@@ -93,6 +93,9 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
 
+  const maxRetries = config.behavior?.maxRetries ?? 0;
+  const retryAttempts = new Map(); // jobId → number of retries made
+
   let applied = 0;
   let skipped = 0;
   let errors = 0;
@@ -104,6 +107,10 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
 
   if (await isBlockedPage(page)) {
     logger.error({ platform: 'dice' }, 'Cloudflare block detected. Stopping Dice.');
+    state.recordApplication({
+      platform: 'dice', jobId: 'captcha_detected',
+      status: 'captcha_blocked', errorMessage: 'Cloudflare/bot block detected — platform stopped', runId,
+    });
     return { applied, skipped, errors };
   }
 
@@ -131,8 +138,10 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
     );
     logger.info({ platform: 'dice', cardCount: jobCards.length, page: currentPage }, 'Found job cards');
 
-    for (const card of jobCards) {
-      if (applied >= maxApplications) break;
+    const cardsToProcess = [...jobCards];
+
+    while (cardsToProcess.length > 0 && applied < maxApplications) {
+      const card = cardsToProcess.shift();
 
       let jobId = null;
       let jobTitle = null;
@@ -172,6 +181,10 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
 
         if (await isBlockedPage(page)) {
           logger.error({ platform: 'dice' }, 'Blocked page detected mid-run. Stopping.');
+          state.recordApplication({
+            platform: 'dice', jobId: 'captcha_detected',
+            status: 'captcha_blocked', errorMessage: 'Cloudflare/bot block detected — platform stopped', runId,
+          });
           return { applied, skipped, errors };
         }
 
@@ -312,15 +325,6 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
         await sleep(2000, 3000);
 
       } catch (err) {
-        logger.error({ platform: 'dice', jobId, jobTitle, error: err.message }, 'Application error');
-        errors++;
-        await screenshotError(page, 'dice', jobId, config);
-
-        state.recordApplication({
-          platform: 'dice', jobId, jobTitle, company, jobUrl,
-          status: 'error', errorMessage: err.message, runId,
-        });
-
         // Try to navigate back to search results
         try {
           const currentUrl = page.url();
@@ -330,6 +334,32 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
         } catch (_) {}
 
         await sleep(2000, 4000);
+
+        // Check for block page before deciding whether to retry (PRD §8.2)
+        if (await isBlockedPage(page)) {
+          logger.error({ platform: 'dice' }, 'Block page detected after error — stopping Dice');
+          state.recordApplication({
+            platform: 'dice', jobId: 'captcha_detected',
+            status: 'captcha_blocked', errorMessage: 'Cloudflare/bot block detected — platform stopped', runId,
+          });
+          return { applied, skipped, errors };
+        }
+
+        // Retry transient errors up to maxRetries times
+        const attemptsMade = (retryAttempts.get(jobId ?? '') || 0) + 1;
+        if (jobId && attemptsMade <= maxRetries) {
+          retryAttempts.set(jobId, attemptsMade);
+          logger.warn({ platform: 'dice', jobId, attempt: attemptsMade, error: err.message }, 'Transient error — queuing retry');
+          cardsToProcess.push(card);
+        } else {
+          logger.error({ platform: 'dice', jobId, jobTitle, error: err.message }, 'Application error');
+          errors++;
+          await screenshotError(page, 'dice', jobId, config);
+          state.recordApplication({
+            platform: 'dice', jobId, jobTitle, company, jobUrl,
+            status: 'error', errorMessage: err.message, runId,
+          });
+        }
       }
     }
 

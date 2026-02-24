@@ -196,6 +196,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
 
+  const maxRetries = config.behavior?.maxRetries ?? 0;
+  const retryAttempts = new Map(); // jobId → number of retries made
+
   let applied = 0;
   let skipped = 0;
   let errors = 0;
@@ -206,9 +209,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
 
-  // Check for CAPTCHA immediately after navigation
+  // Check for CAPTCHA immediately after navigation (PRD §8.2)
   if (await isCaptchaPage(page)) {
     logger.error({ platform: 'linkedin' }, 'CAPTCHA detected at search page. Stopping LinkedIn.');
+    state.recordApplication({
+      platform: 'linkedin', jobId: 'captcha_detected',
+      status: 'captcha_blocked', errorMessage: 'CAPTCHA detected — platform stopped', runId,
+    });
     return { applied, skipped, errors };
   }
 
@@ -230,8 +237,12 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     const jobCards = await page.$$('.job-card-container, .jobs-search-results__list-item');
     logger.info({ platform: 'linkedin', cardCount: jobCards.length }, 'Found job cards');
 
-    for (const card of jobCards) {
-      if (applied >= maxApplications) break;
+    // cardsToProcess queue enables per-job retry: on transient error, push card
+    // back onto the queue (up to maxRetries times) before recording as error.
+    const cardsToProcess = [...jobCards];
+
+    while (cardsToProcess.length > 0 && applied < maxApplications) {
+      const card = cardsToProcess.shift();
 
       let jobId = null;
       let jobTitle = null;
@@ -239,7 +250,6 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       let jobUrl = null;
 
       try {
-        // Extract job ID
         jobId = await extractJobId(card);
         if (!jobId) {
           skipped++;
@@ -377,16 +387,6 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         await sleep(minDelayBetweenApplications, maxDelayBetweenApplications);
 
       } catch (err) {
-        logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
-        errors++;
-
-        await screenshotError(page, 'linkedin', jobId, config);
-
-        state.recordApplication({
-          platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-          status: 'error', errorMessage: err.message, runId,
-        });
-
         // Try to close the modal if it's stuck open
         try {
           const dismissBtn = await page.$(
@@ -405,10 +405,30 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         await sleep(2000, 4000);
 
-        // Check for CAPTCHA after error
+        // Check for CAPTCHA before deciding whether to retry (PRD §8.2)
         if (await isCaptchaPage(page)) {
           logger.error({ platform: 'linkedin' }, 'CAPTCHA detected — stopping LinkedIn');
+          state.recordApplication({
+            platform: 'linkedin', jobId: 'captcha_detected',
+            status: 'captcha_blocked', errorMessage: 'CAPTCHA detected — platform stopped', runId,
+          });
           return { applied, skipped, errors };
+        }
+
+        // Retry transient errors up to maxRetries times
+        const attemptsMade = (retryAttempts.get(jobId ?? '') || 0) + 1;
+        if (jobId && attemptsMade <= maxRetries) {
+          retryAttempts.set(jobId, attemptsMade);
+          logger.warn({ platform: 'linkedin', jobId, attempt: attemptsMade, error: err.message }, 'Transient error — queuing retry');
+          cardsToProcess.push(card);
+        } else {
+          logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
+          errors++;
+          await screenshotError(page, 'linkedin', jobId, config);
+          state.recordApplication({
+            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
+            status: 'error', errorMessage: err.message, runId,
+          });
         }
       }
     }

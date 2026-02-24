@@ -31,7 +31,9 @@ echo " Job Apply Agent starting: $(date)"
 echo "=========================================="
 
 # Run the agent, passing through any arguments (e.g., --dry-run)
-node index.js "$@" 2>&1
+# tee ensures the summary report (written to stdout via console.log) is captured
+# in the daily log file alongside the JSON-structured pino logs.
+node index.js "$@" 2>&1 | tee -a "logs/$(date +%Y-%m-%d).log"
 
 # Log completion
 echo "=========================================="
