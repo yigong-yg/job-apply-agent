@@ -45,6 +45,27 @@ function isJobrightDomain(url) {
 }
 
 /**
+ * Detect Cloudflare challenge or other security check pages on Jobright.
+ * PRD §8.2: "Jobright: Any challenge page" must trigger platform stop.
+ * @returns {Promise<boolean>}
+ */
+async function isChallengedPage(page) {
+  try {
+    const content = await page.content();
+    return (
+      content.includes('Checking your browser') ||
+      content.includes('Just a moment') ||
+      content.includes('security check') ||
+      content.includes('cf-browser-verification') ||
+      (await page.$('iframe[src*="captcha"]')) !== null ||
+      (await page.$('iframe[src*="challenge"]')) !== null
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Extract job ID from a Jobright listing.
  * Jobright uses data attributes or URL slugs.
  */
@@ -113,6 +134,16 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
   const currentUrl = page.url();
   if (loginModal || !isJobrightDomain(currentUrl) || currentUrl.includes('/login')) {
     logger.error({ platform: 'jobright' }, 'Jobright session expired or login required. Stopping.');
+    return { applied, skipped, errors };
+  }
+
+  // Check for Cloudflare/security challenge page (PRD §8.2)
+  if (await isChallengedPage(page)) {
+    logger.error({ platform: 'jobright' }, 'Challenge/security check detected. Stopping Jobright.');
+    state.recordApplication({
+      platform: 'jobright', jobId: 'captcha_detected',
+      status: 'captcha_blocked', errorMessage: 'Challenge page detected — platform stopped', runId,
+    });
     return { applied, skipped, errors };
   }
 
@@ -362,6 +393,16 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
         } catch (_) {}
 
         await sleep(2000, 4000);
+
+        // Check for challenge page after error (PRD §8.2)
+        if (await isChallengedPage(page)) {
+          logger.error({ platform: 'jobright' }, 'Challenge detected — stopping Jobright');
+          state.recordApplication({
+            platform: 'jobright', jobId: 'captcha_detected',
+            status: 'captcha_blocked', errorMessage: 'Challenge page detected — platform stopped', runId,
+          });
+          return { applied, skipped, errors };
+        }
       }
     }
   }

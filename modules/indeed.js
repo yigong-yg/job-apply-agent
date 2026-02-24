@@ -150,6 +150,9 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
 
+  const maxRetries = config.behavior?.maxRetries ?? 0;
+  const retryAttempts = new Map(); // jobId → number of retries made
+
   let applied = 0;
   let skipped = 0;
   let errors = 0;
@@ -162,6 +165,10 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
 
   if (await isBotDetected(page)) {
     logger.error({ platform: 'indeed' }, 'Bot detection triggered. Stopping Indeed.');
+    state.recordApplication({
+      platform: 'indeed', jobId: 'captcha_detected',
+      status: 'captcha_blocked', errorMessage: 'Bot/CAPTCHA detection triggered — platform stopped', runId,
+    });
     return { applied, skipped, errors };
   }
 
@@ -186,8 +193,10 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
     const jobCards = await page.$$('li[data-jk], .job_seen_beacon, .slider_item');
     logger.info({ platform: 'indeed', cardCount: jobCards.length, page: currentPage }, 'Found job cards');
 
-    for (const card of jobCards) {
-      if (applied >= maxApplications) break;
+    const cardsToProcess = [...jobCards];
+
+    while (cardsToProcess.length > 0 && applied < maxApplications) {
+      const card = cardsToProcess.shift();
 
       let jobId = null;
       let jobTitle = null;
@@ -303,6 +312,10 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
 
         if (await isBotDetected(page)) {
           logger.error({ platform: 'indeed' }, 'Bot detection triggered during apply flow. Stopping.');
+          state.recordApplication({
+            platform: 'indeed', jobId: 'captcha_detected',
+            status: 'captcha_blocked', errorMessage: 'Bot/CAPTCHA detection triggered — platform stopped', runId,
+          });
           return { applied, skipped, errors };
         }
 
@@ -359,15 +372,6 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
         await sleep(2000, 3000);
 
       } catch (err) {
-        logger.error({ platform: 'indeed', jobId, jobTitle, error: err.message }, 'Application error');
-        errors++;
-        await screenshotError(page, 'indeed', jobId, config);
-
-        state.recordApplication({
-          platform: 'indeed', jobId, jobTitle, company, jobUrl,
-          status: 'error', errorMessage: err.message, runId,
-        });
-
         // Return to search results
         try {
           await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -375,9 +379,30 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
 
         await sleep(2000, 4000);
 
+        // Check for bot detection before deciding whether to retry (PRD §8.2)
         if (await isBotDetected(page)) {
           logger.error({ platform: 'indeed' }, 'Bot detection after error — stopping Indeed');
+          state.recordApplication({
+            platform: 'indeed', jobId: 'captcha_detected',
+            status: 'captcha_blocked', errorMessage: 'Bot/CAPTCHA detection triggered — platform stopped', runId,
+          });
           return { applied, skipped, errors };
+        }
+
+        // Retry transient errors up to maxRetries times
+        const attemptsMade = (retryAttempts.get(jobId ?? '') || 0) + 1;
+        if (jobId && attemptsMade <= maxRetries) {
+          retryAttempts.set(jobId, attemptsMade);
+          logger.warn({ platform: 'indeed', jobId, attempt: attemptsMade, error: err.message }, 'Transient error — queuing retry');
+          cardsToProcess.push(card);
+        } else {
+          logger.error({ platform: 'indeed', jobId, jobTitle, error: err.message }, 'Application error');
+          errors++;
+          await screenshotError(page, 'indeed', jobId, config);
+          state.recordApplication({
+            platform: 'indeed', jobId, jobTitle, company, jobUrl,
+            status: 'error', errorMessage: err.message, runId,
+          });
         }
       }
     }

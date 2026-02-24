@@ -59,10 +59,15 @@ function parseArgs(argv) {
 
 /**
  * Generate and print the daily summary report.
+ * Uses DB-accurate counts (via state.getRunStats) so dry_run vs submitted
+ * are correctly distinguished regardless of what in-memory stats return.
  */
-function printSummaryReport(runId, startTime, stats) {
+async function printSummaryReport(runId, startTime, sessionStats) {
   const duration = Math.round((Date.now() - startTime) / 1000 / 60);
   const today = new Date().toISOString().slice(0, 10);
+
+  // Pull accurate per-status counts from the database
+  const dbStats = state.getRunStats(runId);
 
   const lines = [
     '═'.repeat(55),
@@ -78,12 +83,13 @@ function printSummaryReport(runId, startTime, stats) {
   let totalErrors = 0;
   const sessionStatus = [];
 
-  for (const [platform, platformStats] of Object.entries(stats)) {
-    if (!platformStats) {
+  for (const [platform, sessionStat] of Object.entries(sessionStats)) {
+    if (!sessionStat) {
       lines.push(`  ${platform.padEnd(10)}: SKIPPED (session expired)`);
       sessionStatus.push(`${platform} ✗ (expired)`);
       continue;
     }
+    const platformStats = dbStats[platform] || { applied: 0, skipped: 0, errors: 0, dry_run: 0 };
     const { applied = 0, skipped = 0, errors = 0, dry_run = 0 } = platformStats;
     totalApplied += applied + dry_run;
     totalSkipped += skipped;
@@ -96,9 +102,12 @@ function printSummaryReport(runId, startTime, stats) {
     sessionStatus.push(`${platform} ✓`);
   }
 
+  const unmatchedCount = state.getUnfilledFieldsCount(runId);
+
   lines.push('─'.repeat(55));
   lines.push(`  TOTAL:      ${totalApplied} applied | ${totalSkipped} skipped | ${totalErrors} errors`);
   lines.push(`  Sessions:  ${sessionStatus.join(' | ')}`);
+  lines.push(`  Unmatched Fields: ${unmatchedCount} new (see unfilled_fields table)`);
   lines.push('═'.repeat(55));
 
   const report = lines.join('\n');
@@ -230,7 +239,7 @@ async function main() {
   }
 
   state.completeRun(runId, aggregatedStats);
-  printSummaryReport(runId, startTime, runStats);
+  await printSummaryReport(runId, startTime, runStats);
 
   process.exit(0);
 }
