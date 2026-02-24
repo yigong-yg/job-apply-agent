@@ -1,0 +1,76 @@
+{
+  "user": {
+    "firstName": "Yi",
+    "lastName": "[LAST_NAME]",
+    "email": "[EMAIL]",
+    "phone": "[PHONE]",
+    "city": "Salt Lake City",
+    "state": "UT",
+    "country": "US",
+    "zipCode": "[ZIP]",
+    "linkedinUrl": "https://linkedin.com/in/[HANDLE]",
+    "workAuthorization": "US Citizen",
+    "requiresSponsorship": false,
+    "willingToRelocate": true,
+    "yearsOfExperience": "3",
+    "highestEducation": "Master's Degree",
+    "veteranStatus": "I am not a protected veteran",
+    "disabilityStatus": "I do not wish to answer",
+    "gender": "Male",
+    "race": "Prefer not to say",
+    "desiredSalary": "120000",
+    "startDate": "Immediately",
+    "resumePath": "./resumes/resume.pdf"
+  },
+
+  "search": {
+    "keywords": ["data scientist", "machine learning engineer", "data analyst"],
+    "location": "Salt Lake City, UT",
+    "remoteOnly": false,
+    "includeRemote": true,
+    "radius": "50 miles",
+    "datePosted": "Past week",
+    "experienceLevel": ["Entry level", "Associate", "Mid-Senior level"],
+    "jobType": ["Full-time"]
+  },
+
+  "platforms": {
+    "linkedin": {
+      "enabled": true,
+      "maxApplicationsPerRun": 30,
+      "searchUrl": "https://www.linkedin.com/jobs/search/?keywords=data+scientist&location=Salt+Lake+City%2C+UT&f_AL=true&f_TPR=r604800"
+    },
+    "indeed": {
+      "enabled": true,
+      "maxApplicationsPerRun": 30,
+      "searchUrl": "https://www.indeed.com/jobs?q=data+scientist&l=Salt+Lake+City%2C+UT&fromage=7&sc=0kf%3Aattr(DSQF7)%3B"
+    },
+    "dice": {
+      "enabled": true,
+      "maxApplicationsPerRun": 30,
+      "searchUrl": "https://www.dice.com/jobs?q=data+scientist&location=Salt+Lake+City%2C+UT&radius=50&postedDate=SEVEN"
+    },
+    "jobright": {
+      "enabled": true,
+      "maxApplicationsPerRun": 20,
+      "searchUrl": "https://jobright.ai/jobs"
+    }
+  },
+
+  "behavior": {
+    "minDelayBetweenActions": 1500,
+    "maxDelayBetweenActions": 4000,
+    "minDelayBetweenApplications": 5000,
+    "maxDelayBetweenApplications": 15000,
+    "typingSpeed": { "min": 50, "max": 150 },
+    "scrollBehavior": "human",
+    "maxRetries": 2,
+    "screenshotOnError": true,
+    "headless": true
+  },
+
+  "notifications": {
+    "logToFile": true,
+    "logToStdout": true
+  }
+}

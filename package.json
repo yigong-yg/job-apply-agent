@@ -1,0 +1,23 @@
+{
+  "name": "job-apply-agent",
+  "version": "1.0.0",
+  "description": "Automated job application agent for LinkedIn, Indeed, Dice, and Jobright",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "setup": "node setup.js",
+    "dry-run": "node index.js --dry-run"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.9.1",
+    "pino": "^8.19.0",
+    "pino-pretty": "^11.0.0",
+    "playwright": "^1.42.1",
+    "string-similarity": "^4.0.4",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
