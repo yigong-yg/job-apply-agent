@@ -210,9 +210,13 @@ __marimo__/
 node_modules/
 npm-debug.log*
 
-# Job Apply Agent - runtime data
+# Job Apply Agent - runtime data (contains PII and session state)
+config.json
+defaultAnswers.json
+.env
 browser-data/
 db/
+*.db
 logs/
 resumes/
 screenshots/

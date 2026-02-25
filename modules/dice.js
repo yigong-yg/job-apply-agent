@@ -22,7 +22,7 @@ const SELECTOR_TIMEOUT = 10000;
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
   try {
-    const dir = path.join(process.cwd(), 'logs', 'errors');
+    const dir = path.join(process.cwd(), 'logs', 'screenshots');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const today = new Date().toISOString().slice(0, 10);
     const fname = `${today}-${platform}-${(jobId || 'unknown').replace(/[^a-z0-9]/gi, '_')}.png`;
@@ -88,6 +88,16 @@ async function getJobDetailUrl(card, baseUrl = 'https://www.dice.com') {
  * @param {boolean} [dryRun=false]
  * @returns {Promise<{ applied: number, skipped: number, errors: number }>}
  */
+/**
+ * Build a Dice search URL dynamically from config.search.keywords.
+ */
+function buildSearchUrl(config) {
+  const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
+  const encoded = encodeURIComponent(keywords);
+  const location = encodeURIComponent(config.search?.location || 'United States');
+  return `https://www.dice.com/jobs?q=${encoded}&location=${location}&postedDate=SEVEN`;
+}
+
 async function applyDice(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
   const platformConfig = config.platforms.dice;
   const maxApplications = platformConfig.maxApplicationsPerRun;
@@ -100,9 +110,10 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
   let skipped = 0;
   let errors = 0;
 
-  logger.info({ platform: 'dice', searchUrl: platformConfig.searchUrl }, 'Navigating to Dice search');
+  const searchUrl = buildSearchUrl(config);
+  logger.info({ platform: 'dice', searchUrl }, 'Navigating to Dice search');
 
-  await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
 
   if (await isBlockedPage(page)) {
@@ -113,8 +124,6 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
     });
     return { applied, skipped, errors };
   }
-
-  const searchUrl = platformConfig.searchUrl;
   let currentPage = 1;
   let pageHasMoreJobs = true;
 
