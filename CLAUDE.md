@@ -666,8 +666,9 @@ TABLE applications (
   jobTitle      TEXT,
   company       TEXT,
   jobUrl        TEXT,
-  status        TEXT NOT NULL,          -- 'submitted' | 'skipped' | 'error' | 'already_applied'
+  status        TEXT NOT NULL,          -- 'submitted' | 'skipped' | 'error' | 'already_applied' | 'dry_run' | 'captcha_blocked'
   errorMessage  TEXT,
+  skipReason    TEXT,                   -- Why this job was skipped (e.g. 'already_applied_db', 'no_easy_apply_button')
   appliedAt     TEXT NOT NULL,          -- ISO 8601 timestamp
   runId         TEXT NOT NULL           -- UUID for each cron run
 );

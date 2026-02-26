@@ -25,7 +25,7 @@ const { recordUnfilledField } = require('../lib/state');
 const SELECTOR_TIMEOUT = 10000;
 
 /**
- * Take an error screenshot and save it to logs/errors/
+ * Take an error screenshot and save it to logs/screenshots/
  */
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
@@ -123,7 +123,8 @@ async function extractJobId(card) {
  * @param {object} logger
  * @param {string} jobId
  * @param {boolean} dryRun
- * @returns {Promise<'next'|'submitted'|'error'>}
+ * @param {number} stepNum - 1-based modal step index for logging/diagnostics
+ * @returns {Promise<'next'|'submitted'|'error'|'validation_error'>}
  */
 async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum) {
   // Give the step content time to render
@@ -170,10 +171,10 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
     return { progress, labels, fields, errors };
   }).catch(() => ({ progress: '?', labels: [], fields: [], errors: [] }));
 
-  console.log(`\n[STEP ${stepNum}] progress=${stepInfo.progress}%`);
-  console.log('  Labels:', stepInfo.labels.join(' | '));
-  console.log('  Fields:', stepInfo.fields.map(f => `${f.tag}(${f.type})${f.visible ? '' : '[hidden]'}=${f.value}`).join(', '));
-  if (stepInfo.errors.length) console.log('  Validation errors:', stepInfo.errors.join(' | '));
+  logger.debug({ platform: 'linkedin', jobId, stepNum, progress: stepInfo.progress, labels: stepInfo.labels,
+    fields: stepInfo.fields.map(f => `${f.tag}(${f.type})${f.visible ? '' : '[hidden]'}`),
+  }, 'Modal step diagnostics');
+  if (stepInfo.errors.length) logger.debug({ platform: 'linkedin', jobId, stepNum, errors: stepInfo.errors }, 'Validation errors on step');
 
   // ── Resume step: select existing resume if present ──
   // LinkedIn shows uploaded resumes as selectable cards with radio buttons.
@@ -195,10 +196,10 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
           await resumeRadios[0].click({ force: true });
         }
         await sleep(300, 600);
-        console.log('  >> Selected first resume option');
+        logger.debug({ platform: 'linkedin', jobId }, 'Selected first resume option');
       }
     } else {
-      console.log('  >> Resume already selected');
+      logger.debug({ platform: 'linkedin', jobId }, 'Resume already selected');
     }
   }
 
@@ -217,10 +218,9 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
     recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: field.fieldLabel, fieldType: field.fieldType });
   }
 
-  console.log(`  >> Filled: ${filledCount}, Unfilled: ${unfilledFields.length}`);
-  if (unfilledFields.length > 0) {
-    console.log('  >> Unfilled fields:', unfilledFields.map(f => `${f.fieldLabel} (${f.fieldType})`).join(', '));
-  }
+  logger.debug({ platform: 'linkedin', jobId, filledCount, unfilledCount: unfilledFields.length,
+    unfilledFields: unfilledFields.map(f => `${f.fieldLabel} (${f.fieldType})`),
+  }, 'Step form fill summary');
 
   // Uncheck "Follow company" if present on review step.
   // The checkbox input is hidden behind a <label> on LinkedIn, so click
@@ -258,7 +258,7 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
     const btn = await page.$(selector);
     if (btn && (await btn.isVisible())) {
       const btnText = (await btn.innerText()).trim();
-      console.log(`  >> Clicking button: "${btnText}" (action=${action})`);
+      logger.debug({ platform: 'linkedin', jobId, btnText, action }, 'Clicking modal button');
 
       if (action === 'submit') {
         if (dryRun) {
@@ -305,7 +305,7 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
         }).catch(() => []);
 
         if (postClickErrors.length > 0) {
-          console.log(`  >> Post-click validation errors: ${postClickErrors.join(' | ')}`);
+          logger.debug({ platform: 'linkedin', jobId, errors: postClickErrors }, 'Post-click validation errors');
           return 'validation_error';
         }
 
@@ -358,7 +358,6 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
   // Construct search URL dynamically from config.search.keywords
   const searchUrl = buildSearchUrl(config);
-  console.log(`[LinkedIn] Search URL: ${searchUrl}`);
   logger.info({ platform: 'linkedin', searchUrl }, 'Navigating to LinkedIn search');
 
   // Navigate to dynamically constructed search URL
@@ -443,12 +442,12 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       try {
         jobId = await extractJobId(card);
       } catch (extractErr) {
-        console.log(`[SKIP] cardIdx=${cardIdx} reason=extract_failed error="${extractErr.message}"`);
+        logger.debug({ platform: 'linkedin', cardIdx, reason: 'extract_failed', error: extractErr.message }, 'Skipping card');
         skipped++;
         continue;
       }
       if (!jobId) {
-        console.log(`[SKIP] cardIdx=${cardIdx} reason=no_job_id`);
+        logger.debug({ platform: 'linkedin', cardIdx, reason: 'no_job_id' }, 'Skipping card');
         skipped++;
         continue;
       }
@@ -464,7 +463,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       try {
         // Check if already applied (SQLite lookup)
         if (state.hasApplied('linkedin', jobId)) {
-          console.log(`[SKIP] jobId=${jobId} title="${(jobTitle || '').substring(0, 40)}" company="${company || ''}" reason=already_applied_db`);
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'already_applied_db' }, 'Skipping job');
           state.recordApplication({ platform: 'linkedin', jobId, jobTitle, company, status: 'already_applied', skipReason: 'already_applied_db', runId });
           skipped++;
           continue;
@@ -502,7 +501,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         }
 
         if (!easyApplyBtn) {
-          console.log(`[SKIP] jobId=${jobId} title="${(jobTitle || '').substring(0, 40)}" company="${company || ''}" reason=no_easy_apply_button`);
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'no_easy_apply_button' }, 'Skipping job');
           state.recordApplication({
             platform: 'linkedin', jobId, jobTitle, company, jobUrl,
             status: 'skipped', skipReason: 'no_easy_apply_button', runId,
@@ -513,7 +512,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         const isVisible = await easyApplyBtn.isVisible();
         if (!isVisible) {
-          console.log(`[SKIP] jobId=${jobId} title="${(jobTitle || '').substring(0, 40)}" company="${company || ''}" reason=easy_apply_not_visible`);
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'easy_apply_not_visible' }, 'Skipping job');
           skipped++;
           continue;
         }
@@ -522,7 +521,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         const btnText = await easyApplyBtn.innerText();
 
         if (btnText.toLowerCase().includes('applied')) {
-          console.log(`[SKIP] jobId=${jobId} title="${(jobTitle || '').substring(0, 40)}" company="${company || ''}" reason=already_applied_linkedin`);
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'already_applied_linkedin' }, 'Skipping job');
           state.recordApplication({
             platform: 'linkedin', jobId, jobTitle, company, jobUrl,
             status: 'already_applied', skipReason: 'already_applied_linkedin', runId,

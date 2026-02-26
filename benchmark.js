@@ -123,7 +123,8 @@ function coreMetrics() {
   `).get(...rf.params);
 
   return {
-    submitted: (row?.submitted || 0) + (row?.dry_run || 0),
+    submitted: row?.submitted || 0,
+    dry_run: row?.dry_run || 0,
     errors: row?.errors || 0,
     attempted: row?.attempted || 0,
     avgPerRun: avgRow?.avg || 0,
@@ -223,11 +224,20 @@ const lines = [
   '',
   '  CORE METRICS',
   '  ' + '─'.repeat(50),
-  `  Submit Rate ........... ${metrics.submitted}/${metrics.submitted + metrics.errors}  ${pct(metrics.submitted, metrics.submitted + metrics.errors)}  (submitted / submitted+errors)`,
-  `  Modal Success Rate .... ${metrics.submitted}/${metrics.attempted}  ${pct(metrics.submitted, metrics.attempted)}  (submitted / attempted)`,
+];
+
+const successful = metrics.submitted + metrics.dry_run;
+if (metrics.dry_run > 0) {
+  lines.push(`  Dry Runs .............. ${metrics.dry_run}`);
+}
+if (metrics.submitted > 0) {
+  lines.push(`  Submit Rate ........... ${metrics.submitted}/${metrics.submitted + metrics.errors}  ${pct(metrics.submitted, metrics.submitted + metrics.errors)}  (submitted / submitted+errors)`);
+}
+lines.push(
+  `  Modal Success Rate .... ${successful}/${metrics.attempted}  ${pct(successful, metrics.attempted)}  (successful / attempted)`,
   `  Avg Applications/Run .. ${metrics.avgPerRun.toFixed(1)}`,
   `  Avg Run Duration ...... ${Math.round(metrics.avgMinutes)} min`,
-];
+);
 
 if (skips.length > 0) {
   const totalSkips = skips.reduce((s, r) => s + r.cnt, 0);

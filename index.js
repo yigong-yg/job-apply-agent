@@ -20,8 +20,15 @@ const path = require('path');
 const fs = require('fs');
 
 // Load configuration files
-const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
-const defaultAnswers = JSON.parse(fs.readFileSync(path.join(__dirname, 'defaultAnswers.json'), 'utf8'));
+const configPath = path.join(__dirname, 'config.json');
+const answersPath = path.join(__dirname, 'defaultAnswers.json');
+if (!fs.existsSync(configPath) || !fs.existsSync(answersPath)) {
+  const missing = [!fs.existsSync(configPath) && 'config.json', !fs.existsSync(answersPath) && 'defaultAnswers.json'].filter(Boolean);
+  console.error(`Error: missing ${missing.join(' and ')}. Copy from .example templates:\n  cp config.json.example config.json\n  cp defaultAnswers.json.example defaultAnswers.json\nThen fill in your personal details.`);
+  process.exit(2);
+}
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const defaultAnswers = JSON.parse(fs.readFileSync(answersPath, 'utf8'));
 
 // Core libraries
 const logger = require('./lib/logger');
