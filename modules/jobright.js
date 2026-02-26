@@ -29,7 +29,7 @@ const SELECTOR_TIMEOUT = 10000;
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
   try {
-    const dir = path.join(process.cwd(), 'logs', 'errors');
+    const dir = path.join(process.cwd(), 'logs', 'screenshots');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const today = new Date().toISOString().slice(0, 10);
     const fname = `${today}-${platform}-${(jobId || 'unknown').replace(/[^a-z0-9]/gi, '_')}.png`;
@@ -114,6 +114,16 @@ async function scrollToLoadMoreJobs(page, currentCount) {
  * @param {boolean} [dryRun=false]
  * @returns {Promise<{ applied: number, skipped: number, errors: number }>}
  */
+/**
+ * Build a Jobright search URL dynamically from config.search.keywords.
+ * Jobright uses a simpler URL format — keywords are passed as query params.
+ */
+function buildSearchUrl(config) {
+  const keywords = (config.search?.keywords || ['data scientist']).join(' ');
+  const encoded = encodeURIComponent(keywords);
+  return `https://jobright.ai/jobs?q=${encoded}`;
+}
+
 async function applyJobright(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
   const platformConfig = config.platforms.jobright;
   const maxApplications = platformConfig.maxApplicationsPerRun;
@@ -124,9 +134,10 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
   let errors = 0;
   let processedJobIds = new Set(); // Track processed jobs in this run to avoid re-processing
 
-  logger.info({ platform: 'jobright', searchUrl: platformConfig.searchUrl }, 'Navigating to Jobright jobs');
+  const searchUrl = buildSearchUrl(config);
+  logger.info({ platform: 'jobright', searchUrl }, 'Navigating to Jobright jobs');
 
-  await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
 
   // Check for login wall (Jobright sessions expire quickly)
@@ -285,7 +296,7 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
             status: 'skipped', errorMessage: 'external_redirect', runId,
           });
           skipped++;
-          await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded' });
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
           await sleep(2000, 3000);
           continue;
         }
@@ -371,7 +382,7 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
 
         // Navigate back to the job feed
         await page.goBack({ waitUntil: 'domcontentloaded' }).catch(async () => {
-          await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded' });
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
         });
         await sleep(1500, 2500);
 
@@ -388,7 +399,7 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
         // Return to job feed
         try {
           if (!isJobrightDomain(page.url())) {
-            await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded' });
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
           }
         } catch (_) {}
 

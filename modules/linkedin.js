@@ -25,12 +25,12 @@ const { recordUnfilledField } = require('../lib/state');
 const SELECTOR_TIMEOUT = 10000;
 
 /**
- * Take an error screenshot and save it to logs/errors/
+ * Take an error screenshot and save it to logs/screenshots/
  */
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
   try {
-    const dir = path.join(process.cwd(), 'logs', 'errors');
+    const dir = path.join(process.cwd(), 'logs', 'screenshots');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const today = new Date().toISOString().slice(0, 10);
     const fname = `${today}-${platform}-${(jobId || 'unknown').replace(/[^a-z0-9]/gi, '_')}.png`;
@@ -42,18 +42,50 @@ async function screenshotError(page, platform, jobId, config) {
 
 /**
  * Detect if LinkedIn is showing a CAPTCHA / security check page.
+ *
+ * LinkedIn embeds an invisible reCAPTCHA Enterprise widget (size=invisible)
+ * on ALL pages for passive bot scoring.  This is NOT a blocking challenge —
+ * we must ignore it.  Only trigger when a real blocking challenge is shown:
+ *   1. Visible challenge text ("Let's do a quick security check", etc.)
+ *   2. A visible (non-invisible) reCAPTCHA iframe
+ *   3. The page lacks normal navigation, indicating a redirect to a
+ *      standalone challenge page
+ *
  * @returns {Promise<boolean>}
  */
 async function isCaptchaPage(page) {
   try {
-    const content = await page.content();
-    return (
-      content.includes("Let's do a quick security check") ||
-      content.includes('security check') ||
-      content.includes('captcha') ||
-      (await page.$('iframe[src*="captcha"]')) !== null ||
-      (await page.$('iframe[src*="challenge"]')) !== null
-    );
+    // If the normal job-list or nav chrome is present, the page loaded fine.
+    const hasJobList = (await page.$('.jobs-search-results-list, .scaffold-layout__list')) !== null;
+    const hasNav = (await page.$('.global-nav, #global-nav')) !== null;
+    if (hasJobList || hasNav) return false;
+
+    // No normal page elements — check for visible challenge text
+    const bodyText = await page.evaluate(() => document.body?.innerText || '');
+    if (
+      bodyText.includes("Let's do a quick security check") ||
+      bodyText.includes('Verify you\'re not a robot') ||
+      bodyText.includes('unusual activity')
+    ) {
+      return true;
+    }
+
+    // Check for a visible (non-invisible) reCAPTCHA iframe
+    const hasVisibleCaptchaIframe = await page.evaluate(() => {
+      const iframes = document.querySelectorAll('iframe[src*="captcha"], iframe[src*="challenge"]');
+      for (const f of iframes) {
+        const src = f.src || '';
+        // Skip LinkedIn's passive invisible widget
+        if (src.includes('size=invisible')) continue;
+        // Check if the iframe is actually visible
+        const rect = f.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
+      }
+      return false;
+    });
+    if (hasVisibleCaptchaIframe) return true;
+
+    return false;
   } catch (_) {
     return false;
   }
@@ -91,11 +123,85 @@ async function extractJobId(card) {
  * @param {object} logger
  * @param {string} jobId
  * @param {boolean} dryRun
- * @returns {Promise<'next'|'submitted'|'error'>}
+ * @param {number} stepNum - 1-based modal step index for logging/diagnostics
+ * @returns {Promise<'next'|'submitted'|'error'|'validation_error'>}
  */
-async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun) {
+async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum) {
   // Give the step content time to render
   await sleep(800, 1500);
+
+  // ── Capture step diagnostics ──
+  const stepInfo = await page.evaluate(() => {
+    const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal');
+    if (!modal) return { progress: '?', labels: [], fields: [], errors: [] };
+
+    // Progress indicator (e.g. "57%")
+    const progressEl = modal.querySelector('progress, [role="progressbar"], [class*="progress"]');
+    const progress = progressEl
+      ? (progressEl.getAttribute('aria-valuenow') || progressEl.getAttribute('value') || progressEl.textContent || '').trim()
+      : '?';
+
+    // All labels in the modal
+    const labels = [];
+    for (const lbl of modal.querySelectorAll('label, legend, [class*="question"], [data-test-form-element-label]')) {
+      const t = (lbl.textContent || '').trim().substring(0, 120);
+      if (t) labels.push(t);
+    }
+
+    // All form fields with their type, value, and visibility
+    const fields = [];
+    for (const el of modal.querySelectorAll('input, select, textarea, [role="combobox"], [aria-haspopup="listbox"]')) {
+      const rect = el.getBoundingClientRect();
+      fields.push({
+        tag: el.tagName,
+        type: el.type || el.getAttribute('role') || '',
+        id: (el.id || '').substring(0, 80),
+        visible: rect.width > 0 && rect.height > 0,
+        value: (el.value || el.textContent || '').trim().substring(0, 60),
+      });
+    }
+
+    // Validation errors
+    const errors = [];
+    for (const err of modal.querySelectorAll('[class*="error"], [class*="invalid"], [role="alert"]')) {
+      const t = (err.textContent || '').trim();
+      if (t) errors.push(t.substring(0, 100));
+    }
+
+    return { progress, labels, fields, errors };
+  }).catch(() => ({ progress: '?', labels: [], fields: [], errors: [] }));
+
+  logger.debug({ platform: 'linkedin', jobId, stepNum, progress: stepInfo.progress, labels: stepInfo.labels,
+    fields: stepInfo.fields.map(f => `${f.tag}(${f.type})${f.visible ? '' : '[hidden]'}`),
+  }, 'Modal step diagnostics');
+  if (stepInfo.errors.length) logger.debug({ platform: 'linkedin', jobId, stepNum, errors: stepInfo.errors }, 'Validation errors on step');
+
+  // ── Resume step: select existing resume if present ──
+  // LinkedIn shows uploaded resumes as selectable cards with radio buttons.
+  // If none is selected, the "Next" button silently refuses to advance.
+  const resumeRadios = await page.$$('input[type="radio"][id*="jobsDocumentCardToggle"]');
+  if (resumeRadios.length > 0) {
+    let anyChecked = false;
+    for (const r of resumeRadios) {
+      if (await r.isChecked()) { anyChecked = true; break; }
+    }
+    if (!anyChecked) {
+      // Click the label of the first resume radio (the input is visually hidden)
+      const firstId = await resumeRadios[0].getAttribute('id');
+      if (firstId) {
+        const label = await page.$(`label[for="${firstId}"]`);
+        if (label) {
+          await label.click();
+        } else {
+          await resumeRadios[0].click({ force: true });
+        }
+        await sleep(300, 600);
+        logger.debug({ platform: 'linkedin', jobId }, 'Selected first resume option');
+      }
+    } else {
+      logger.debug({ platform: 'linkedin', jobId }, 'Resume already selected');
+    }
+  }
 
   // Fill any visible form fields on this step
   const { filledCount, unfilledFields } = await fillForm(
@@ -112,25 +218,24 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
     recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: field.fieldLabel, fieldType: field.fieldType });
   }
 
-  logger.debug({ jobId, filledCount, unmatched: unfilledFields.length }, 'Filled modal step');
+  logger.debug({ platform: 'linkedin', jobId, filledCount, unfilledCount: unfilledFields.length,
+    unfilledFields: unfilledFields.map(f => `${f.fieldLabel} (${f.fieldType})`),
+  }, 'Step form fill summary');
 
-  // Handle resume step: prefer "Use last resume" if available
-  const useLastResumeBtn = await page.$('button:has-text("Use last resume"), [data-test-resume-option]');
-  if (useLastResumeBtn) {
-    const isVisible = await useLastResumeBtn.isVisible();
-    if (isVisible) {
-      await useLastResumeBtn.click();
-      await sleep(500, 1000);
-    }
-  }
-
-  // Uncheck "Follow company" if present on review step
-  const followCheckbox = await page.$('input[type="checkbox"][id*="follow"], label:has-text("Follow") input[type="checkbox"]');
+  // Uncheck "Follow company" if present on review step.
+  // The checkbox input is hidden behind a <label> on LinkedIn, so click
+  // the label instead (same pattern as radio buttons).
+  const followCheckbox = await page.$('input[type="checkbox"][id*="follow"]');
   if (followCheckbox) {
-    const isVisible = await followCheckbox.isVisible();
-    const isChecked = await followCheckbox.isChecked();
-    if (isVisible && isChecked) {
-      await followCheckbox.click();
+    const isChecked = await followCheckbox.isChecked().catch(() => false);
+    if (isChecked) {
+      const cbId = await followCheckbox.getAttribute('id');
+      const cbLabel = cbId ? await page.$(`label[for="${cbId}"]`) : null;
+      if (cbLabel && await cbLabel.isVisible()) {
+        await cbLabel.click();
+      } else {
+        await followCheckbox.click({ force: true });
+      }
       await sleep(200, 400);
     }
   }
@@ -140,13 +245,10 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
   // Determine which button to click based on what's visible
   // Priority: "Submit application" > "Review" > "Next" > "Continue"
   const buttonSelectors = [
-    // Final submit button
     { selector: 'button[aria-label="Submit application"]', action: 'submit' },
     { selector: 'button:has-text("Submit application")', action: 'submit' },
-    // Review step (penultimate)
     { selector: 'button[aria-label="Review your application"]', action: 'next' },
     { selector: 'button:has-text("Review")', action: 'next' },
-    // Next step
     { selector: 'button[aria-label="Continue to next step"]', action: 'next' },
     { selector: 'button:has-text("Next")', action: 'next' },
     { selector: 'button:has-text("Continue")', action: 'next' },
@@ -155,20 +257,58 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
   for (const { selector, action } of buttonSelectors) {
     const btn = await page.$(selector);
     if (btn && (await btn.isVisible())) {
+      const btnText = (await btn.innerText()).trim();
+      logger.debug({ platform: 'linkedin', jobId, btnText, action }, 'Clicking modal button');
+
       if (action === 'submit') {
         if (dryRun) {
-          // In dry-run mode, take screenshot instead of submitting
           await screenshotError(page, 'linkedin', `dryrun-${jobId}`, config);
           logger.info({ jobId }, '[DRY RUN] Would submit application — taking screenshot instead');
-          // Click "Done" or dismiss the modal without submitting
-          const doneBtn = await page.$('button[aria-label="Dismiss"], button:has-text("Discard")');
-          if (doneBtn) await doneBtn.click();
+
+          // Dismiss the modal cleanly: click X → wait for "Discard" confirmation → click Discard
+          const dismissBtn = await page.$('button[aria-label="Dismiss"]');
+          if (dismissBtn) {
+            await dismissBtn.click();
+            await sleep(500, 1000);
+            // LinkedIn shows a confirmation overlay asking "Discard application?"
+            const discardBtn = await page.waitForSelector(
+              '[data-test-easy-apply-discard-confirmation] button[data-control-name="discard_application_confirm"], ' +
+              '[data-test-modal-id="data-test-easy-apply-discard-confirmation"] button:has-text("Discard"), ' +
+              'button[data-control-name="discard_application_confirm"], ' +
+              'button:has-text("Discard")',
+              { timeout: 5000 }
+            ).catch(() => null);
+            if (discardBtn) {
+              await discardBtn.click();
+              await sleep(500, 1000);
+            }
+          }
+
           return 'submitted';
         }
         await btn.click();
         return 'submitted';
       } else {
         await btn.click();
+        await sleep(500, 800);
+
+        // Check for validation errors that appeared after clicking
+        const postClickErrors = await page.evaluate(() => {
+          const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal');
+          if (!modal) return [];
+          const errs = [];
+          for (const el of modal.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
+            const t = (el.textContent || '').trim();
+            if (t) errs.push(t.substring(0, 100));
+          }
+          return errs;
+        }).catch(() => []);
+
+        if (postClickErrors.length > 0) {
+          logger.debug({ platform: 'linkedin', jobId, errors: postClickErrors }, 'Post-click validation errors');
+          return 'validation_error';
+        }
+
         return 'next';
       }
     }
@@ -191,6 +331,19 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
  * @param {boolean} [dryRun=false]
  * @returns {Promise<{ applied: number, skipped: number, errors: number }>}
  */
+/**
+ * Build a LinkedIn search URL dynamically from config.search.keywords.
+ * - Keywords are joined with " OR " and URL-encoded
+ * - geoId=103644278 = "United States"
+ * - f_AL=true = Easy Apply filter
+ * - f_TPR=r604800 = Past week
+ */
+function buildSearchUrl(config) {
+  const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
+  const encoded = encodeURIComponent(keywords);
+  return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&geoId=103644278&f_AL=true&f_TPR=r604800`;
+}
+
 async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
   const platformConfig = config.platforms.linkedin;
   const maxApplications = platformConfig.maxApplicationsPerRun;
@@ -203,10 +356,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   let skipped = 0;
   let errors = 0;
 
-  logger.info({ platform: 'linkedin', searchUrl: platformConfig.searchUrl }, 'Navigating to LinkedIn search');
+  // Construct search URL dynamically from config.search.keywords
+  const searchUrl = buildSearchUrl(config);
+  logger.info({ platform: 'linkedin', searchUrl }, 'Navigating to LinkedIn search');
 
-  // Navigate to the pre-configured search URL (includes Easy Apply filter f_AL=true)
-  await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // Navigate to dynamically constructed search URL
+  // geoId=103644278 (United States) + URL-encoded keywords + f_AL=true + f_TPR=r604800
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
 
   // Check for CAPTCHA immediately after navigation (PRD §8.2)
@@ -233,67 +389,122 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       break;
     }
 
-    // Get all job cards currently visible on the page
-    const jobCards = await page.$$('.job-card-container, .jobs-search-results__list-item');
-    logger.info({ platform: 'linkedin', cardCount: jobCards.length }, 'Found job cards');
+    // Query job cards fresh from the live DOM.
+    // We use index-based iteration and re-query each time because clicking a
+    // card, opening a modal, or dismissing it can mutate the DOM and
+    // invalidate previously-held element handles.
+    // Job cards live inside the scrollable left-hand list. We scope all card
+    // queries to this container so we never accidentally match filter chips,
+    // nav elements, or other page-level nodes.
+    const LIST_SELECTOR = '.jobs-search-results-list, [class*="jobs-search-results"], .scaffold-layout__list';
+    let pageAlive = true;
 
-    // cardsToProcess queue enables per-job retry: on transient error, push card
-    // back onto the queue (up to maxRetries times) before recording as error.
-    const cardsToProcess = [...jobCards];
+    // Only match <li> elements that contain an actual job link — this filters
+    // out spacer elements, ad slots, promoted cards, and skeleton placeholders
+    // that don't have job data and cause extractJobId to return null.
+    const initialCards = await page.$$(`${LIST_SELECTOR} li`);
+    const jobCards = [];
+    for (const li of initialCards) {
+      const hasJobLink = await li.$('a[href*="/jobs/view/"]');
+      const hasJobId = await li.getAttribute('data-occludable-job-id');
+      if (hasJobLink || hasJobId) jobCards.push(li);
+    }
+    const totalCardCount = jobCards.length;
+    logger.info({ platform: 'linkedin', cardCount: totalCardCount, totalLi: initialCards.length }, 'Found job cards');
 
-    while (cardsToProcess.length > 0 && applied < maxApplications) {
-      const card = cardsToProcess.shift();
+    // Build a CARD_SELECTOR that re-queries only real job cards on each iteration.
+    // We use data-occludable-job-id which is the most reliable marker.
+    const CARD_SELECTOR = `${LIST_SELECTOR} li[data-occludable-job-id], ${LIST_SELECTOR} li:has(a[href*="/jobs/view/"])`;
+
+    for (let cardIdx = 0; cardIdx < totalCardCount && applied < maxApplications; cardIdx++) {
+      // ── Re-query the card list so we always have a live handle ──
+      let freshCards;
+      try {
+        freshCards = await page.$$(CARD_SELECTOR);
+      } catch (reQueryErr) {
+        logger.warn({ platform: 'linkedin', error: reQueryErr.message }, 'Failed to query cards — page may have closed');
+        pageAlive = false;
+        break;
+      }
+      if (cardIdx >= freshCards.length) {
+        logger.debug({ platform: 'linkedin', cardIdx, freshCount: freshCards.length }, 'Card list shrank — skipping remaining');
+        break;
+      }
+      const card = freshCards[cardIdx];
 
       let jobId = null;
       let jobTitle = null;
       let company = null;
       let jobUrl = null;
 
+      // Extract jobId FIRST, before any clicks.  If this fails the element
+      // handle is unusable — skip the card entirely without recording.
       try {
         jobId = await extractJobId(card);
-        if (!jobId) {
-          skipped++;
-          continue;
-        }
+      } catch (extractErr) {
+        logger.debug({ platform: 'linkedin', cardIdx, reason: 'extract_failed', error: extractErr.message }, 'Skipping card');
+        skipped++;
+        continue;
+      }
+      if (!jobId) {
+        logger.debug({ platform: 'linkedin', cardIdx, reason: 'no_job_id' }, 'Skipping card');
+        skipped++;
+        continue;
+      }
 
+      // Quick-extract title/company from the card before any clicks for logging
+      try {
+        const titleEl = await card.$('a[class*="job-card-list__title"], a[class*="job-card-container__link"], [class*="job-title"], strong');
+        if (titleEl) jobTitle = (await titleEl.innerText()).trim().replace(/\n.*/s, '');
+        const companyEl = await card.$('[class*="company-name"], [class*="primary-description"], [class*="subtitle"]');
+        if (companyEl) company = (await companyEl.innerText()).trim().replace(/\n.*/s, '');
+      } catch (_) {}
+
+      try {
         // Check if already applied (SQLite lookup)
         if (state.hasApplied('linkedin', jobId)) {
-          logger.debug({ jobId }, 'Already applied — skipping');
-          state.recordApplication({ platform: 'linkedin', jobId, status: 'already_applied', runId });
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'already_applied_db' }, 'Skipping job');
+          state.recordApplication({ platform: 'linkedin', jobId, jobTitle, company, status: 'already_applied', skipReason: 'already_applied_db', runId });
           skipped++;
           continue;
         }
 
-        // Extract job title and company for logging
-        const titleEl = await card.$('.job-card-list__title, .job-card-container__link');
-        if (titleEl) jobTitle = (await titleEl.innerText()).trim();
-        const companyEl = await card.$('.job-card-container__company-name, .job-card-container__primary-description');
-        if (companyEl) company = (await companyEl.innerText()).trim();
+        // Click the job card's title link to load the detail panel on the right.
+        const cardLink = await card.$('a[class*="job-card-list__title"], a[class*="job-card-container__link"], a[href*="/jobs/view/"]');
+        const clickTarget = cardLink || card;
 
-        // Click the job card to load the detail panel
-        await card.click();
+        await clickTarget.click();
         await sleep(1500, 3000);
 
-        // Wait for the job detail panel to load
-        await page.waitForSelector('.jobs-details__main-content, .job-view-layout', {
+        // Wait for the job DETAIL PANEL (right side) to load
+        const DETAIL_SELECTOR = '.jobs-search__job-details, .job-details, .jobs-details, .jobs-details__main-content, .job-view-layout';
+        await page.waitForSelector(DETAIL_SELECTOR, {
           timeout: SELECTOR_TIMEOUT,
         });
 
         // Get the current URL for this job
         jobUrl = page.url();
 
-        // Check for the Easy Apply button in the detail panel
-        // LinkedIn shows either "Easy Apply" (blue) or "Apply" (external redirect)
-        const easyApplyBtn = await page.$(
-          'button.jobs-apply-button[aria-label*="Easy Apply"], button:has-text("Easy Apply")'
-        );
+        // The "Easy Apply" button lives inside the detail panel (right side),
+        // NOT in the job card list. Scope the search to the detail container.
+        const detailPanel = await page.$(DETAIL_SELECTOR);
+        let easyApplyBtn = null;
+        if (detailPanel) {
+          easyApplyBtn = await detailPanel.$('button.jobs-apply-button, button[aria-label*="Easy Apply"]');
+        }
+        // Fallback: use Playwright's role-based locator scoped to detail panel
+        if (!easyApplyBtn) {
+          const loc = page.getByRole('button', { name: /easy apply/i });
+          if (await loc.count() > 0) {
+            easyApplyBtn = await loc.first().elementHandle();
+          }
+        }
 
         if (!easyApplyBtn) {
-          // No Easy Apply button — this job uses external application
-          logger.debug({ jobId, jobTitle, company }, 'No Easy Apply button — skipping (external apply)');
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'no_easy_apply_button' }, 'Skipping job');
           state.recordApplication({
             platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'skipped', errorMessage: 'external_apply', runId,
+            status: 'skipped', skipReason: 'no_easy_apply_button', runId,
           });
           skipped++;
           continue;
@@ -301,17 +512,19 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         const isVisible = await easyApplyBtn.isVisible();
         if (!isVisible) {
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'easy_apply_not_visible' }, 'Skipping job');
           skipped++;
           continue;
         }
 
         // Check if we've already applied (LinkedIn sometimes shows this in the button)
         const btnText = await easyApplyBtn.innerText();
+
         if (btnText.toLowerCase().includes('applied')) {
-          logger.debug({ jobId }, 'Already applied indicator on button — skipping');
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'already_applied_linkedin' }, 'Skipping job');
           state.recordApplication({
             platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', runId,
+            status: 'already_applied', skipReason: 'already_applied_linkedin', runId,
           });
           skipped++;
           continue;
@@ -339,28 +552,54 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           if (dismissBtn) await dismissBtn.click();
           state.recordApplication({
             platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', runId,
+            status: 'already_applied', skipReason: 'already_applied_linkedin', runId,
           });
           skipped++;
           continue;
         }
 
-        // Process multi-step modal — keep clicking Next until we Submit
+        // Process multi-step modal — keep clicking Next until we Submit.
+        // Track step identity by fingerprinting field labels so we detect
+        // cycles (modal wrapping back to an earlier step) reliably.
         let stepCount = 0;
         let modalComplete = false;
-        const MAX_STEPS = 10; // Safeguard against infinite loops
+        const seenFingerprints = new Set();
+        const MAX_STEPS = 12; // Safeguard against infinite loops
 
         while (!modalComplete && stepCount < MAX_STEPS) {
           stepCount++;
-          const result = await handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun);
+
+          // Fingerprint this step by its field labels
+          const fingerprint = await page.evaluate(() => {
+            const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal');
+            if (!modal) return '';
+            const labels = [];
+            for (const lbl of modal.querySelectorAll('label, legend, [data-test-form-element-label]')) {
+              const t = (lbl.textContent || '').trim().substring(0, 60);
+              if (t) labels.push(t);
+            }
+            return labels.sort().join('||');
+          }).catch(() => '');
+
+          if (fingerprint && seenFingerprints.has(fingerprint)) {
+            logger.warn({ platform: 'linkedin', jobId, step: stepCount }, 'Modal cycled back to a previously seen step — skipping job');
+            throw new Error('Modal cycled — unfilled required fields on an earlier step');
+          }
+          if (fingerprint) seenFingerprints.add(fingerprint);
+
+          const result = await handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount);
 
           if (result === 'submitted') {
             modalComplete = true;
-            // Wait for confirmation message
-            await page.waitForSelector(
-              'text="Application submitted", text="Your application was sent", .artdeco-toast-item--success',
-              { timeout: 10000 }
-            ).catch(() => null);
+
+            if (!dryRun) {
+              // Wait for LinkedIn's success confirmation overlay
+              await page.waitForSelector(
+                'text="Application submitted", text="Your application was sent", .artdeco-toast-item--success',
+                { timeout: 10000 }
+              ).catch(() => null);
+            }
+
             logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Application submitted');
             state.recordApplication({
               platform: 'linkedin', jobId, jobTitle, company, jobUrl,
@@ -368,11 +607,58 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             });
             applied++;
 
-            // Close the success modal/dialog
+            // Dismiss the post-submit success dialog / modal.
+            // LinkedIn may show "Done", "Not now", or an X button — try
+            // multiple approaches since labels can intercept pointer events.
             await sleep(1000, 2000);
-            const doneBtn = await page.$('button[aria-label="Dismiss"], button:has-text("Done"), button:has-text("Not now")');
-            if (doneBtn) await doneBtn.click();
+            let dismissed = false;
 
+            // Try each dismiss strategy
+            const dismissSelectors = [
+              'button[aria-label="Dismiss"]',
+              'button:has-text("Done")',
+              'button:has-text("Not now")',
+            ];
+            for (const sel of dismissSelectors) {
+              if (dismissed) break;
+              try {
+                const btn = await page.$(sel);
+                if (btn && await btn.isVisible()) {
+                  await btn.click({ force: true }); // force bypasses label intercepts
+                  dismissed = true;
+                  await sleep(500, 1000);
+                }
+              } catch (_) {}
+            }
+
+            // If the modal is still blocking, press Escape as a last resort
+            if (!dismissed) {
+              try {
+                await page.keyboard.press('Escape');
+                await sleep(500, 1000);
+              } catch (_) {}
+            }
+
+            // Wait for the modal overlay to fully close
+            await page.waitForSelector('.jobs-easy-apply-modal, .artdeco-modal', {
+              state: 'hidden',
+              timeout: 5000,
+            }).catch(() => null);
+
+            // Verify the job list is accessible again before continuing
+            try {
+              await page.waitForSelector(LIST_SELECTOR, { timeout: 5000 });
+            } catch (_) {
+              logger.warn({ platform: 'linkedin' }, 'Job list not visible after submit — attempting recovery');
+              // Try scrolling up to reveal the list
+              await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+              await sleep(1000, 2000);
+            }
+
+          } else if (result === 'validation_error') {
+            // Clicking Next triggered validation errors — required fields are
+            // unfilled and the modal won't advance.  Skip this job immediately.
+            throw new Error(`Validation errors on step ${stepCount} — required fields unfilled`);
           } else if (result === 'error') {
             throw new Error(`Could not navigate modal step ${stepCount}`);
           }
@@ -387,20 +673,49 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         await sleep(minDelayBetweenApplications, maxDelayBetweenApplications);
 
       } catch (err) {
-        // Try to close the modal if it's stuck open
+        // Robustly close any open modal to prevent state leaking into the
+        // next job.  Sequence: dismiss → discard confirm → verify closed →
+        // force-navigate if still stuck.
         try {
-          const dismissBtn = await page.$(
-            'button[aria-label="Dismiss"], button[aria-label="Cancel"], .jobs-easy-apply-modal__dismiss'
-          );
+          const dismissBtn = await page.$('button[aria-label="Dismiss"]');
           if (dismissBtn) {
-            await dismissBtn.click();
-            await sleep(500, 1000);
-            // Confirm discard if prompted
-            const discardBtn = await page.$('button:has-text("Discard"), button[data-control-name="discard_application"]');
-            if (discardBtn) await discardBtn.click();
+            await dismissBtn.click({ force: true });
+            await sleep(800, 1500);
+
+            const discardBtn = await page.waitForSelector(
+              'button[data-control-name="discard_application_confirm"]',
+              { timeout: 5000 }
+            ).catch(() => null);
+
+            if (discardBtn) {
+              await discardBtn.click({ force: true });
+              await sleep(500, 1000);
+            } else {
+              const fallbackDiscard = await page.$('button:has-text("Discard")');
+              if (fallbackDiscard) {
+                await fallbackDiscard.click({ force: true });
+                await sleep(500, 1000);
+              }
+            }
           }
+
+          // Wait for the modal to fully close
+          await page.waitForSelector('.jobs-easy-apply-modal, .artdeco-modal', {
+            state: 'hidden',
+            timeout: 5000,
+          }).catch(() => null);
         } catch (_) {
-          // Ignore cleanup errors
+          try { await page.keyboard.press('Escape'); } catch (__) {}
+          await sleep(1000, 2000);
+        }
+
+        // Verify the modal is actually gone.  If not, force-navigate back
+        // to the search URL to reset page state completely.
+        const modalStillOpen = await page.$('.jobs-easy-apply-modal, .artdeco-modal').catch(() => null);
+        if (modalStillOpen) {
+          logger.warn({ platform: 'linkedin', jobId }, 'Modal still open after dismiss — force-navigating to search URL');
+          await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+          await sleep(2000, 3000);
         }
 
         await sleep(2000, 4000);
@@ -415,12 +730,12 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           return { applied, skipped, errors };
         }
 
-        // Retry transient errors up to maxRetries times
-        const attemptsMade = (retryAttempts.get(jobId ?? '') || 0) + 1;
-        if (jobId && attemptsMade <= maxRetries) {
+        // Retry transient errors up to maxRetries times (re-visit same index)
+        const attemptsMade = (retryAttempts.get(jobId) || 0) + 1;
+        if (attemptsMade <= maxRetries) {
           retryAttempts.set(jobId, attemptsMade);
-          logger.warn({ platform: 'linkedin', jobId, attempt: attemptsMade, error: err.message }, 'Transient error — queuing retry');
-          cardsToProcess.push(card);
+          logger.warn({ platform: 'linkedin', jobId, attempt: attemptsMade, error: err.message }, 'Transient error — will retry');
+          cardIdx--; // decrement so the for-loop re-visits this index with a fresh handle
         } else {
           logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
           errors++;
@@ -432,6 +747,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         }
       }
     }
+
+    // If the page/context was closed mid-run, exit the outer loop too
+    if (!pageAlive) break;
 
     // Pagination: scroll down to load more jobs or find "See more jobs" button
     if (applied < maxApplications) {
@@ -447,8 +765,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           await sleep(2000, 3000);
 
           // Check if new cards loaded
-          const newCards = await page.$$('.job-card-container, .jobs-search-results__list-item');
-          if (newCards.length <= jobCards.length) {
+          const newCards = await page.$$(CARD_SELECTOR);
+          if (newCards.length <= totalCardCount) {
             pageHasMoreJobs = false;
           }
         } else {

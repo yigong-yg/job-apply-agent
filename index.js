@@ -8,15 +8,27 @@
  *   node index.js                            # Run all enabled platforms
  *   node index.js --dry-run                  # Simulate without submitting
  *   node index.js --platform linkedin        # Run only LinkedIn
- *   node index.js --dry-run --platform dice  # Dry run for Dice only
+ *   node index.js --max 5                    # Override max applications
+ *   node index.js --help                     # Show usage
+ *
+ * Configuration priority: CLI flags > .env > config.json
  */
+
+require('dotenv').config();
 
 const path = require('path');
 const fs = require('fs');
 
 // Load configuration files
-const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
-const defaultAnswers = JSON.parse(fs.readFileSync(path.join(__dirname, 'defaultAnswers.json'), 'utf8'));
+const configPath = path.join(__dirname, 'config.json');
+const answersPath = path.join(__dirname, 'defaultAnswers.json');
+if (!fs.existsSync(configPath) || !fs.existsSync(answersPath)) {
+  const missing = [!fs.existsSync(configPath) && 'config.json', !fs.existsSync(answersPath) && 'defaultAnswers.json'].filter(Boolean);
+  console.error(`Error: missing ${missing.join(' and ')}. Copy from .example templates:\n  cp config.json.example config.json\n  cp defaultAnswers.json.example defaultAnswers.json\nThen fill in your personal details.`);
+  process.exit(2);
+}
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const defaultAnswers = JSON.parse(fs.readFileSync(answersPath, 'utf8'));
 
 // Core libraries
 const logger = require('./lib/logger');
@@ -39,22 +51,96 @@ const PLATFORM_MODULES = {
 
 const KNOWN_PLATFORMS = new Set(Object.keys(PLATFORM_MODULES));
 
+const HELP_TEXT = `
+Usage: node index.js [options]
+
+Options:
+  --dry-run         Take screenshots instead of submitting (overrides .env DRY_RUN)
+  --platform <name> Run specific platform only (overrides .env PLATFORMS)
+  --max <number>    Max applications this run (overrides .env MAX_APPLICATIONS)
+  --headless        Run in headless mode (overrides .env HEADLESS)
+  --help            Show this help message
+
+Configuration priority: CLI flags > .env > config.json
+See .env.example for all available environment variables.
+`.trim();
+
 /**
- * Parse CLI arguments.
- * Exits with code 2 (usage error) if --platform value is not a known platform.
+ * Parse CLI arguments into a flat object.
  */
 function parseArgs(argv) {
   const args = argv.slice(2);
-  const dryRun = args.includes('--dry-run');
-  const platformIdx = args.indexOf('--platform');
-  const platformFilter = platformIdx !== -1 ? args[platformIdx + 1]?.toLowerCase() : null;
 
-  if (platformFilter && !KNOWN_PLATFORMS.has(platformFilter)) {
-    console.error(`Error: unknown platform "${platformFilter}". Valid options: ${[...KNOWN_PLATFORMS].join(', ')}`);
-    process.exit(2);
+  if (args.includes('--help')) {
+    console.log(HELP_TEXT);
+    process.exit(0);
   }
 
-  return { dryRun, platformFilter };
+  const parsed = {
+    dryRun: args.includes('--dry-run') ? true : undefined,
+    headless: args.includes('--headless') ? true : undefined,
+    platform: undefined,
+    max: undefined,
+  };
+
+  const platformIdx = args.indexOf('--platform');
+  if (platformIdx !== -1) {
+    parsed.platform = args[platformIdx + 1]?.toLowerCase();
+    if (parsed.platform && !KNOWN_PLATFORMS.has(parsed.platform)) {
+      console.error(`Error: unknown platform "${parsed.platform}". Valid options: ${[...KNOWN_PLATFORMS].join(', ')}`);
+      process.exit(2);
+    }
+  }
+
+  const maxIdx = args.indexOf('--max');
+  if (maxIdx !== -1) {
+    const val = parseInt(args[maxIdx + 1], 10);
+    if (isNaN(val) || val < 1) {
+      console.error('Error: --max requires a positive integer');
+      process.exit(2);
+    }
+    parsed.max = val;
+  }
+
+  return parsed;
+}
+
+/**
+ * Build the resolved runtime configuration from CLI > .env > config.json.
+ */
+function resolveRuntime(cli) {
+  // Platform filter (CLI > .env > all enabled in config)
+  const platformFilter = cli.platform
+    || (process.env.PLATFORMS ? process.env.PLATFORMS.split(',').map(s => s.trim()).filter(Boolean)[0] : null)
+    || null;
+
+  // Dry run
+  const dryRun = cli.dryRun !== undefined
+    ? cli.dryRun
+    : (process.env.DRY_RUN !== undefined ? process.env.DRY_RUN === 'true' : false);
+
+  // Headless
+  const headless = cli.headless !== undefined
+    ? cli.headless
+    : (process.env.HEADLESS !== undefined ? process.env.HEADLESS === 'true' : (config.behavior?.headless ?? true));
+
+  // Max applications (per platform)
+  const maxApplications = cli.max
+    || (process.env.MAX_APPLICATIONS ? parseInt(process.env.MAX_APPLICATIONS, 10) : null)
+    || null; // null = use platform default from config
+
+  // Delays
+  const delayMin = parseInt(process.env.DELAY_MIN_BETWEEN_APPS || 0, 10)
+    || config.behavior?.minDelayBetweenApplications || 5000;
+  const delayMax = parseInt(process.env.DELAY_MAX_BETWEEN_APPS || 0, 10)
+    || config.behavior?.maxDelayBetweenApplications || 15000;
+
+  // Screenshot on error
+  const screenshotOnError = process.env.SCREENSHOT_ON_ERROR !== undefined
+    ? process.env.SCREENSHOT_ON_ERROR !== 'false'
+    : (config.behavior?.screenshotOnError !== false);
+
+  return { platformFilter, dryRun, headless, maxApplications, delayMin, delayMax, screenshotOnError };
 }
 
 /**
@@ -124,7 +210,7 @@ function ensureDirectories() {
   const dirs = [
     path.join(__dirname, 'db'),
     path.join(__dirname, 'logs'),
-    path.join(__dirname, 'logs', 'errors'),
+    path.join(__dirname, 'logs', 'screenshots'),
     path.join(__dirname, 'resumes'),
     path.join(__dirname, 'browser-data'),
   ];
@@ -139,7 +225,8 @@ function ensureDirectories() {
  * Main execution flow.
  */
 async function main() {
-  const { dryRun, platformFilter } = parseArgs(process.argv);
+  const cli = parseArgs(process.argv);
+  const runtime = resolveRuntime(cli);
   const startTime = Date.now();
 
   ensureDirectories();
@@ -147,31 +234,39 @@ async function main() {
   // Create a new run record in SQLite
   const runId = state.createRun();
 
+  // Log resolved runtime config so the user always knows what's active
+  console.log(`Runtime config: max=${runtime.maxApplications || 'per-platform default'}, headless=${runtime.headless}, dryRun=${runtime.dryRun}, platforms=${runtime.platformFilter || 'all enabled'}, delays=${runtime.delayMin}-${runtime.delayMax}ms`);
+
   logger.info(
-    { runId, dryRun, platformFilter: platformFilter || 'all' },
-    `Starting job application run${dryRun ? ' [DRY RUN]' : ''}`
+    { runId, dryRun: runtime.dryRun, platformFilter: runtime.platformFilter || 'all' },
+    `Starting job application run${runtime.dryRun ? ' [DRY RUN]' : ''}`
   );
 
-  if (dryRun) {
+  if (runtime.dryRun) {
     logger.info('DRY RUN mode: will take screenshots instead of submitting applications');
   }
+
+  // Inject runtime overrides into config so modules read them transparently.
+  // This avoids changing every module's function signature.
+  config.behavior.minDelayBetweenApplications = runtime.delayMin;
+  config.behavior.maxDelayBetweenApplications = runtime.delayMax;
+  config.behavior.screenshotOnError = runtime.screenshotOnError;
+  config.behavior.headless = runtime.headless;
 
   const runStats = {};
   const enabledPlatforms = Object.entries(config.platforms)
     .filter(([name, cfg]) => {
       if (!cfg.enabled) return false;
-      if (platformFilter && name !== platformFilter) return false;
+      if (runtime.platformFilter && name !== runtime.platformFilter) return false;
       return true;
     })
     .map(([name]) => name);
 
   if (enabledPlatforms.length === 0) {
-    // platformFilter was already validated above, so if we're here it means
-    // config has that platform disabled — treat as a configuration error.
-    const msg = platformFilter
-      ? `Platform "${platformFilter}" is disabled in config.json (set enabled: true to use it).`
+    const msg = runtime.platformFilter
+      ? `Platform "${runtime.platformFilter}" is disabled in config.json (set enabled: true to use it).`
       : 'No platforms are enabled in config.json.';
-    logger.error({ platformFilter }, msg);
+    logger.error({ platformFilter: runtime.platformFilter }, msg);
     console.error('Error:', msg);
     process.exit(2);
   }
@@ -183,14 +278,17 @@ async function main() {
     const platformLogger = logger.child({ platform });
     platformLogger.info('Processing platform');
 
+    // Apply global max override if set, otherwise use per-platform default
+    if (runtime.maxApplications) {
+      config.platforms[platform].maxApplicationsPerRun = runtime.maxApplications;
+    }
+
     let context = null;
     let page = null;
 
     try {
       // Launch persistent browser context for this platform
-      // Persistent context = cookies/session survive between runs (loaded from browser-data/<platform>/)
-      const headless = config.behavior?.headless !== false;
-      const launched = await launchForPlatform(platform, headless);
+      const launched = await launchForPlatform(platform, runtime.headless);
       context = launched.context;
       page = launched.page;
 
@@ -208,19 +306,16 @@ async function main() {
 
       // Run the platform-specific apply module
       const applyFn = PLATFORM_MODULES[platform];
-      const platformStats = await applyFn(page, config, defaultAnswers, state, runId, platformLogger, dryRun);
+      const platformStats = await applyFn(page, config, defaultAnswers, state, runId, platformLogger, runtime.dryRun);
 
       runStats[platform] = platformStats;
       platformLogger.info(platformStats, 'Platform complete');
 
     } catch (err) {
-      // Catch unexpected errors at the platform level — don't crash the whole run
       platformLogger.error({ error: err.message, stack: err.stack }, 'Unexpected platform error');
       runStats[platform] = { applied: 0, skipped: 0, errors: 1 };
 
     } finally {
-      // Always close the browser context when done with a platform
-      // This releases resources and saves session state
       if (context) {
         try {
           await context.close();

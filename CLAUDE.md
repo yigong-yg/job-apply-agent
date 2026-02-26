@@ -2,10 +2,10 @@
 
 ## Document Metadata
 
-- **Version:** 1.0
-- **Date:** 2026-02-19
+- **Version:** 1.1
+- **Date:** 2026-02-24
 - **Author:** Yi (via Claude)
-- **Status:** Draft — Ready for Claude Code Implementation
+- **Status:** Draft — Configuration Finalized, Ready for Testing
 - **Scope:** "One-Click Apply" scenarios ONLY across LinkedIn Easy Apply, Indeed Apply, Dice Easy Apply, and Jobright Quick Apply
 
 ---
@@ -78,7 +78,10 @@ Build a Playwright-based automation agent that runs as a daily cron job, automat
 job-apply-agent/
 ├── config.json                 # User profile + search parameters
 ├── index.js                    # Main orchestrator entry point
+├── setup.js                    # One-time session capture (headed browser)
+├── benchmark.js                # Benchmark reporting (read-only)
 ├── run_apply.sh                # Shell launcher for cron
+├── .env.example                # Runtime knobs template
 ├── package.json
 ├── db/
 │   └── applications.db         # SQLite database (auto-created)
@@ -201,27 +204,26 @@ Sessions WILL expire. The agent must handle this gracefully:
     "state": "UT",
     "country": "US",
     "zipCode": "[ZIP]",
-    "linkedinUrl": "https://linkedin.com/in/[HANDLE]",
-    "workAuthorization": "US Citizen",
+    "linkedinUrl": "https://www.linkedin.com/in/[HANDLE]/",
+    "workAuthorization": "Authorized to work in the US",
     "requiresSponsorship": false,
     "willingToRelocate": true,
-    "yearsOfExperience": "3",
+    "yearsOfExperience": "2",
     "highestEducation": "Master's Degree",
     "veteranStatus": "I am not a protected veteran",
     "disabilityStatus": "I do not wish to answer",
     "gender": "Male",
     "race": "Prefer not to say",
-    "desiredSalary": "120000",
+    "desiredSalary": "150000",
     "startDate": "Immediately",
     "resumePath": "./resumes/resume.pdf"
   },
 
   "search": {
-    "keywords": ["data scientist", "machine learning engineer", "data analyst"],
-    "location": "Salt Lake City, UT",
+    "keywords": ["data scientist", "machine learning engineer", "data analyst", "ML engineer", "applied scientist", "data engineer"],
+    "location": "United States",
     "remoteOnly": false,
     "includeRemote": true,
-    "radius": "50 miles",
     "datePosted": "Past week",
     "experienceLevel": ["Entry level", "Associate", "Mid-Senior level"],
     "jobType": ["Full-time"]
@@ -230,23 +232,19 @@ Sessions WILL expire. The agent must handle this gracefully:
   "platforms": {
     "linkedin": {
       "enabled": true,
-      "maxApplicationsPerRun": 30,
-      "searchUrl": "https://www.linkedin.com/jobs/search/?keywords=data+scientist&location=Salt+Lake+City%2C+UT&f_AL=true&f_TPR=r604800"
+      "maxApplicationsPerRun": 30
     },
     "indeed": {
       "enabled": true,
-      "maxApplicationsPerRun": 30,
-      "searchUrl": "https://www.indeed.com/jobs?q=data+scientist&l=Salt+Lake+City%2C+UT&fromage=7&sc=0kf%3Aattr(DSQF7)%3B"
+      "maxApplicationsPerRun": 30
     },
     "dice": {
       "enabled": true,
-      "maxApplicationsPerRun": 30,
-      "searchUrl": "https://www.dice.com/jobs?q=data+scientist&location=Salt+Lake+City%2C+UT&radius=50&postedDate=SEVEN"
+      "maxApplicationsPerRun": 30
     },
     "jobright": {
       "enabled": true,
-      "maxApplicationsPerRun": 20,
-      "searchUrl": "https://jobright.ai/jobs"
+      "maxApplicationsPerRun": 20
     }
   },
 
@@ -269,35 +267,32 @@ Sessions WILL expire. The agent must handle this gracefully:
 }
 ```
 
+> **Note:** No static `searchUrl` fields in platform configs. Each platform module constructs its search URL dynamically from `search.keywords` and `search.location` at runtime.
+
 ### 4.2 Default Answer Map
 
-For screener questions that appear on some quick-apply forms, the agent needs a lookup table of common questions and their default answers. This is separate from `config.json` for clarity:
+For screener questions that appear on some quick-apply forms, the agent needs a lookup table of common questions and their default answers. This is separate from `config.json` for clarity.
+
+> **Note:** See `defaultAnswers.json` for the complete answer map (~60 entries). The subset below shows the pattern:
 
 ```json
 {
   "defaultAnswers": {
-    "years of experience": "3",
-    "years of relevant experience": "3",
+    "years of experience": "2",
+    "years of relevant experience": "2",
     "are you legally authorized to work": "Yes",
     "do you now or will you in the future require sponsorship": "No",
     "are you willing to relocate": "Yes",
-    "what is your expected salary": "120000",
-    "desired salary": "120000",
+    "what is your expected salary": "150000",
+    "desired salary": "150000",
     "when can you start": "Immediately",
-    "have you been referred": "No",
-    "how did you hear about": "Job Board",
     "highest level of education": "Master's Degree",
-    "do you have a bachelor's degree": "Yes",
-    "do you have a master's degree": "Yes",
-    "are you 18 years or older": "Yes",
-    "can you commute to": "Yes",
     "do you have experience with python": "Yes",
-    "do you have experience with sql": "Yes",
     "do you have experience with machine learning": "Yes",
-    "linkedin profile": "https://linkedin.com/in/[HANDLE]",
-    "github": "[GITHUB_URL]",
-    "portfolio": "[PORTFOLIO_URL]",
-    "cover letter": ""
+    "linkedin profile": "https://www.linkedin.com/in/[HANDLE]/",
+    "github": "https://github.com/[GITHUB_HANDLE]",
+    "cover letter": "",
+    "disability status": "I do not wish to answer"
   }
 }
 ```
@@ -317,7 +312,7 @@ For screener questions that appear on some quick-apply forms, the agent needs a 
 #### 5.1.2 Application Flow (Step by Step)
 
 ```
-1. NAVIGATE to search URL (pre-configured with filters including Easy Apply filter f_AL=true)
+1. NAVIGATE to dynamically constructed search URL (geoId=103644278 [United States] + URL-encoded keywords from config.search.keywords + f_AL=true [Easy Apply] + f_TPR=r604800 [Past week])
 2. WAIT for job list to load (selector: `.jobs-search-results-list`)
 3. FOR EACH job card in the list:
    a. READ job ID from card's data attribute or href
@@ -671,8 +666,9 @@ TABLE applications (
   jobTitle      TEXT,
   company       TEXT,
   jobUrl        TEXT,
-  status        TEXT NOT NULL,          -- 'submitted' | 'skipped' | 'error' | 'already_applied'
+  status        TEXT NOT NULL,          -- 'submitted' | 'skipped' | 'error' | 'already_applied' | 'dry_run' | 'captcha_blocked'
   errorMessage  TEXT,
+  skipReason    TEXT,                   -- Why this job was skipped (e.g. 'already_applied_db', 'no_easy_apply_button')
   appliedAt     TEXT NOT NULL,          -- ISO 8601 timestamp
   runId         TEXT NOT NULL           -- UUID for each cron run
 );
@@ -832,9 +828,11 @@ node index.js 2>&1 | tee -a logs/$(date +%Y-%m-%d).log
 # Runs Monday through Friday only
 ```
 
+**Windows:** `run_apply.bat` is available for Windows Task Scheduler. It invokes Git Bash with `run_apply.sh`. Schedule it as a daily task at 10:00 AM via Task Scheduler.
+
 ### 9.2 System Requirements
 
-- macOS or Linux (Ubuntu 22+)
+- Windows 11, macOS, or Linux (Ubuntu 22+)
 - Node.js 18 or higher
 - Playwright system dependencies (`npx playwright install-deps`)
 - Chromium browser (installed via `npx playwright install chromium`)

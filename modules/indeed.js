@@ -26,7 +26,7 @@ const SELECTOR_TIMEOUT = 10000;
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
   try {
-    const dir = path.join(process.cwd(), 'logs', 'errors');
+    const dir = path.join(process.cwd(), 'logs', 'screenshots');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const today = new Date().toISOString().slice(0, 10);
     const fname = `${today}-${platform}-${(jobId || 'unknown').replace(/[^a-z0-9]/gi, '_')}.png`;
@@ -145,6 +145,17 @@ async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dry
  * @param {boolean} [dryRun=false]
  * @returns {Promise<{ applied: number, skipped: number, errors: number }>}
  */
+/**
+ * Build an Indeed search URL dynamically from config.search.keywords.
+ * Includes Indeed Apply filter: sc=0kf%3Aattr(DSQF7)%3B + fromage=7 (past week)
+ */
+function buildSearchUrl(config) {
+  const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
+  const encoded = encodeURIComponent(keywords);
+  const location = encodeURIComponent(config.search?.location || 'United States');
+  return `https://www.indeed.com/jobs?q=${encoded}&l=${location}&fromage=7&sc=0kf%3Aattr(DSQF7)%3B`;
+}
+
 async function applyIndeed(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
   const platformConfig = config.platforms.indeed;
   const maxApplications = platformConfig.maxApplicationsPerRun;
@@ -157,10 +168,11 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
   let skipped = 0;
   let errors = 0;
 
-  logger.info({ platform: 'indeed', searchUrl: platformConfig.searchUrl }, 'Navigating to Indeed search');
+  const searchUrl = buildSearchUrl(config);
+  logger.info({ platform: 'indeed', searchUrl }, 'Navigating to Indeed search');
 
-  // The search URL includes Indeed Apply filter: sc=0kf%3Aattr(DSQF7)%3B
-  await page.goto(platformConfig.searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // Navigate to dynamically constructed URL (includes Indeed Apply filter)
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
 
   if (await isBotDetected(page)) {
@@ -171,8 +183,6 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
     });
     return { applied, skipped, errors };
   }
-
-  const searchUrl = platformConfig.searchUrl;
   let currentPage = 1;
   let pageHasMoreJobs = true;
 
