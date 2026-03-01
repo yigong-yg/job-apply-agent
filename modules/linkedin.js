@@ -336,12 +336,12 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
  * - Keywords are joined with " OR " and URL-encoded
  * - geoId=103644278 = "United States"
  * - f_AL=true = Easy Apply filter
- * - f_TPR=r604800 = Past week
+ * - f_TPR=r86400 = Past 24 hours
  */
 function buildSearchUrl(config) {
   const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
   const encoded = encodeURIComponent(keywords);
-  return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&geoId=103644278&f_AL=true&f_TPR=r604800`;
+  return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&geoId=103644278&f_AL=true&f_TPR=r86400`;
 }
 
 async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
@@ -459,6 +459,37 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         const companyEl = await card.$('[class*="company-name"], [class*="primary-description"], [class*="subtitle"]');
         if (companyEl) company = (await companyEl.innerText()).trim().replace(/\n.*/s, '');
       } catch (_) {}
+
+      // Extract location from the card before clicking into detail
+      let jobLocation = null;
+      try {
+        const locEl = await card.$('[class*="job-card-container__metadata-item"], [class*="artdeco-entity-lockup__caption"], [class*="job-card-container__metadata-wrapper"]');
+        if (locEl) jobLocation = (await locEl.innerText()).trim().replace(/\n.*/s, '');
+      } catch (_) {}
+
+      // ── Location filter: skip jobs outside target states ──
+      const locationFilter = config.search?.locationFilter;
+      if (locationFilter && locationFilter.length > 0 && jobLocation) {
+        const locUpper = jobLocation.toUpperCase();
+        // Allow remote jobs through (user has includeRemote: true)
+        const isRemote = locUpper.includes('REMOTE');
+        const matchesState = locationFilter.some(st => {
+          const stUpper = st.toUpperCase();
+          // Match ", CA", "(CA)", " CA " or ending with " CA"
+          return locUpper.includes(`, ${stUpper}`) ||
+                 locUpper.includes(`(${stUpper})`) ||
+                 locUpper.endsWith(` ${stUpper}`);
+        });
+        if (!isRemote && !matchesState) {
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, jobLocation, reason: 'location_filtered' }, 'Skipping job — location not in filter');
+          state.recordApplication({
+            platform: 'linkedin', jobId, jobTitle, company,
+            status: 'skipped', skipReason: `location_filtered:${jobLocation}`, runId,
+          });
+          skipped++;
+          continue;
+        }
+      }
 
       try {
         // Check if already applied (SQLite lookup)

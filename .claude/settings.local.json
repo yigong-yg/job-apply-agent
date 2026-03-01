@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(head:*)",
+      "Bash(gh pr list --state open)",
+      "Bash(gh pr view 5 --json comments,reviews,reviewRequests,title,body,url --jq '.')",
+      "Bash(gh api repos/yigong-yg/job-apply-agent/pulls/5/comments --jq '.[] | {path: .path, line: .line, body: .body, author: .user.login}')",
+      "Bash(git stash)",
+      "Bash(git checkout v1-linkedin-production)",
+      "Bash(git rm --cached config.json defaultAnswers.json)",
+      "Bash(node -c index.js)",
+      "Bash(node -c lib/form-filler.js)",
+      "Bash(node -c modules/linkedin.js)",
+      "Bash(node -c benchmark.js)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(git check-ignore config.json.example defaultAnswers.json.example)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git push origin v1-linkedin-production)"
+    ]
+  }
+}
