@@ -147,13 +147,13 @@ async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dry
  */
 /**
  * Build an Indeed search URL dynamically from config.search.keywords.
- * Includes Indeed Apply filter: sc=0kf%3Aattr(DSQF7)%3B + fromage=7 (past week)
+ * Includes Indeed Apply filter: sc=0kf%3Aattr(DSQF7)%3B + fromage=1 (past 24 hours)
  */
 function buildSearchUrl(config) {
   const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
   const encoded = encodeURIComponent(keywords);
   const location = encodeURIComponent(config.search?.location || 'United States');
-  return `https://www.indeed.com/jobs?q=${encoded}&l=${location}&fromage=7&sc=0kf%3Aattr(DSQF7)%3B`;
+  return `https://www.indeed.com/jobs?q=${encoded}&l=${location}&fromage=1&sc=0kf%3Aattr(DSQF7)%3B`;
 }
 
 async function applyIndeed(page, config, defaultAnswers, state, runId, logger, dryRun = false) {

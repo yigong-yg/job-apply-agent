@@ -95,7 +95,7 @@ function buildSearchUrl(config) {
   const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
   const encoded = encodeURIComponent(keywords);
   const location = encodeURIComponent(config.search?.location || 'United States');
-  return `https://www.dice.com/jobs?q=${encoded}&location=${location}&postedDate=SEVEN`;
+  return `https://www.dice.com/jobs?q=${encoded}&location=${location}&postedDate=ONE`;
 }
 
 async function applyDice(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
