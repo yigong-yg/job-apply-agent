@@ -98,7 +98,7 @@ function buildSearchUrl(config) {
   return `https://www.dice.com/jobs?q=${encoded}&location=${location}&postedDate=ONE`;
 }
 
-async function applyDice(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
+async function applyDice(page, config, defaultAnswers, state, runId, logger, dryRun = false, llmCache = null) {
   const platformConfig = config.platforms.dice;
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
@@ -272,6 +272,22 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
           throw new Error('Easy Apply modal did not open within timeout');
         }
 
+        // Scrape job description text for LLM context
+        let jobDescription = '';
+        try {
+          const jdEl = await page.$('.job-description, [data-testid="job-description"], [class*="description"]');
+          if (jdEl) jobDescription = (await jdEl.innerText()).trim();
+        } catch (_) {}
+
+        // Build fill options with LLM support
+        const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
+        const fillOptions = {
+          jobContext: { jobTitle, company, jobDescription },
+          llmCache: llmCache || undefined,
+          llmBudget,
+          runId,
+        };
+
         // Fill all fields in the single-screen Dice modal
         const { filledCount, unfilledFields } = await fillForm(
           page,
@@ -279,7 +295,8 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
           config,
           logger,
           'dice',
-          jobId
+          jobId,
+          fillOptions
         );
 
         for (const field of unfilledFields) {

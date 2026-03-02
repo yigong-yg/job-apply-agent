@@ -83,7 +83,7 @@ function isIndeedDomain(url) {
  * Handle a single step of the Indeed apply form.
  * Returns 'next', 'submitted', or 'error'.
  */
-async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dryRun) {
+async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dryRun, options = {}) {
   await sleep(800, 1500);
 
   const { filledCount, unfilledFields } = await fillForm(
@@ -92,7 +92,8 @@ async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dry
     config,
     logger,
     'indeed',
-    jobId
+    jobId,
+    options
   );
 
   for (const field of unfilledFields) {
@@ -156,7 +157,7 @@ function buildSearchUrl(config) {
   return `https://www.indeed.com/jobs?q=${encoded}&l=${location}&fromage=1&sc=0kf%3Aattr(DSQF7)%3B`;
 }
 
-async function applyIndeed(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
+async function applyIndeed(page, config, defaultAnswers, state, runId, logger, dryRun = false, llmCache = null) {
   const platformConfig = config.platforms.indeed;
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
@@ -341,6 +342,15 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
           }
         }
 
+        // Build fill options with LLM support for this job
+        const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
+        const fillOptions = {
+          jobContext: { jobTitle, company },
+          llmCache: llmCache || undefined,
+          llmBudget,
+          runId,
+        };
+
         // Multi-step form navigation
         let stepCount = 0;
         let formComplete = false;
@@ -348,7 +358,7 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
 
         while (!formComplete && stepCount < MAX_STEPS) {
           stepCount++;
-          const result = await handleIndeedStep(applyPage, defaultAnswers, config, logger, jobId, dryRun);
+          const result = await handleIndeedStep(applyPage, defaultAnswers, config, logger, jobId, dryRun, fillOptions);
 
           if (result === 'submitted') {
             formComplete = true;
