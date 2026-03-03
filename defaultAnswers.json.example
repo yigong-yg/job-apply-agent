@@ -64,7 +64,16 @@
     "disability status": "I do not wish to answer",
     "do you have a disability": "I do not wish to answer",
     "gender": "Male",
+    "pronoun": "He/Him",
+    "pronouns": "He/Him",
+    "preferred pronoun": "He/Him",
     "race": "Prefer not to say",
-    "ethnicity": "Prefer not to say"
+    "ethnicity": "Prefer not to say",
+    "city": "Salt Lake City",
+    "location city": "Salt Lake City",
+    "degree": "Master's Degree",
+    "discipline": "Computer Science",
+    "gpa": "3.8",
+    "pronouns other": ""
   }
 }

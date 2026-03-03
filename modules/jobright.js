@@ -124,7 +124,7 @@ function buildSearchUrl(config) {
   return `https://jobright.ai/jobs?q=${encoded}`;
 }
 
-async function applyJobright(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
+async function applyJobright(page, config, defaultAnswers, state, runId, logger, dryRun = false, llmCache = null) {
   const platformConfig = config.platforms.jobright;
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
@@ -307,6 +307,15 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
           { timeout: SELECTOR_TIMEOUT }
         ).catch(() => null);
 
+        // Build fill options with LLM support
+        const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
+        const fillOptions = {
+          jobContext: { jobTitle, company },
+          llmCache: llmCache || undefined,
+          llmBudget,
+          runId,
+        };
+
         // Fill any fields in the apply form
         const { filledCount, unfilledFields } = await fillForm(
           page,
@@ -314,7 +323,8 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
           config,
           logger,
           'jobright',
-          jobId
+          jobId,
+          fillOptions
         );
 
         for (const field of unfilledFields) {

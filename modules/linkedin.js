@@ -18,7 +18,7 @@
 const path = require('path');
 const fs = require('fs');
 const { sleep, scrollLikeHuman } = require('../lib/humanize');
-const { fillForm } = require('../lib/form-filler');
+const { fillForm, retryInvalidFields } = require('../lib/form-filler');
 const { recordUnfilledField } = require('../lib/state');
 
 // Maximum time to wait for selectors (ms)
@@ -124,9 +124,10 @@ async function extractJobId(card) {
  * @param {string} jobId
  * @param {boolean} dryRun
  * @param {number} stepNum - 1-based modal step index for logging/diagnostics
+ * @param {object} [options] - { jobContext, llmCache } forwarded to fillForm
  * @returns {Promise<'next'|'submitted'|'error'|'validation_error'>}
  */
-async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum) {
+async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   // Give the step content time to render
   await sleep(800, 1500);
 
@@ -210,7 +211,8 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
     config,
     logger,
     'linkedin',
-    jobId
+    jobId,
+    options
   );
 
   // Record unmatched fields for future improvement
@@ -305,8 +307,40 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
         }).catch(() => []);
 
         if (postClickErrors.length > 0) {
-          logger.debug({ platform: 'linkedin', jobId, errors: postClickErrors }, 'Post-click validation errors');
-          return 'validation_error';
+          logger.debug({ platform: 'linkedin', jobId, errors: postClickErrors }, 'Post-click validation errors — attempting retry');
+
+          // Bounded retry: one attempt to fix invalid fields using the same job-level budget
+          const { retryFilled } = await retryInvalidFields(
+            page, defaultAnswers, config, logger, 'linkedin', jobId, options
+          );
+
+          if (retryFilled > 0) {
+            logger.debug({ platform: 'linkedin', jobId, retryFilled }, 'Retry filled fields — clicking Next again');
+            await sleep(300, 600);
+            await btn.click();
+            await sleep(500, 800);
+
+            // Re-check for errors after retry
+            const postRetryErrors = await page.evaluate(() => {
+              const modal = document.querySelector('.jobs-easy-apply-modal, .artdeco-modal');
+              if (!modal) return [];
+              const errs = [];
+              for (const el of modal.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
+                const t = (el.textContent || '').trim();
+                if (t) errs.push(t.substring(0, 100));
+              }
+              return errs;
+            }).catch(() => []);
+
+            if (postRetryErrors.length > 0) {
+              logger.debug({ platform: 'linkedin', jobId, errors: postRetryErrors }, 'Validation errors persist after retry');
+              return 'retry_failed';
+            }
+            return 'next';
+          }
+
+          // No fields could be filled on retry
+          return 'retry_failed';
         }
 
         return 'next';
@@ -329,6 +363,7 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
  * @param {string} runId
  * @param {object} logger
  * @param {boolean} [dryRun=false]
+ * @param {Map} [llmCache=null] - per-run LLM answer cache from lib/llm.js
  * @returns {Promise<{ applied: number, skipped: number, errors: number }>}
  */
 /**
@@ -344,10 +379,64 @@ function buildSearchUrl(config) {
   return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&geoId=103644278&f_AL=true&f_TPR=r86400`;
 }
 
-async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger, dryRun = false) {
+/**
+ * Navigate to the next page of LinkedIn search results.
+ * Uses two strategies:
+ *   1. Click the page number button in the pagination bar
+ *   2. Fallback: modify the URL &start= parameter directly
+ *
+ * @param {import('playwright').Page} page
+ * @param {number} currentPage - 1-based current page number
+ * @param {string} searchUrl - base search URL (page 1)
+ * @param {object} logger
+ * @returns {Promise<boolean>} - true if navigation succeeded
+ */
+async function goToNextPage(page, currentPage, searchUrl, logger) {
+  const nextPageNum = currentPage + 1;
+
+  // Method 1: Click the page number button in LinkedIn's pagination bar
+  try {
+    const nextBtn = await page.$(`button[aria-label="Page ${nextPageNum}"]`);
+    if (nextBtn && await nextBtn.isVisible()) {
+      await nextBtn.click();
+      await sleep(2000, 3000);
+      // Verify job list loaded
+      const jobList = await page.$('.jobs-search-results-list, .scaffold-layout__list');
+      if (jobList) {
+        logger.info({ platform: 'linkedin', page: nextPageNum }, `Navigated to page ${nextPageNum} via button`);
+        return true;
+      }
+    }
+  } catch (_) {}
+
+  // Method 2: URL-based pagination — LinkedIn uses &start=25 for page 2, &start=50 for page 3, etc.
+  try {
+    const url = new URL(searchUrl);
+    url.searchParams.set('start', String((nextPageNum - 1) * 25));
+    logger.debug({ platform: 'linkedin', url: url.toString() }, 'Trying URL-based pagination');
+    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await sleep(2000, 3000);
+
+    // Verify we got job cards on the new page
+    const jobList = await page.$('.jobs-search-results-list, .scaffold-layout__list');
+    if (jobList) {
+      const cards = await page.$$('.jobs-search-results-list li[data-occludable-job-id], .scaffold-layout__list li[data-occludable-job-id]');
+      if (cards.length > 0) {
+        logger.info({ platform: 'linkedin', page: nextPageNum, cardCount: cards.length }, `Navigated to page ${nextPageNum} via URL`);
+        return true;
+      }
+    }
+  } catch (_) {}
+
+  logger.info({ platform: 'linkedin', page: currentPage }, `No more pages after page ${currentPage}`);
+  return false;
+}
+
+async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger, dryRun = false, llmCache = null) {
   const platformConfig = config.platforms.linkedin;
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
+  const maxPages = config.behavior?.maxPages || 5;
 
   const maxRetries = config.behavior?.maxRetries ?? 0;
   const retryAttempts = new Map(); // jobId → number of retries made
@@ -360,8 +449,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   const searchUrl = buildSearchUrl(config);
   logger.info({ platform: 'linkedin', searchUrl }, 'Navigating to LinkedIn search');
 
-  // Navigate to dynamically constructed search URL
-  // geoId=103644278 (United States) + URL-encoded keywords + f_AL=true + f_TPR=r604800
+  let currentPage = 1;
+
+  // Navigate to first page
   await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
 
@@ -375,33 +465,22 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     return { applied, skipped, errors };
   }
 
-  let pageHasMoreJobs = true;
-
-  while (applied < maxApplications && pageHasMoreJobs) {
+  while (applied < maxApplications && currentPage <= maxPages) {
     // Wait for the job list container to be present
-    // waitForSelector auto-waits up to the timeout — no need for manual sleep here
     try {
       await page.waitForSelector('.jobs-search-results-list, .scaffold-layout__list', {
         timeout: SELECTOR_TIMEOUT,
       });
     } catch (_) {
-      logger.warn({ platform: 'linkedin' }, 'Job list not found — may have reached end of results');
+      logger.warn({ platform: 'linkedin', page: currentPage }, 'Job list not found — may have reached end of results');
       break;
     }
 
     // Query job cards fresh from the live DOM.
-    // We use index-based iteration and re-query each time because clicking a
-    // card, opening a modal, or dismissing it can mutate the DOM and
-    // invalidate previously-held element handles.
-    // Job cards live inside the scrollable left-hand list. We scope all card
-    // queries to this container so we never accidentally match filter chips,
-    // nav elements, or other page-level nodes.
     const LIST_SELECTOR = '.jobs-search-results-list, [class*="jobs-search-results"], .scaffold-layout__list';
     let pageAlive = true;
 
-    // Only match <li> elements that contain an actual job link — this filters
-    // out spacer elements, ad slots, promoted cards, and skeleton placeholders
-    // that don't have job data and cause extractJobId to return null.
+    // Only match <li> elements that contain an actual job link
     const initialCards = await page.$$(`${LIST_SELECTOR} li`);
     const jobCards = [];
     for (const li of initialCards) {
@@ -410,10 +489,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       if (hasJobLink || hasJobId) jobCards.push(li);
     }
     const totalCardCount = jobCards.length;
-    logger.info({ platform: 'linkedin', cardCount: totalCardCount, totalLi: initialCards.length }, 'Found job cards');
+    logger.info({ platform: 'linkedin', page: currentPage, cardCount: totalCardCount, totalLi: initialCards.length }, `Processing page ${currentPage} (${totalCardCount} cards)`);
 
-    // Build a CARD_SELECTOR that re-queries only real job cards on each iteration.
-    // We use data-occludable-job-id which is the most reliable marker.
+    if (totalCardCount === 0) {
+      logger.info({ platform: 'linkedin', page: currentPage }, 'No job cards found on page — stopping');
+      break;
+    }
+
     const CARD_SELECTOR = `${LIST_SELECTOR} li[data-occludable-job-id], ${LIST_SELECTOR} li:has(a[href*="/jobs/view/"])`;
 
     for (let cardIdx = 0; cardIdx < totalCardCount && applied < maxApplications; cardIdx++) {
@@ -515,6 +597,24 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         // Get the current URL for this job
         jobUrl = page.url();
+
+        // Scrape job description text for LLM context
+        let jobDescription = '';
+        try {
+          const jdEl = await page.$('.jobs-description__content, #job-details, [class*="jobs-description"], [class*="job-details"]');
+          if (jdEl) {
+            jobDescription = (await jdEl.innerText()).trim();
+          }
+        } catch (_) {}
+
+        // Build LLM options for this job with per-job budget
+        const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
+        const fillOptions = {
+          jobContext: { jobTitle, company, jobDescription },
+          llmCache: llmCache || undefined,
+          llmBudget,
+          runId,
+        };
 
         // The "Easy Apply" button lives inside the detail panel (right side),
         // NOT in the job card list. Scope the search to the detail container.
@@ -618,9 +718,12 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           }
           if (fingerprint) seenFingerprints.add(fingerprint);
 
-          const result = await handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount);
+          const result = await handleModalStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount, fillOptions);
 
-          if (result === 'submitted') {
+          if (result === 'retry_failed') {
+            // Bounded retry was attempted but failed — skip this job
+            throw new Error(`Validation errors on step ${stepCount} — retry failed`);
+          } else if (result === 'submitted') {
             modalComplete = true;
 
             if (!dryRun) {
@@ -687,8 +790,6 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             }
 
           } else if (result === 'validation_error') {
-            // Clicking Next triggered validation errors — required fields are
-            // unfilled and the modal won't advance.  Skip this job immediately.
             throw new Error(`Validation errors on step ${stepCount} — required fields unfilled`);
           } else if (result === 'error') {
             throw new Error(`Could not navigate modal step ${stepCount}`);
@@ -700,8 +801,12 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           throw new Error(`Modal exceeded ${MAX_STEPS} steps without submitting`);
         }
 
-        // Wait between applications (human-like pacing)
-        await sleep(minDelayBetweenApplications, maxDelayBetweenApplications);
+        // Wait between applications — shorter in dry-run since no actual submission
+        if (dryRun) {
+          await sleep(1000, 3000);
+        } else {
+          await sleep(minDelayBetweenApplications, maxDelayBetweenApplications);
+        }
 
       } catch (err) {
         // Robustly close any open modal to prevent state leaking into the
@@ -761,9 +866,12 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           return { applied, skipped, errors };
         }
 
-        // Retry transient errors up to maxRetries times (re-visit same index)
+        // Retry transient errors up to maxRetries times (re-visit same index).
+        // Skip retries for deterministic failures (validation errors, modal cycles)
+        // — retrying won't help since the same required fields will be unfilled.
+        const isDeterministic = err.message.includes('Validation errors') || err.message.includes('Modal cycled') || err.message.includes('retry failed');
         const attemptsMade = (retryAttempts.get(jobId) || 0) + 1;
-        if (attemptsMade <= maxRetries) {
+        if (!isDeterministic && attemptsMade <= maxRetries) {
           retryAttempts.set(jobId, attemptsMade);
           logger.warn({ platform: 'linkedin', jobId, attempt: attemptsMade, error: err.message }, 'Transient error — will retry');
           cardIdx--; // decrement so the for-loop re-visits this index with a fresh handle
@@ -782,28 +890,27 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     // If the page/context was closed mid-run, exit the outer loop too
     if (!pageAlive) break;
 
-    // Pagination: scroll down to load more jobs or find "See more jobs" button
-    if (applied < maxApplications) {
-      const seeMoreBtn = await page.$('button:has-text("See more jobs"), button[aria-label*="See more jobs"]');
-      if (seeMoreBtn && await seeMoreBtn.isVisible()) {
-        await seeMoreBtn.click();
-        await sleep(2000, 4000);
-      } else {
-        // Try scrolling the job list to trigger infinite scroll
-        const jobList = await page.$('.jobs-search-results-list');
-        if (jobList) {
-          await page.evaluate((el) => el.scrollTo(0, el.scrollHeight), jobList);
-          await sleep(2000, 3000);
-
-          // Check if new cards loaded
-          const newCards = await page.$$(CARD_SELECTOR);
-          if (newCards.length <= totalCardCount) {
-            pageHasMoreJobs = false;
-          }
-        } else {
-          pageHasMoreJobs = false;
-        }
+    // ── Pagination: navigate to next page via URL &start= parameter ──
+    if (applied < maxApplications && currentPage < maxPages) {
+      const navigated = await goToNextPage(page, currentPage, searchUrl, logger);
+      if (!navigated) {
+        logger.info({ platform: 'linkedin', page: currentPage }, 'No more pages available');
+        break;
       }
+      currentPage++;
+      await sleep(2000, 4000);
+
+      // Check for CAPTCHA on new page
+      if (await isCaptchaPage(page)) {
+        logger.error({ platform: 'linkedin' }, 'CAPTCHA detected on page navigation. Stopping.');
+        state.recordApplication({
+          platform: 'linkedin', jobId: 'captcha_detected',
+          status: 'captcha_blocked', errorMessage: 'CAPTCHA detected — platform stopped', runId,
+        });
+        return { applied, skipped, errors };
+      }
+    } else {
+      break;
     }
   }
 

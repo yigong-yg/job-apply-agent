@@ -35,6 +35,9 @@ const logger = require('./lib/logger');
 const state = require('./lib/state');
 const { launchForPlatform, checkLoginStatus } = require('./lib/browser');
 
+// LLM support
+const { createLLMCache, setUserContext } = require('./lib/llm');
+
 // Platform modules
 const { applyLinkedIn } = require('./modules/linkedin');
 const { applyDice } = require('./modules/dice');
@@ -140,7 +143,10 @@ function resolveRuntime(cli) {
     ? process.env.SCREENSHOT_ON_ERROR !== 'false'
     : (config.behavior?.screenshotOnError !== false);
 
-  return { platformFilter, dryRun, headless, maxApplications, delayMin, delayMax, screenshotOnError };
+  // Max pages to paginate through per platform
+  const maxPages = parseInt(process.env.MAX_PAGES || '5', 10);
+
+  return { platformFilter, dryRun, headless, maxApplications, delayMin, delayMax, screenshotOnError, maxPages };
 }
 
 /**
@@ -148,16 +154,19 @@ function resolveRuntime(cli) {
  * Uses DB-accurate counts (via state.getRunStats) so dry_run vs submitted
  * are correctly distinguished regardless of what in-memory stats return.
  */
-async function printSummaryReport(runId, startTime, sessionStats) {
+async function printSummaryReport(runId, startTime, sessionStats, dryRun = false) {
   const duration = Math.round((Date.now() - startTime) / 1000 / 60);
   const today = new Date().toISOString().slice(0, 10);
 
   // Pull accurate per-status counts from the database
   const dbStats = state.getRunStats(runId);
 
+  const title = dryRun
+    ? '  JOB APPLICATION AGENT — DAILY REPORT [DRY RUN]'
+    : '  JOB APPLICATION AGENT — DAILY REPORT';
   const lines = [
     '═'.repeat(55),
-    '  JOB APPLICATION AGENT — DAILY REPORT',
+    title,
     `  Run ID: ${runId}`,
     `  Date: ${today}`,
     `  Duration: ${duration} minutes`,
@@ -190,9 +199,22 @@ async function printSummaryReport(runId, startTime, sessionStats) {
 
   const unmatchedCount = state.getUnfilledFieldsCount(runId);
 
+  // Fill source distribution from fill_audit table
+  const fillSourceStats = state.getFillSourceStats(runId);
+  const sourceCategories = { defaultAnswers: 0, rule: 0, llm: 0, safe_default: 0, cannot_fill: 0 };
+  for (const [source, count] of Object.entries(fillSourceStats)) {
+    if (source === 'defaultAnswers') sourceCategories.defaultAnswers += count;
+    else if (source.startsWith('rule:')) sourceCategories.rule += count;
+    else if (source.startsWith('llm')) sourceCategories.llm += count;
+    else if (source === 'safe_default') sourceCategories.safe_default += count;
+    else if (source === 'cannot_fill') sourceCategories.cannot_fill += count;
+    else if (source === 'config') sourceCategories.defaultAnswers += count; // file uploads etc.
+  }
+
   lines.push('─'.repeat(55));
   lines.push(`  TOTAL:      ${totalApplied} applied | ${totalSkipped} skipped | ${totalErrors} errors`);
   lines.push(`  Sessions:  ${sessionStatus.join(' | ')}`);
+  lines.push(`  Fill Sources: ${sourceCategories.defaultAnswers} defaultAnswers | ${sourceCategories.rule} rule | ${sourceCategories.llm} llm | ${sourceCategories.safe_default} safe_default | ${sourceCategories.cannot_fill} cannot_fill`);
   lines.push(`  Unmatched Fields: ${unmatchedCount} new (see unfilled_fields table)`);
   lines.push('═'.repeat(55));
 
@@ -234,6 +256,12 @@ async function main() {
   // Create a new run record in SQLite
   const runId = state.createRun();
 
+  // Create per-run LLM cache (shared across platforms for dedup)
+  const llmCache = createLLMCache();
+
+  // Initialize LLM user context so all generated answers use real profile data
+  setUserContext(config, defaultAnswers);
+
   // Log resolved runtime config so the user always knows what's active
   console.log(`Runtime config: max=${runtime.maxApplications || 'per-platform default'}, headless=${runtime.headless}, dryRun=${runtime.dryRun}, platforms=${runtime.platformFilter || 'all enabled'}, delays=${runtime.delayMin}-${runtime.delayMax}ms`);
 
@@ -252,6 +280,7 @@ async function main() {
   config.behavior.maxDelayBetweenApplications = runtime.delayMax;
   config.behavior.screenshotOnError = runtime.screenshotOnError;
   config.behavior.headless = runtime.headless;
+  config.behavior.maxPages = runtime.maxPages;
 
   const runStats = {};
   const enabledPlatforms = Object.entries(config.platforms)
@@ -306,7 +335,7 @@ async function main() {
 
       // Run the platform-specific apply module
       const applyFn = PLATFORM_MODULES[platform];
-      const platformStats = await applyFn(page, config, defaultAnswers, state, runId, platformLogger, runtime.dryRun);
+      const platformStats = await applyFn(page, config, defaultAnswers, state, runId, platformLogger, runtime.dryRun, llmCache);
 
       runStats[platform] = platformStats;
       platformLogger.info(platformStats, 'Platform complete');
@@ -318,8 +347,9 @@ async function main() {
     } finally {
       if (context) {
         try {
+          platformLogger.info('Closing browser...');
           await context.close();
-          platformLogger.debug('Browser context closed');
+          platformLogger.info('Browser closed');
         } catch (_) {}
       }
     }
@@ -334,7 +364,7 @@ async function main() {
   }
 
   state.completeRun(runId, aggregatedStats);
-  await printSummaryReport(runId, startTime, runStats);
+  await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
 
   process.exit(0);
 }
