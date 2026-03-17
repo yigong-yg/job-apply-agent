@@ -220,6 +220,7 @@ db/
 logs/
 resumes/
 screenshots/
+.playwright-mcp/
 
 # Source code must be versioned (override Python template's lib/ ignore)
 !lib/

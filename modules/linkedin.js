@@ -376,7 +376,124 @@ async function handleModalStep(page, defaultAnswers, config, logger, jobId, dryR
 function buildSearchUrl(config) {
   const keywords = (config.search?.keywords || ['data scientist']).join(' OR ');
   const encoded = encodeURIComponent(keywords);
-  return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&geoId=103644278&f_AL=true&f_TPR=r86400`;
+
+  // LinkedIn f_E codes: 1=Internship, 2=Entry level, 3=Associate, 4=Mid-Senior level, 5=Director, 6=Executive
+  const expLevelMap = {
+    'internship': '1', 'entry level': '2', 'associate': '3',
+    'mid-senior level': '4', 'director': '5', 'executive': '6',
+  };
+  const expLevels = (config.search?.experienceLevel || [])
+    .map(l => expLevelMap[l.toLowerCase()])
+    .filter(Boolean);
+  const expParam = expLevels.length > 0 ? `&f_E=${expLevels.join('%2C')}` : '';
+
+  // LinkedIn f_SB2 salary bands: 1=$40k+, 2=$60k+, 3=$80k+, 4=$100k+, 5=$120k+, 6=$140k+, 7=$160k+, 8=$180k+, 9=$200k+
+  const salaryBands = [40000, 60000, 80000, 100000, 120000, 140000, 160000, 180000, 200000];
+  const minSalary = config.search?.minSalary;
+  let salaryParam = '';
+  if (minSalary) {
+    const bandIdx = salaryBands.findIndex(b => b >= minSalary);
+    if (bandIdx >= 0) salaryParam = `&f_SB2=${bandIdx + 1}`;
+  }
+
+  return `https://www.linkedin.com/jobs/search/?keywords=${encoded}&geoId=103644278&f_AL=true&f_TPR=r86400${expParam}${salaryParam}`;
+}
+
+/**
+ * Apply location filters via LinkedIn's "All filters" dialog.
+ *
+ * The "All filters" dialog contains a "Location filter" section with checkboxes
+ * like: checkbox "Filter by New York, NY", checkbox "Filter by San Francisco, CA"
+ * LinkedIn pre-populates these based on search results. We check matching ones
+ * then click "Show results" to apply.
+ *
+ * @param {import('playwright').Page} page - must already be on a search results page
+ * @param {string[]} cities - e.g. ["New York, NY", "San Francisco, CA"]
+ * @param {object} logger
+ * @returns {Promise<boolean>} true if filters were applied successfully
+ */
+async function applyLocationFilters(page, cities, logger) {
+  if (!cities || cities.length === 0) return false;
+
+  try {
+    // Click "All filters" button
+    const allFiltersBtn = page.getByRole('button', { name: /all filters/i });
+    if (await allFiltersBtn.count() === 0) {
+      logger.warn({ platform: 'linkedin' }, '"All filters" button not found');
+      return false;
+    }
+    await allFiltersBtn.click();
+    await sleep(1500, 2500);
+
+    // Wait for the "All filters" dialog to appear
+    const dialog = await page.waitForSelector(
+      '[role="dialog"]',
+      { timeout: 10000 }
+    ).catch(() => null);
+    if (!dialog) {
+      logger.warn({ platform: 'linkedin' }, 'All filters dialog did not appear');
+      return false;
+    }
+
+    // Check each location checkbox by its aria-label "Filter by <city>"
+    let checkedCount = 0;
+    for (const city of cities) {
+      const checkbox = page.getByRole('checkbox', { name: `Filter by ${city}` });
+      if (await checkbox.count() > 0) {
+        const isChecked = await checkbox.isChecked();
+        if (!isChecked) {
+          // Click the paragraph/label next to the checkbox (checkbox input is visually hidden)
+          const label = page.locator(`text="${city}"`).first();
+          await label.click();
+          await sleep(300, 600);
+          checkedCount++;
+          logger.debug({ platform: 'linkedin', city }, 'Checked location filter');
+        } else {
+          checkedCount++;
+          logger.debug({ platform: 'linkedin', city }, 'Location filter already checked');
+        }
+      } else {
+        logger.debug({ platform: 'linkedin', city }, 'Location checkbox not available in filter list');
+      }
+    }
+
+    if (checkedCount === 0) {
+      logger.warn({ platform: 'linkedin' }, 'No location filters could be checked — closing dialog');
+      const cancelBtn = page.getByRole('button', { name: /cancel/i });
+      if (await cancelBtn.count() > 0) await cancelBtn.click();
+      else await page.keyboard.press('Escape');
+      await sleep(500, 1000);
+      return false;
+    }
+
+    // Click "Show results" button to apply filters.
+    // Use the data-test attribute to avoid matching the "Showing results of type" button in the top bar.
+    await sleep(500, 1000);
+    const showBtn = page.locator('button[data-test-reusables-filters-modal-show-results-button="true"]');
+    if (await showBtn.count() > 0) {
+      await showBtn.click();
+      await sleep(2000, 4000);
+      logger.info({ platform: 'linkedin', cities, checkedCount }, 'Applied location filters via All Filters');
+      return true;
+    }
+    // Fallback: look for button with "Show" text inside the dialog
+    const dialogShowBtn = page.locator('[role="dialog"] button:has-text("Show")').last();
+    if (await dialogShowBtn.count() > 0) {
+      await dialogShowBtn.click();
+      await sleep(2000, 4000);
+      logger.info({ platform: 'linkedin', cities, checkedCount }, 'Applied location filters via All Filters (fallback)');
+      return true;
+    }
+
+    logger.warn({ platform: 'linkedin' }, 'Could not find "Show results" button');
+    await page.keyboard.press('Escape');
+    return false;
+  } catch (err) {
+    logger.warn({ platform: 'linkedin', error: err.message }, 'Failed to apply location filters');
+    try { await page.keyboard.press('Escape'); } catch (_) {}
+    await sleep(500, 1000);
+    return false;
+  }
 }
 
 /**
@@ -454,6 +571,17 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   // Navigate to first page
   await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await sleep(2000, 4000);
+
+  // Apply location filters via "All filters" dialog if configured
+  const locationCities = config.search?.locationFilter;
+  if (locationCities && locationCities.length > 0) {
+    const filterApplied = await applyLocationFilters(page, locationCities, logger);
+    if (filterApplied) {
+      await sleep(2000, 3000);
+    } else {
+      logger.warn({ platform: 'linkedin' }, 'Location filters could not be applied — continuing without location filter');
+    }
+  }
 
   // Check for CAPTCHA immediately after navigation (PRD §8.2)
   if (await isCaptchaPage(page)) {
@@ -542,36 +670,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (companyEl) company = (await companyEl.innerText()).trim().replace(/\n.*/s, '');
       } catch (_) {}
 
-      // Extract location from the card before clicking into detail
-      let jobLocation = null;
-      try {
-        const locEl = await card.$('[class*="job-card-container__metadata-item"], [class*="artdeco-entity-lockup__caption"], [class*="job-card-container__metadata-wrapper"]');
-        if (locEl) jobLocation = (await locEl.innerText()).trim().replace(/\n.*/s, '');
-      } catch (_) {}
-
-      // ── Location filter: skip jobs outside target states ──
-      const locationFilter = config.search?.locationFilter;
-      if (locationFilter && locationFilter.length > 0 && jobLocation) {
-        const locUpper = jobLocation.toUpperCase();
-        // Allow remote jobs through (user has includeRemote: true)
-        const isRemote = locUpper.includes('REMOTE');
-        const matchesState = locationFilter.some(st => {
-          const stUpper = st.toUpperCase();
-          // Match ", CA", "(CA)", " CA " or ending with " CA"
-          return locUpper.includes(`, ${stUpper}`) ||
-                 locUpper.includes(`(${stUpper})`) ||
-                 locUpper.endsWith(` ${stUpper}`);
-        });
-        if (!isRemote && !matchesState) {
-          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, jobLocation, reason: 'location_filtered' }, 'Skipping job — location not in filter');
-          state.recordApplication({
-            platform: 'linkedin', jobId, jobTitle, company,
-            status: 'skipped', skipReason: `location_filtered:${jobLocation}`, runId,
-          });
-          skipped++;
-          continue;
-        }
-      }
+      // Location filtering is now handled server-side via LinkedIn's "All filters" dialog.
+      // See applyLocationFilters() called after initial page navigation.
 
       try {
         // Check if already applied (SQLite lookup)
