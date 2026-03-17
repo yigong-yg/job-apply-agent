@@ -210,6 +210,9 @@ __marimo__/
 node_modules/
 npm-debug.log*
 
+# Claude Code local settings
+.claude/
+
 # Job Apply Agent - runtime data (contains PII and session state)
 config.json
 defaultAnswers.json
