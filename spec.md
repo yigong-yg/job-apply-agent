@@ -4,11 +4,14 @@ Living document. Updated by Claude Code as we learn things from production runs.
 
 ---
 
-## LinkedIn Rate Limits (tested 2026-03-12)
+## LinkedIn Rate Limits (tested 2026-03-12, updated 2026-03-17)
 
 - **Daily Easy Apply limit: ~35 applications per session**
-- After hitting the limit, LinkedIn **disables the Easy Apply button** (greyed out, `element is not enabled`). No CAPTCHA, no security challenge, no account warning.
-- Error signature: `elementHandle.click: Timeout 30000ms exceeded` + `element is not enabled` in Playwright call log.
+- LinkedIn has two rate limit mechanisms:
+  1. **Button disabled:** Easy Apply button becomes greyed out (`element is not enabled`). Silent — no message shown.
+  2. **Explicit modal message:** "We limit daily submissions to maintain quality and prevent bots, helping each application get the right attention. Save this job and apply tomorrow." — shown in a modal after clicking Easy Apply.
+- The agent detects both: button-disabled causes timeout errors (existing retry logic), the modal message triggers immediate clean shutdown with `daily_limit_reached` skip reason.
+- Error signature (button disabled): `elementHandle.click: Timeout 30000ms exceeded` + `element is not enabled` in Playwright call log.
 - The limit appears to be per-calendar-day (UTC or account timezone TBD).
 - The limit is NOT per-search — it persists across page navigation within the same session.
 - `maxApplicationsPerRun: 30` is safely under the limit. Could push to 33 but buffer is wise.
@@ -21,6 +24,7 @@ Living document. Updated by Claude Code as we learn things from production runs.
 
 ### Throughput
 - Average time per application: ~53 seconds (includes 5-15s inter-app delay + form filling + modal steps)
+- Best observed: 36s avg (2026-03-17 run with location filters, 20 apps in 14 min)
 - Applications with 1 step (pre-filled, no questions): ~15s active time
 - Applications with 5+ steps: ~25-30s active time
 - NielsenIQ job had 8 steps (max observed)
@@ -36,16 +40,16 @@ Living document. Updated by Claude Code as we learn things from production runs.
 
 | Platform  | Daily Limit | Limit Type | Config Setting | Notes |
 |-----------|-------------|------------|----------------|-------|
-| LinkedIn  | ~35         | Button disabled | 30 | Tested 2026-03-12 |
+| LinkedIn  | ~35         | Button disabled + modal message | 30 | Tested 2026-03-12, 2026-03-17 |
 | Indeed    | TBD         | TBD        | 30 | Not yet tested at scale |
 | Dice      | TBD         | TBD        | 30 | Not yet tested at scale |
 | Jobright  | TBD         | TBD        | 20 | Not yet tested at scale |
 
 ---
 
-## Historical Run Summary (as of 2026-03-15)
+## Historical Run Summary (as of 2026-03-17)
 
-### All-time LinkedIn stats: 101 submitted, 22 errors, 34 skipped, 25 already_applied, 5 dry_run
+### All-time LinkedIn stats: 121 submitted, 22 errors, 39 skipped, 31 already_applied, 8 dry_run
 
 | Date | Submitted | Errors | Skipped | Success Rate | Notes |
 |------|-----------|--------|---------|-------------|-------|
@@ -54,19 +58,15 @@ Living document. Updated by Claude Code as we learn things from production runs.
 | 2026-03-02 | 35 | 4 | 10 | 65% | Good run |
 | 2026-03-12 | 35 | 11 | 9 | 61% | Hit rate limit at 35 |
 | 2026-03-15 | 4 | 0 | 1 | 100% | Tight filters (salary+exp+location), only 12 cards |
+| 2026-03-17 | 20 | 0 | 5 | 100% | Location filters via All Filters, 36s avg/app |
 
-### Error breakdown (22 total)
-- 12x click timeout (rate limit — button disabled)
-- 7x validation failure (unfilled required fields on screener step)
-- 1x JS error (CSS not defined)
-- 2x other timeouts
+---
 
-### Top unfilled form fields (62 total logged)
-- 6x "Location (city)" — should map to config.user.city
-- 6x "Are you comfortable commuting to this job's location?" — should default Yes
-- 5x "Are you a protected veteran?" — should map to config.user.veteranStatus
-- 4x "City" — variant of location field
-- 3x various certification questions
+## Job Card Filtering
+
+### Promoted jobs (added 2026-03-17)
+- Jobs with "Promoted" badge in card text are skipped — typically low-relevance paid placements
+- Recorded as `skipped` with `skipReason: 'promoted'`
 
 ---
 
@@ -76,18 +76,23 @@ Living document. Updated by Claude Code as we learn things from production runs.
 - **Cause:** Daily application limit reached
 - **Detection:** Consecutive `element is not enabled` timeouts on Easy Apply button click
 - **Current behavior:** Retries 3x (wastes ~90s per job), records as `error`
-- **TODO:** Detect 3+ consecutive button-disabled errors and abort the platform early instead of grinding through remaining cards
+- **TODO:** Detect 3+ consecutive button-disabled errors and abort the platform early
 
-### 2. Transient button click timeout (one-off)
+### 2. Daily limit modal message (LinkedIn rate limit)
+- **Cause:** Daily application limit reached
+- **Detection:** Page body contains "We limit daily submissions" or "Save this job and apply tomorrow"
+- **Current behavior:** Immediate clean shutdown — dismisses modal, records `daily_limit_reached`, returns stats
+
+### 3. Transient button click timeout (one-off)
 - **Cause:** Occasional LinkedIn UI lag, modal not ready
 - **Detection:** Single timeout followed by successful retry
 - **Current behavior:** Retry logic handles this correctly
 
-### 3. Validation errors on screener steps
+### 4. Validation errors on screener steps
 - **Cause:** Required fields that fuzzy matching + LLM couldn't fill
 - **Detection:** `Validation errors on step N — retry failed`
 - **Frequency:** ~7 out of 22 errors (32%)
-- **Fix path:** Improve defaultAnswers.json coverage and fuzzy matching for location/city/veteran fields
+- **Fix path:** Improve defaultAnswers.json coverage
 
 ---
 
@@ -101,15 +106,9 @@ Living document. Updated by Claude Code as we learn things from production runs.
 - `f_SB2=5` — Salary $120k+
 
 ### Location filter (server-side via "All filters" dialog)
-- **Mechanism:** Open LinkedIn's "All filters" dialog → check location checkboxes → click "Show results"
+- **Mechanism:** Open LinkedIn's "All filters" dialog -> check location checkboxes -> click "Show results"
 - **Cities configured:** New York NY, Boston MA, San Francisco CA, Los Angeles CA, San Jose CA, San Diego CA, Palo Alto CA, Santa Clara CA, Sunnyvale CA, Mountain View CA, Irvine CA
 - **Behavior:** Only cities that appear in LinkedIn's pre-populated checkbox list are checked; others silently skipped
-- **Remote jobs:** Passed through by LinkedIn's own filter logic (not client-side)
-
-#### Location filter implementation history
-1. **v1 (2026-03-15):** Client-side filter matching state abbreviations (", CA") — failed because LinkedIn uses metro area names without abbreviations
-2. **v2 (2026-03-15):** Added keyword matching for metro area names (e.g. "San Francisco" → CA) — worked but fragile; also skipped jobs with unknown location
-3. **v3 (2026-03-17):** Switched to server-side filtering via "All filters" dialog checkboxes — reliable, uses LinkedIn's own UI, no client-side filtering needed
 
 ### Filter impact on volume
 - With all filters (salary $120k+ / exp level / location / past 24h / Easy Apply): ~20 cards per search
@@ -120,55 +119,25 @@ Living document. Updated by Claude Code as we learn things from production runs.
 
 ## Config Decisions & Rationale
 
-- `datePosted: "Past week"` in config but `buildSearchUrl()` uses `f_TPR=r86400` (past 24h) — avoids re-processing week-old listings already applied to in prior runs.
-- `headless: true` in config but overridden by `.env HEADLESS=false` for debugging. Production should use headless.
+- `datePosted: "Past week"` in config but `buildSearchUrl()` uses `f_TPR=r86400` (past 24h).
+- `headless: true` in config but overridden by `.env HEADLESS=false` for debugging.
 - Delays (5-15s between apps, 1.5-4s between actions) — no bot detection triggered in 35 applications.
 - `experienceLevel: ["Entry level", "Associate", "Mid-Senior level"]` — maps to `f_E=2,3,4`.
 - `minSalary: 120000` — maps to `f_SB2=5` ($120k+ band).
 - `locationFilter` — array of "City, ST" strings; matched against LinkedIn's "All filters" location checkboxes.
-- `config.json searchUrl` field is vestigial — `buildSearchUrl()` constructs the URL dynamically from `config.search.*` fields.
 
 ---
 
 ## Notification System Design
 
 ### Recommended: Discord Webhook
-
-**Why Discord:**
 - Zero auth complexity — just a webhook URL
-- Rich embed support (color-coded success/failure, fields, timestamps)
-- Free, no rate limits at our volume (~1 message/day)
+- Rich embed support (color-coded success/failure)
+- Free, no rate limits at our volume
 - No npm dependencies needed — native `fetch()` in Node 18+
-- Mobile push notifications built in
 
-### Implementation plan
-
-1. Create `lib/notify.js` with `sendRunNotification(stats)` function
-2. Add `DISCORD_WEBHOOK_URL` to `.env`
-3. Call from `index.js` after run summary is computed
-4. Payload: Discord embed with run summary fields
-
-### Embed format
-```
-[Green/Red bar based on error rate]
-Job Application Agent — Daily Report
-Date: 2026-03-15 | Duration: 3 min
-
-LinkedIn:  4 applied | 1 skipped | 0 errors
-TOTAL:     4 applied | 1 skipped | 0 errors
-
-Session Status: linkedin OK
-Unmatched Fields: 3 new
-Success Rate: 100%
-```
-
-### Alternative options (if Discord not preferred)
-- **Telegram Bot:** Create via @BotFather, POST to `/sendMessage` API. Similar simplicity.
-- **WeChat (PushPlus/Server酱):** Register for token, POST to API → pushes to WeChat. More setup friction.
-- **Email (nodemailer):** SMTP credentials needed, may land in spam. Least real-time.
-- **WhatsApp (Twilio):** Costs money, complex approval process. Not recommended.
-
-### Future: Error alerting
-- If 3+ consecutive button-disabled errors detected mid-run → send immediate "rate limit hit" notification
-- If session expires → send "session expired, run setup.js" notification
-- If CAPTCHA detected → send critical alert
+### Alternative options
+- **Telegram Bot:** Simple HTTP API via @BotFather
+- **WeChat (PushPlus/Server酱):** More setup friction
+- **Email (nodemailer):** May land in spam
+- **WhatsApp (Twilio):** Costs money, not recommended

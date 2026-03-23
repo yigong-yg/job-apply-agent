@@ -402,18 +402,27 @@ function buildSearchUrl(config) {
 /**
  * Apply location filters via LinkedIn's "All filters" dialog.
  *
- * The "All filters" dialog contains a "Location filter" section with checkboxes
- * like: checkbox "Filter by New York, NY", checkbox "Filter by San Francisco, CA"
- * LinkedIn pre-populates these based on search results. We check matching ones
- * then click "Show results" to apply.
+ * LinkedIn's "All filters" has a Location fieldset with checkboxes. The actual
+ * DOM structure (verified via Playwright inspection 2026-03-18):
+ *   <fieldset> with <legend>Location filter</legend>
+ *     <li> per city:
+ *       <input type="checkbox" id="advanced-filter-populatedPlace-{geoId}" name="location-filter-value">
+ *       <label for="..."><p><span aria-hidden="true">New York, NY</span>...</p></label>
+ *
+ * The checkbox inputs have NO aria-label — city text is in a span inside the label.
+ * We use page.evaluate() to find and click matching labels directly in the DOM.
+ *
+ * Config format for locationFilter supports two styles:
+ *   - Exact city:      "New York, NY"  — matches only that city
+ *   - State wildcard:  "CA"            — matches ANY city ending in ", CA"
  *
  * @param {import('playwright').Page} page - must already be on a search results page
- * @param {string[]} cities - e.g. ["New York, NY", "San Francisco, CA"]
+ * @param {string[]} targets - e.g. ["New York, NY", "Boston, MA", "CA"]
  * @param {object} logger
  * @returns {Promise<boolean>} true if filters were applied successfully
  */
-async function applyLocationFilters(page, cities, logger) {
-  if (!cities || cities.length === 0) return false;
+async function applyLocationFilters(page, targets, logger) {
+  if (!targets || targets.length === 0) return false;
 
   try {
     // Click "All filters" button
@@ -425,63 +434,108 @@ async function applyLocationFilters(page, cities, logger) {
     await allFiltersBtn.click();
     await sleep(1500, 2500);
 
-    // Wait for the "All filters" dialog to appear
-    const dialog = await page.waitForSelector(
-      '[role="dialog"]',
-      { timeout: 10000 }
-    ).catch(() => null);
+    // Wait for the dialog to appear
+    const dialog = await page.waitForSelector('[role="dialog"]', { timeout: 10000 }).catch(() => null);
     if (!dialog) {
       logger.warn({ platform: 'linkedin' }, 'All filters dialog did not appear');
       return false;
     }
 
-    // Check each location checkbox by its aria-label "Filter by <city>"
-    let checkedCount = 0;
-    for (const city of cities) {
-      const checkbox = page.getByRole('checkbox', { name: `Filter by ${city}` });
-      if (await checkbox.count() > 0) {
-        const isChecked = await checkbox.isChecked();
-        if (!isChecked) {
-          // Click the paragraph/label next to the checkbox (checkbox input is visually hidden)
-          const label = page.locator(`text="${city}"`).first();
-          await label.click();
-          await sleep(300, 600);
-          checkedCount++;
-          logger.debug({ platform: 'linkedin', city }, 'Checked location filter');
-        } else {
-          checkedCount++;
-          logger.debug({ platform: 'linkedin', city }, 'Location filter already checked');
-        }
-      } else {
-        logger.debug({ platform: 'linkedin', city }, 'Location checkbox not available in filter list');
-      }
-    }
+    // Use page.evaluate to find the Location fieldset, read available cities,
+    // match against targets (exact city OR state wildcard), and click labels.
+    const result = await page.evaluate((rawTargets) => {
+      const dlg = document.querySelector('[role="dialog"]');
+      if (!dlg) return { error: 'no dialog', checked: [], available: [] };
 
-    if (checkedCount === 0) {
-      logger.warn({ platform: 'linkedin' }, 'No location filters could be checked — closing dialog');
-      const cancelBtn = page.getByRole('button', { name: /cancel/i });
-      if (await cancelBtn.count() > 0) await cancelBtn.click();
-      else await page.keyboard.press('Escape');
+      // Find the Location fieldset by its legend text
+      let locationFieldset = null;
+      for (const legend of dlg.querySelectorAll('legend')) {
+        if (legend.textContent.includes('Location filter')) {
+          locationFieldset = legend.closest('fieldset') || legend.parentElement;
+          break;
+        }
+      }
+      if (!locationFieldset) return { error: 'no location fieldset', checked: [], available: [] };
+
+      // Parse targets into exact cities and state wildcards
+      const exactCities = new Set();
+      const stateWildcards = new Set();
+      for (const t of rawTargets) {
+        const trimmed = t.trim();
+        if (/^[A-Z]{2}$/.test(trimmed)) {
+          stateWildcards.add(trimmed);
+        } else {
+          exactCities.add(trimmed);
+          // Also extract state abbreviation so "Boston, MA" enables the MA wildcard
+          const m = trimmed.match(/,\s*([A-Z]{2})$/);
+          if (m) stateWildcards.add(m[1]);
+        }
+      }
+
+      // Read available cities from the fieldset
+      const available = [];
+      const cityMap = new Map();
+      for (const li of locationFieldset.querySelectorAll('li')) {
+        const input = li.querySelector('input[type="checkbox"]');
+        const span = li.querySelector('span[aria-hidden="true"]');
+        if (!input || !span) continue;
+        const cityName = span.textContent.trim();
+        available.push(cityName);
+        cityMap.set(cityName, { inputId: input.id, checked: input.checked });
+      }
+
+      // Match: exact city name OR state abbreviation wildcard (", CA" suffix)
+      const checked = [];
+      for (const [cityName, info] of cityMap) {
+        const isExact = exactCities.has(cityName);
+        const stateMatch = cityName.match(/,\s*([A-Z]{2})$/);
+        const isWildcard = stateMatch && stateWildcards.has(stateMatch[1]);
+
+        if ((isExact || isWildcard) && !info.checked) {
+          const label = dlg.querySelector(`label[for="${info.inputId}"]`);
+          if (label) {
+            label.click();
+            checked.push(cityName);
+          }
+        } else if ((isExact || isWildcard) && info.checked) {
+          checked.push(cityName + ' (already)');
+        }
+      }
+
+      return { checked, available };
+    }, targets);
+
+    logger.debug({ platform: 'linkedin', available: result.available, checked: result.checked }, 'Location filter results');
+
+    if (result.error) {
+      logger.warn({ platform: 'linkedin', error: result.error }, 'Location filter DOM error');
+      await page.keyboard.press('Escape');
       await sleep(500, 1000);
       return false;
     }
 
-    // Click "Show results" button to apply filters.
-    // Use the data-test attribute to avoid matching the "Showing results of type" button in the top bar.
+    if (result.checked.length === 0) {
+      logger.warn({ platform: 'linkedin', available: result.available }, 'No target cities found in filter list — closing dialog');
+      await page.keyboard.press('Escape');
+      await sleep(500, 1000);
+      return false;
+    }
+
+    // Click "Show results" button
     await sleep(500, 1000);
     const showBtn = page.locator('button[data-test-reusables-filters-modal-show-results-button="true"]');
     if (await showBtn.count() > 0) {
       await showBtn.click();
       await sleep(2000, 4000);
-      logger.info({ platform: 'linkedin', cities, checkedCount }, 'Applied location filters via All Filters');
+      logger.info({ platform: 'linkedin', checked: result.checked, checkedCount: result.checked.length }, 'Applied location filters via All Filters');
       return true;
     }
-    // Fallback: look for button with "Show" text inside the dialog
+    // Fallback
     const dialogShowBtn = page.locator('[role="dialog"] button:has-text("Show")').last();
     if (await dialogShowBtn.count() > 0) {
       await dialogShowBtn.click();
       await sleep(2000, 4000);
-      logger.info({ platform: 'linkedin', cities, checkedCount }, 'Applied location filters via All Filters (fallback)');
+      logger.info({ platform: 'linkedin', checked: result.checked, checkedCount: result.checked.length }, 'Applied location filters via All Filters (fallback)');
       return true;
     }
 
@@ -670,8 +724,16 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (companyEl) company = (await companyEl.innerText()).trim().replace(/\n.*/s, '');
       } catch (_) {}
 
-      // Location filtering is now handled server-side via LinkedIn's "All filters" dialog.
-      // See applyLocationFilters() called after initial page navigation.
+      // Skip promoted/sponsored jobs — typically low-relevance paid placements
+      try {
+        const cardText = await card.innerText();
+        if (/\bPromoted\b/.test(cardText)) {
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'promoted' }, 'Skipping promoted job');
+          state.recordApplication({ platform: 'linkedin', jobId, jobTitle, company, status: 'skipped', skipReason: 'promoted', runId });
+          skipped++;
+          continue;
+        }
+      } catch (_) {}
 
       try {
         // Check if already applied (SQLite lookup)
@@ -774,6 +836,22 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         if (!modal) {
           throw new Error('Easy Apply modal did not open');
+        }
+
+        // Check for daily application limit message
+        const dailyLimitMsg = await page.evaluate(() => {
+          const body = document.body?.innerText || '';
+          return body.includes('We limit daily submissions') || body.includes('Save this job and apply tomorrow');
+        }).catch(() => false);
+        if (dailyLimitMsg) {
+          logger.warn({ platform: 'linkedin', applied, jobId, jobTitle }, 'Daily application limit reached — stopping platform');
+          const dismissBtn = await page.$('button[aria-label="Dismiss"], button:has-text("OK"), button:has-text("Got it"), button:has-text("Done")');
+          if (dismissBtn) await dismissBtn.click().catch(() => {});
+          state.recordApplication({
+            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
+            status: 'skipped', skipReason: 'daily_limit_reached', runId,
+          });
+          return { applied, skipped, errors };
         }
 
         // Check for "already applied" message inside the modal

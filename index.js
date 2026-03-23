@@ -38,6 +38,9 @@ const { launchForPlatform, checkLoginStatus } = require('./lib/browser');
 // LLM support
 const { createLLMCache, setUserContext } = require('./lib/llm');
 
+// Notifications
+const { sendDiscordNotification, sendDiscordMessage } = require('./lib/notify');
+
 // Platform modules
 const { applyLinkedIn } = require('./modules/linkedin');
 const { applyDice } = require('./modules/dice');
@@ -222,7 +225,7 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
   console.log('\n' + report + '\n');
   logger.info({ runId, totalApplied, totalSkipped, totalErrors }, 'Run complete');
 
-  return report;
+  return { report, totalApplied, totalSkipped, totalErrors, durationMin: duration, sessions: sessionStatus };
 }
 
 /**
@@ -252,6 +255,34 @@ async function main() {
   const startTime = Date.now();
 
   ensureDirectories();
+
+  // ── Daily guard: skip if a successful run already exists today ──
+  // (bypassed by --dry-run so testing is always possible)
+  if (!runtime.dryRun) {
+    const todaySubmitted = state.getTodaySubmittedCount();
+    if (todaySubmitted > 0) {
+      const msg = `⏭️ Already applied to ${todaySubmitted} jobs today — skipping run.`;
+      console.log(msg);
+      logger.info({ todaySubmitted }, msg);
+      await sendDiscordMessage(msg, logger);
+      process.exit(0);
+    }
+  }
+
+  // ── Time window guard: only run between 7 AM and 11 PM MST ──
+  // (bypassed by --dry-run and when run manually via CLI)
+  const AUTO_RUN = process.env.AUTO_RUN === 'true';
+  if (AUTO_RUN && !runtime.dryRun) {
+    const mstHour = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour: 'numeric', hour12: false });
+    const hour = parseInt(mstHour, 10);
+    if (hour < 7 || hour >= 23) {
+      const msg = `🌙 Outside run window (${hour}:00 MST, window is 7AM-11PM) — skipping.`;
+      console.log(msg);
+      logger.info({ hour }, msg);
+      await sendDiscordMessage(msg, logger);
+      process.exit(0);
+    }
+  }
 
   // Create a new run record in SQLite
   const runId = state.createRun();
@@ -364,7 +395,14 @@ async function main() {
   }
 
   state.completeRun(runId, aggregatedStats);
-  await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
+  const { report, totalApplied, totalSkipped, totalErrors, durationMin, sessions } =
+    await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
+
+  // Send Discord notification
+  await sendDiscordNotification({
+    runId, totalApplied, totalSkipped, totalErrors, durationMin,
+    dryRun: runtime.dryRun, sessions, logger,
+  });
 
   process.exit(0);
 }

@@ -1,3 +1,97 @@
+# AGENT OPERATING GUIDE — READ THIS FIRST
+
+This section is mandatory context for any Claude Code agent working on this project. Read it in full before making any changes. The detailed PRD follows below.
+
+---
+
+## Critical Rules
+
+1. **NEVER push `.claude/` to any remote branch.** It is gitignored. If you see it tracked, remove it.
+2. **NEVER commit PII** (names, emails, phone numbers, API keys). All PII lives in gitignored runtime files: `config.json`, `defaultAnswers.json`, `.env`.
+3. **NEVER modify `config.json` format without testing.** The locationFilter array must contain full "City, ST" strings (e.g. `"San Francisco, CA"`), NOT bare state codes like `"CA"`.
+4. **Always dry-run before prod.** Use `node index.js --dry-run --platform linkedin --max 3` to validate changes.
+5. **Do not install Python packages or modify the Python/Anaconda environment.** Node.js only. Python is only needed for compiling `better-sqlite3`.
+
+## Branch Strategy
+
+- **`main`** — Clean, public-facing code. No PII, no `.claude/`. Push here only after review.
+- **`local-test`** — Working branch for development. Tracks `main` but has local runtime files (`config.json`, `.env`, etc.) that are gitignored.
+- Always work on `local-test`. Merge to `main` only for meaningful commits.
+- After merging to `main`, sync `local-test`: `git checkout local-test && git reset --hard origin/main`
+- Runtime files (`config.json`, `defaultAnswers.json`, `.env`) must be manually restored after reset since they're gitignored.
+
+## Environment
+
+- **Runtime:** Node.js 22.18.0 on Windows 11
+- **Python** (for native module compilation only): `C:\Users\gongy\anaconda3\python.exe` (3.11.7)
+- **npm install requires:** `PYTHON="/c/Users/gongy/anaconda3/python.exe" npm install`
+- **Playwright Chromium:** `%LOCALAPPDATA%\ms-playwright\`
+- **Browser profiles:** `browser-data/<platform>/` (persistent login sessions, gitignored)
+
+## PII Locations (gitignored, NEVER commit)
+
+| File | Contains |
+|------|----------|
+| `config.json` | User profile (name, email, phone, zip), search parameters, platform settings |
+| `defaultAnswers.json` | Screener question answers (LinkedIn URL, city, salary, etc.) |
+| `.env` | API keys (DeepSeek), runtime overrides (MAX_APPLICATIONS, HEADLESS, etc.) |
+| `browser-data/` | Saved login sessions per platform |
+| `db/applications.db` | Application history with job titles, companies, timestamps |
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `index.js` | Main orchestrator — load config, loop platforms, generate report |
+| `modules/linkedin.js` | LinkedIn Easy Apply automation (only active platform) |
+| `lib/browser.js` | Playwright persistent context launcher |
+| `lib/form-filler.js` | Generic form detection + fuzzy matching + LLM fallback |
+| `lib/state.js` | SQLite state manager (applications, runs, unfilled_fields) |
+| `lib/humanize.js` | Anti-detection delays and human-like typing |
+| `lib/llm.js` | DeepSeek LLM integration for unknown form fields |
+| `spec.md` | Runtime findings, rate limits, error patterns (living doc) |
+
+## Testing Commands
+
+```bash
+node setup.js --platform linkedin    # One-time: capture login session (headed browser)
+node index.js --dry-run --platform linkedin --max 3   # Validate without submitting
+node index.js --platform linkedin    # Production run (uses .env MAX_APPLICATIONS)
+node index.js                        # Full run, all enabled platforms
+```
+
+## LinkedIn-Specific Knowledge
+
+### Search URL Construction (`buildSearchUrl()` in `modules/linkedin.js`)
+- Keywords joined with " OR ", URL-encoded
+- `geoId=103644278` = United States, `f_AL=true` = Easy Apply, `f_TPR=r86400` = Past 24h
+- `f_E=2,3,4` = experience level (Entry/Associate/Mid-Senior), `f_SB2=5` = salary $120k+
+- These are built dynamically from `config.search.*` fields
+
+### Location Filter (`applyLocationFilters()` in `modules/linkedin.js`)
+- Opens LinkedIn's "All filters" dialog, finds the Location fieldset
+- DOM structure: `<fieldset>` → `<legend>Location filter</legend>` → `<li>` per city → `<input type="checkbox">` + `<label>` with `<span aria-hidden="true">City, ST</span>`
+- Checkboxes have NO aria-label — must use `page.evaluate()` to find spans by text and click labels by `for` attribute
+- Config: `config.search.locationFilter` = array of `"City, ST"` strings (must match LinkedIn's exact format)
+- Only cities present in LinkedIn's pre-populated list get checked; others silently skipped
+
+### Rate Limits
+- Daily Easy Apply limit: ~35 applications
+- Two detection mechanisms: (1) button becomes disabled, (2) modal with "We limit daily submissions..." message
+- Agent detects both and stops cleanly
+
+### Promoted Jobs
+- Jobs with "Promoted" badge in card text are skipped (low-relevance paid placements)
+
+## Common Pitfalls
+
+1. **Orphaned browser processes.** If the agent crashes, Chromium processes may persist and lock `browser-data/linkedin/`. Fix: `taskkill //F //IM chrome.exe` or find PIDs with `wmic process where "name='chrome.exe'" get ProcessId,CommandLine | grep browser-data`
+2. **Location filter bare state codes.** `"CA"` does NOT work — must be `"San Francisco, CA"` etc. LinkedIn's checkbox labels are full city names.
+3. **Stale snapshots.** LinkedIn changes DOM frequently. If selectors break, use Playwright MCP plugin to inspect the live page: `browser_navigate` → `browser_snapshot` → read the snapshot file.
+4. **Config lost after `git reset --hard`.** Runtime files are gitignored. After any hard reset, restore `config.json` and `defaultAnswers.json` manually.
+
+---
+
 # Product Requirements Document: Automated Job Application Agent
 
 ## Document Metadata
