@@ -20,9 +20,64 @@ const fs = require('fs');
 const { sleep, scrollLikeHuman } = require('../lib/humanize');
 const { fillForm, retryInvalidFields } = require('../lib/form-filler');
 const { recordUnfilledField } = require('../lib/state');
+const { queueAppNotification } = require('../lib/notify');
 
 // Maximum time to wait for selectors (ms)
 const SELECTOR_TIMEOUT = 10000;
+
+/**
+ * Decide whether to apply to a job based on config.search.jobFilter.
+ * Runs in <1ms — no network calls, pure string matching.
+ *
+ * @param {string|null} title - Job title from card
+ * @param {string|null} company - Company name from card
+ * @param {object} config - Full config object
+ * @returns {{ apply: boolean, skipReason?: string }}
+ */
+function shouldApply(title, company, config) {
+  const filter = config.search?.jobFilter;
+  if (!filter) return { apply: true };
+
+  const titleLower = (title || '').toLowerCase();
+  const companyLower = (company || '').toLowerCase();
+
+  // Block companies (case-insensitive substring)
+  if (filter.blockCompanies) {
+    for (const blocked of filter.blockCompanies) {
+      if (companyLower.includes(blocked.toLowerCase())) {
+        return { apply: false, skipReason: `blocked_company:${blocked}` };
+      }
+    }
+  }
+
+  // Block title keywords (word-boundary match)
+  if (filter.blockTitleKeywords) {
+    for (const kw of filter.blockTitleKeywords) {
+      const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (re.test(title || '')) {
+        return { apply: false, skipReason: `blocked_title:${kw}` };
+      }
+    }
+  }
+
+  // Require at least one title keyword match
+  if (filter.requireTitleKeywords && filter.requireTitleKeywords.length > 0) {
+    const matched = filter.requireTitleKeywords.some(kw => {
+      if (kw.includes(' ')) {
+        // Multi-word phrase: case-insensitive includes
+        return titleLower.includes(kw.toLowerCase());
+      }
+      // Single word: word boundary
+      const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      return re.test(title || '');
+    });
+    if (!matched) {
+      return { apply: false, skipReason: `title_no_match:${title}` };
+    }
+  }
+
+  return { apply: true };
+}
 
 /**
  * Take an error screenshot and save it to logs/screenshots/
@@ -603,7 +658,7 @@ async function goToNextPage(page, currentPage, searchUrl, logger) {
   return false;
 }
 
-async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger, dryRun = false, llmCache = null) {
+async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger, dryRun = false, llmCache = null, sessionId = 0) {
   const platformConfig = config.platforms.linkedin;
   const maxApplications = platformConfig.maxApplicationsPerRun;
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
@@ -615,6 +670,21 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   let applied = 0;
   let skipped = 0;
   let errors = 0;
+  let seq = 0; // Per-session sequence counter for notifications
+
+  // Wrapper: record application AND queue Discord notification
+  function recordAndNotify({ status, jobId, jobTitle, company, jobUrl, skipReason, errorMessage, steps, source }) {
+    state.recordApplication({
+      platform: 'linkedin', jobId, jobTitle, company, jobUrl,
+      status, errorMessage, skipReason, runId, source: source || null,
+    });
+    seq++;
+    queueAppNotification({
+      status, company, jobTitle, jobId, steps: steps || 0,
+      dsFills: 0, skipReason, errorMessage, sessionId, seq,
+      source: source || 'organic',
+    }, logger);
+  }
 
   // Construct search URL dynamically from config.search.keywords
   const searchUrl = buildSearchUrl(config);
@@ -640,10 +710,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   // Check for CAPTCHA immediately after navigation (PRD §8.2)
   if (await isCaptchaPage(page)) {
     logger.error({ platform: 'linkedin' }, 'CAPTCHA detected at search page. Stopping LinkedIn.');
-    state.recordApplication({
-      platform: 'linkedin', jobId: 'captcha_detected',
-      status: 'captcha_blocked', errorMessage: 'CAPTCHA detected — platform stopped', runId,
-    });
+    recordAndNotify({ status: 'error', jobId: 'captcha_detected', errorMessage: 'CAPTCHA detected' });
+    errors++;
     return { applied, skipped, errors };
   }
 
@@ -716,7 +784,11 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         continue;
       }
 
-      // Quick-extract title/company from the card before any clicks for logging
+      // Scroll card into view to trigger lazy rendering, then extract metadata
+      try { await card.scrollIntoViewIfNeeded(); } catch (_) {}
+      await sleep(200, 400);
+
+      // Quick-extract title/company from the card before any clicks
       try {
         const titleEl = await card.$('a[class*="job-card-list__title"], a[class*="job-card-container__link"], [class*="job-title"], strong');
         if (titleEl) jobTitle = (await titleEl.innerText()).trim().replace(/\n.*/s, '');
@@ -724,22 +796,35 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (companyEl) company = (await companyEl.innerText()).trim().replace(/\n.*/s, '');
       } catch (_) {}
 
-      // Skip promoted/sponsored jobs — typically low-relevance paid placements
+      // If title is still null after scroll, the card hasn't rendered — skip silently
+      if (!jobTitle) {
+        logger.debug({ platform: 'linkedin', jobId, cardIdx, reason: 'card_not_rendered' }, 'Skipping unloaded card');
+        skipped++;
+        continue;
+      }
+
+      // Extract promoted/organic source (before filtering so all records have source data)
+      let isPromoted = false;
       try {
         const cardText = await card.innerText();
-        if (/\bPromoted\b/.test(cardText)) {
-          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'promoted' }, 'Skipping promoted job');
-          state.recordApplication({ platform: 'linkedin', jobId, jobTitle, company, status: 'skipped', skipReason: 'promoted', runId });
-          skipped++;
-          continue;
-        }
+        if (/\bPromoted\b/.test(cardText)) isPromoted = true;
       } catch (_) {}
+      const source = isPromoted ? 'promoted' : 'organic';
+
+      // ── Job filter: block/pass decision ──
+      const { apply: passFilter, skipReason: filterReason } = shouldApply(jobTitle, company, config);
+      if (!passFilter) {
+        logger.debug({ platform: 'linkedin', jobId, jobTitle, company, source, reason: filterReason }, 'Filtered out');
+        recordAndNotify({ status: 'skipped', jobId, jobTitle, company, skipReason: filterReason, source });
+        skipped++;
+        continue;
+      }
 
       try {
         // Check if already applied (SQLite lookup)
         if (state.hasApplied('linkedin', jobId)) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'already_applied_db' }, 'Skipping job');
-          state.recordApplication({ platform: 'linkedin', jobId, jobTitle, company, status: 'already_applied', skipReason: 'already_applied_db', runId });
+          recordAndNotify({ status: 'already_applied', jobId, jobTitle, company, skipReason: 'already_applied_db', source });
           skipped++;
           continue;
         }
@@ -795,10 +880,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         if (!easyApplyBtn) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'no_easy_apply_button' }, 'Skipping job');
-          state.recordApplication({
-            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'skipped', skipReason: 'no_easy_apply_button', runId,
-          });
+          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
           skipped++;
           continue;
         }
@@ -815,10 +897,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         if (btnText.toLowerCase().includes('applied')) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'already_applied_linkedin' }, 'Skipping job');
-          state.recordApplication({
-            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', skipReason: 'already_applied_linkedin', runId,
-          });
+          recordAndNotify({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_linkedin', source });
           skipped++;
           continue;
         }
@@ -847,10 +926,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           logger.warn({ platform: 'linkedin', applied, jobId, jobTitle }, 'Daily application limit reached — stopping platform');
           const dismissBtn = await page.$('button[aria-label="Dismiss"], button:has-text("OK"), button:has-text("Got it"), button:has-text("Done")');
           if (dismissBtn) await dismissBtn.click().catch(() => {});
-          state.recordApplication({
-            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'skipped', skipReason: 'daily_limit_reached', runId,
-          });
+          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'daily_limit_reached', source });
           return { applied, skipped, errors };
         }
 
@@ -859,10 +935,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (alreadyAppliedMsg) {
           const dismissBtn = await page.$('button[aria-label="Dismiss"], button:has-text("Done")');
           if (dismissBtn) await dismissBtn.click();
-          state.recordApplication({
-            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', skipReason: 'already_applied_linkedin', runId,
-          });
+          recordAndNotify({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_linkedin', source });
           skipped++;
           continue;
         }
@@ -913,10 +986,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             }
 
             logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Application submitted');
-            state.recordApplication({
-              platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-              status: dryRun ? 'dry_run' : 'submitted', runId,
-            });
+            recordAndNotify({ status: dryRun ? 'dry_run' : 'submitted', jobId, jobTitle, company, jobUrl, steps: stepCount, source });
             applied++;
 
             // Dismiss the post-submit success dialog / modal.
@@ -1037,10 +1107,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Check for CAPTCHA before deciding whether to retry (PRD §8.2)
         if (await isCaptchaPage(page)) {
           logger.error({ platform: 'linkedin' }, 'CAPTCHA detected — stopping LinkedIn');
-          state.recordApplication({
-            platform: 'linkedin', jobId: 'captcha_detected',
-            status: 'captcha_blocked', errorMessage: 'CAPTCHA detected — platform stopped', runId,
-          });
+          recordAndNotify({ status: 'error', jobId: 'captcha_detected', errorMessage: 'CAPTCHA detected' });
           return { applied, skipped, errors };
         }
 
@@ -1057,10 +1124,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
           errors++;
           await screenshotError(page, 'linkedin', jobId, config);
-          state.recordApplication({
-            platform: 'linkedin', jobId, jobTitle, company, jobUrl,
-            status: 'error', errorMessage: err.message, runId,
-          });
+          recordAndNotify({ status: 'error', jobId, jobTitle, company, jobUrl, errorMessage: err.message, source });
         }
       }
     }
@@ -1081,10 +1145,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       // Check for CAPTCHA on new page
       if (await isCaptchaPage(page)) {
         logger.error({ platform: 'linkedin' }, 'CAPTCHA detected on page navigation. Stopping.');
-        state.recordApplication({
-          platform: 'linkedin', jobId: 'captcha_detected',
-          status: 'captcha_blocked', errorMessage: 'CAPTCHA detected — platform stopped', runId,
-        });
+        recordAndNotify({ status: 'error', jobId: 'captcha_detected', errorMessage: 'CAPTCHA detected' });
         return { applied, skipped, errors };
       }
     } else {

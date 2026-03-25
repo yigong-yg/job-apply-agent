@@ -39,7 +39,7 @@ const { launchForPlatform, checkLoginStatus } = require('./lib/browser');
 const { createLLMCache, setUserContext } = require('./lib/llm');
 
 // Notifications
-const { sendDiscordNotification, sendDiscordMessage } = require('./lib/notify');
+const { flushAppNotifications, sendSessionSummary, sendDiscordMessage } = require('./lib/notify');
 
 // Platform modules
 const { applyLinkedIn } = require('./modules/linkedin');
@@ -284,8 +284,8 @@ async function main() {
     }
   }
 
-  // Create a new run record in SQLite
-  const runId = state.createRun();
+  // Create a new run record in SQLite (sessionId is auto-increment)
+  const { runId, sessionId } = state.createRun();
 
   // Create per-run LLM cache (shared across platforms for dedup)
   const llmCache = createLLMCache();
@@ -366,7 +366,7 @@ async function main() {
 
       // Run the platform-specific apply module
       const applyFn = PLATFORM_MODULES[platform];
-      const platformStats = await applyFn(page, config, defaultAnswers, state, runId, platformLogger, runtime.dryRun, llmCache);
+      const platformStats = await applyFn(page, config, defaultAnswers, state, runId, platformLogger, runtime.dryRun, llmCache, sessionId);
 
       runStats[platform] = platformStats;
       platformLogger.info(platformStats, 'Platform complete');
@@ -398,11 +398,25 @@ async function main() {
   const { report, totalApplied, totalSkipped, totalErrors, durationMin, sessions } =
     await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
 
-  // Send Discord notification
-  await sendDiscordNotification({
-    runId, totalApplied, totalSkipped, totalErrors, durationMin,
-    dryRun: runtime.dryRun, sessions, logger,
-  });
+  // Flush any remaining per-app notifications
+  await flushAppNotifications(logger);
+
+  // Send session summary to Discord
+  const scanned = Object.values(runStats).filter(Boolean).reduce((s, p) => s + (p.applied || 0) + (p.skipped || 0) + (p.errors || 0), 0);
+  await sendSessionSummary({
+    sessionId,
+    durationMin,
+    scanned,
+    applied: totalApplied,
+    skipped: totalSkipped,
+    failed: totalErrors,
+    dsCalls: state.getLlmCallCount(runId),
+    topFail: state.getFailReasons(runId),
+    weekApplied: state.getWeekSubmittedCount(),
+    weekTarget: 60,
+    dbTotal: state.getDbTotal(),
+    dryRun: runtime.dryRun,
+  }, logger);
 
   process.exit(0);
 }

@@ -49,7 +49,8 @@ This section is mandatory context for any Claude Code agent working on this proj
 | `lib/state.js` | SQLite state manager (applications, runs, unfilled_fields) |
 | `lib/humanize.js` | Anti-detection delays and human-like typing |
 | `lib/llm.js` | DeepSeek LLM integration for unknown form fields |
-| `spec.md` | Runtime findings, rate limits, error patterns (living doc) |
+| `.docs/spec.md` | Technical spec, notification design, DOM reference (gitignored, living doc) |
+| `.docs/versions.md` | Version history, concluded findings, historical run log (gitignored) |
 
 ## Testing Commands
 
