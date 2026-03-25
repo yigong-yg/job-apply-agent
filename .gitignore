@@ -224,6 +224,7 @@ logs/
 resumes/
 screenshots/
 .playwright-mcp/
+.docs/
 
 # Source code must be versioned (override Python template's lib/ ignore)
 !lib/
