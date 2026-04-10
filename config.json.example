@@ -25,20 +25,20 @@
 
   "search": {
     "keywords": ["data scientist", "machine learning engineer", "data analyst"],
-    "location": "Salt Lake City, UT",
-    "remoteOnly": false,
-    "includeRemote": true,
-    "radius": "50 miles",
-    "datePosted": "Past week",
-    "experienceLevel": ["Entry level", "Associate", "Mid-Senior level"],
-    "jobType": ["Full-time"]
+    "jobFilter": {
+      "blockCompanies": [],
+      "blockTitleKeywords": ["intern", "director", "VP", "recruiter"],
+      "requireTitleKeywords": ["data scientist", "data analyst", "data engineer", "machine learning", "ML engineer", "AI engineer"]
+    }
   },
 
   "platforms": {
     "linkedin": {
       "enabled": true,
       "maxApplicationsPerRun": 30,
-      "searchUrl": "https://www.linkedin.com/jobs/search/?keywords=data+scientist&location=Salt+Lake+City%2C+UT&f_AL=true&f_TPR=r604800"
+      "geoId": "102095887",
+      "distance": 0.0,
+      "f_SAL": ""
     },
     "indeed": {
       "enabled": true,
