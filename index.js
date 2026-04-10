@@ -39,7 +39,7 @@ const { launchForPlatform, checkLoginStatus } = require('./lib/browser');
 const { createLLMCache, setUserContext } = require('./lib/llm');
 
 // Notifications
-const { flushAppNotifications, sendSessionSummary, sendDiscordMessage } = require('./lib/notify');
+const { flushAppNotifications, sendSessionSummary, sendDiscordMessage, notifyMeowfis } = require('./lib/notify');
 
 // Platform modules
 const { applyLinkedIn } = require('./modules/linkedin');
@@ -256,19 +256,6 @@ async function main() {
 
   ensureDirectories();
 
-  // ── Daily guard: skip if a successful run already exists today ──
-  // (bypassed by --dry-run so testing is always possible)
-  if (!runtime.dryRun) {
-    const todaySubmitted = state.getTodaySubmittedCount();
-    if (todaySubmitted > 0) {
-      const msg = `⏭️ Already applied to ${todaySubmitted} jobs today — skipping run.`;
-      console.log(msg);
-      logger.info({ todaySubmitted }, msg);
-      await sendDiscordMessage(msg, logger);
-      process.exit(0);
-    }
-  }
-
   // ── Time window guard: only run between 7 AM and 11 PM MST ──
   // (bypassed by --dry-run and when run manually via CLI)
   const AUTO_RUN = process.env.AUTO_RUN === 'true';
@@ -334,6 +321,7 @@ async function main() {
   logger.info({ platforms: enabledPlatforms }, 'Will process platforms');
 
   // Process each platform sequentially
+  let stopSessionRequested = false;
   for (const platform of enabledPlatforms) {
     const platformLogger = logger.child({ platform });
     platformLogger.info('Processing platform');
@@ -370,6 +358,13 @@ async function main() {
 
       runStats[platform] = platformStats;
       platformLogger.info(platformStats, 'Platform complete');
+      if (platformStats?.stopSession) {
+        stopSessionRequested = true;
+        platformLogger.warn(
+          { reason: platformStats.stopSessionReason || 'unknown' },
+          'Platform requested early session shutdown'
+        );
+      }
 
     } catch (err) {
       platformLogger.error({ error: err.message, stack: err.stack }, 'Unexpected platform error');
@@ -383,6 +378,11 @@ async function main() {
           platformLogger.info('Browser closed');
         } catch (_) {}
       }
+    }
+
+    if (stopSessionRequested) {
+      logger.warn({ platform }, 'Ending run early after platform stop request');
+      break;
     }
   }
 
@@ -416,6 +416,14 @@ async function main() {
     weekTarget: 60,
     dbTotal: state.getDbTotal(),
     dryRun: runtime.dryRun,
+  }, logger);
+
+  // Notify Meowfis in #agent-internal with mode-aware session completion info
+  await notifyMeowfis({
+    dryRun: runtime.dryRun,
+    sessionId,
+    applied: totalApplied,
+    scanned,
   }, logger);
 
   process.exit(0);

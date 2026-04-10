@@ -7,10 +7,9 @@ This section is mandatory context for any Claude Code agent working on this proj
 ## Critical Rules
 
 1. **NEVER push `.claude/` to any remote branch.** It is gitignored. If you see it tracked, remove it.
-2. **NEVER commit PII** (names, emails, phone numbers, API keys). All PII lives in gitignored runtime files: `config.json`, `defaultAnswers.json`, `.env`.
-3. **NEVER modify `config.json` format without testing.** The locationFilter array must contain full "City, ST" strings (e.g. `"San Francisco, CA"`), NOT bare state codes like `"CA"`.
-4. **Always dry-run before prod.** Use `node index.js --dry-run --platform linkedin --max 3` to validate changes.
-5. **Do not install Python packages or modify the Python/Anaconda environment.** Node.js only. Python is only needed for compiling `better-sqlite3`.
+2. **NEVER commit PII** (names, emails, phone numbers, API keys, Discord webhook URLs, Discord user IDs). All PII lives in gitignored runtime files: `config.json`, `defaultAnswers.json`, `.env`.
+3. **Always dry-run before prod.** Use `node index.js --dry-run --platform linkedin --max 3` to validate changes.
+4. **Do not install Python packages or modify the Python/Anaconda environment.** Node.js only. Python is only needed for compiling `better-sqlite3`.
 
 ## Branch Strategy
 
@@ -63,33 +62,35 @@ node index.js                        # Full run, all enabled platforms
 
 ## LinkedIn-Specific Knowledge
 
-### Search URL Construction (`buildSearchUrl()` in `modules/linkedin.js`)
-- Keywords joined with " OR ", URL-encoded
-- `geoId=103644278` = United States, `f_AL=true` = Easy Apply, `f_TPR=r86400` = Past 24h
-- `f_E=2,3,4` = experience level (Entry/Associate/Mid-Senior), `f_SB2=5` = salary $120k+
-- These are built dynamically from `config.search.*` fields
+### Search URL (`buildLinkedInSearchUrl()` in `modules/linkedin.js`)
+- Path: `/jobs/search-results/` (not the old `/jobs/search/`)
+- `f_AL=true` = Easy Apply, `f_TPR=r86400` = Past 24h (hardcoded)
+- `geoId`, `distance`, `f_SAL` = LinkedIn-specific params from `platforms.linkedin` in config
+- Keywords from `config.search.keywords`, space-joined (not OR-joined)
+- Location filtering is via `geoId` + `distance` in the URL — there is no runtime "All filters" dialog interaction
 
-### Location Filter (`applyLocationFilters()` in `modules/linkedin.js`)
-- Opens LinkedIn's "All filters" dialog, finds the Location fieldset
-- DOM structure: `<fieldset>` → `<legend>Location filter</legend>` → `<li>` per city → `<input type="checkbox">` + `<label>` with `<span aria-hidden="true">City, ST</span>`
-- Checkboxes have NO aria-label — must use `page.evaluate()` to find spans by text and click labels by `for` attribute
-- Config: `config.search.locationFilter` = array of `"City, ST"` strings (must match LinkedIn's exact format)
-- Only cities present in LinkedIn's pre-populated list get checked; others silently skipped
+### DOM Architecture (verified 2026-04-10)
+- **Job cards + detail panel:** top-level page, NOT inside any iframe
+- **Cards:** `<div role="button">` elements found via `page.getByRole('button').filter({hasText: 'Easy Apply'})`
+- **Easy Apply entry:** `<a aria-label="Easy Apply to this job">` in the detail panel, clicked to open the form
+- **Apply form:** renders inside `#interop-outlet` → `shadowRoot` (shadow DOM). Standard `page.$()` and `fillForm()` cannot see into it — must use `page.evaluate()` to access the shadow root directly
+- **`interop-outlet` overlay:** intercepts pointer events on ALL elements. All clicks must use `el.evaluate(e => e.click())` (JS click) or `{ force: true }`, not regular Playwright `.click()`
+- **Promoted detection:** "Promoted by hirer" text in the detail panel (not in card text)
 
 ### Rate Limits
 - Daily Easy Apply limit: ~35 applications
-- Two detection mechanisms: (1) button becomes disabled, (2) modal with "We limit daily submissions..." message
-- Agent detects both and stops cleanly
+- Detection: exact-match on the message "We limit daily submissions to maintain quality and prevent bots, helping each application get the right attention. Save this job and apply tomorrow."
+- Agent checks both page text and shadow DOM text for this message, stops cleanly on match
 
-### Promoted Jobs
-- Jobs with "Promoted" badge in card text are skipped (low-relevance paid placements)
+### CAPTCHA Handling
+- **TODO:** The current `isCaptchaPage()` checks for old UI selectors (`.jobs-search-results-list`, `.global-nav`) that may not exist in the new `/jobs/search-results/` UI. This needs verification and updating if CAPTCHA detection is still required.
 
 ## Common Pitfalls
 
 1. **Orphaned browser processes.** If the agent crashes, Chromium processes may persist and lock `browser-data/linkedin/`. Fix: `taskkill //F //IM chrome.exe` or find PIDs with `wmic process where "name='chrome.exe'" get ProcessId,CommandLine | grep browser-data`
-2. **Location filter bare state codes.** `"CA"` does NOT work — must be `"San Francisco, CA"` etc. LinkedIn's checkbox labels are full city names.
-3. **Stale snapshots.** LinkedIn changes DOM frequently. If selectors break, use Playwright MCP plugin to inspect the live page: `browser_navigate` → `browser_snapshot` → read the snapshot file.
-4. **Config lost after `git reset --hard`.** Runtime files are gitignored. After any hard reset, restore `config.json` and `defaultAnswers.json` manually.
+2. **Playwright MCP plugin conflicts.** The MCP Playwright plugin can hold a browser instance on the `browser-data/linkedin/` profile, blocking the agent from launching. Close it before running.
+3. **Stale snapshots.** LinkedIn changes DOM frequently. If selectors break, use Playwright MCP plugin to inspect the live page. Save snapshots to `.playwright-mcp/` (gitignored).
+4. **Config lost after `git reset --hard`.** Runtime files are gitignored. After any hard reset, restore `config.json`, `defaultAnswers.json`, and `.env` manually.
 
 ---
 
@@ -99,7 +100,7 @@ node index.js                        # Full run, all enabled platforms
 
 - **Version:** 1.1
 - **Date:** 2026-02-24
-- **Author:** Yi (via Claude)
+- **Author:** Project operator (via Claude)
 - **Status:** Draft — Configuration Finalized, Ready for Testing
 - **Scope:** "One-Click Apply" scenarios ONLY across LinkedIn Easy Apply, Indeed Apply, Dice Easy Apply, and Jobright Quick Apply
 
@@ -291,26 +292,26 @@ Sessions WILL expire. The agent must handle this gracefully:
 ```json
 {
   "user": {
-    "firstName": "Yi",
+    "firstName": "[FIRST_NAME]",
     "lastName": "[LAST_NAME]",
     "email": "[EMAIL]",
     "phone": "[PHONE]",
-    "city": "Salt Lake City",
-    "state": "UT",
-    "country": "US",
-    "zipCode": "[ZIP]",
+    "city": "[CITY]",
+    "state": "[STATE]",
+    "country": "[COUNTRY_CODE]",
+    "zipCode": "[ZIP_CODE]",
     "linkedinUrl": "https://www.linkedin.com/in/[HANDLE]/",
-    "workAuthorization": "Authorized to work in the US",
+    "workAuthorization": "[WORK_AUTHORIZATION]",
     "requiresSponsorship": false,
     "willingToRelocate": true,
-    "yearsOfExperience": "2",
-    "highestEducation": "Master's Degree",
-    "veteranStatus": "I am not a protected veteran",
-    "disabilityStatus": "I do not wish to answer",
-    "gender": "Male",
-    "race": "Prefer not to say",
-    "desiredSalary": "150000",
-    "startDate": "Immediately",
+    "yearsOfExperience": "[YEARS_OF_EXPERIENCE]",
+    "highestEducation": "[HIGHEST_EDUCATION]",
+    "veteranStatus": "[VETERAN_STATUS]",
+    "disabilityStatus": "[DISABILITY_STATUS]",
+    "gender": "[GENDER]",
+    "race": "[RACE_ETHNICITY]",
+    "desiredSalary": "[DESIRED_SALARY]",
+    "startDate": "[START_DATE]",
     "resumePath": "./resumes/resume.pdf"
   },
 
@@ -373,21 +374,21 @@ For screener questions that appear on some quick-apply forms, the agent needs a 
 ```json
 {
   "defaultAnswers": {
-    "years of experience": "2",
-    "years of relevant experience": "2",
+    "years of experience": "[YEARS_OF_EXPERIENCE]",
+    "years of relevant experience": "[YEARS_OF_EXPERIENCE]",
     "are you legally authorized to work": "Yes",
     "do you now or will you in the future require sponsorship": "No",
     "are you willing to relocate": "Yes",
-    "what is your expected salary": "150000",
-    "desired salary": "150000",
-    "when can you start": "Immediately",
-    "highest level of education": "Master's Degree",
+    "what is your expected salary": "[DESIRED_SALARY]",
+    "desired salary": "[DESIRED_SALARY]",
+    "when can you start": "[START_DATE]",
+    "highest level of education": "[HIGHEST_EDUCATION]",
     "do you have experience with python": "Yes",
     "do you have experience with machine learning": "Yes",
     "linkedin profile": "https://www.linkedin.com/in/[HANDLE]/",
     "github": "https://github.com/[GITHUB_HANDLE]",
     "cover letter": "",
-    "disability status": "I do not wish to answer"
+    "disability status": "[DISABILITY_STATUS]"
   }
 }
 ```
@@ -694,7 +695,7 @@ RESPONSIBILITIES:
   - User agent: Real Chrome user agent string (not Playwright default)
   - Locale: en-US
   - Timezone: America/Denver (MST)
-  - Geolocation: Salt Lake City coordinates (optional)
+- Geolocation: operator-supplied coordinates (optional)
 - Support headless and headed modes (headed for setup, headless for cron)
 - Provide utility: launchForPlatform(platformName) → returns { browser, context, page }
 - Provide utility: checkLoginStatus(page, platform) → boolean
