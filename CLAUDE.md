@@ -99,7 +99,7 @@ node index.js                        # Full run, all enabled platforms
 
 - **Version:** 1.1
 - **Date:** 2026-02-24
-- **Author:** Yi (via Claude)
+- **Author:** Project operator (via Claude)
 - **Status:** Draft — Configuration Finalized, Ready for Testing
 - **Scope:** "One-Click Apply" scenarios ONLY across LinkedIn Easy Apply, Indeed Apply, Dice Easy Apply, and Jobright Quick Apply
 
@@ -291,26 +291,26 @@ Sessions WILL expire. The agent must handle this gracefully:
 ```json
 {
   "user": {
-    "firstName": "Yi",
+    "firstName": "[FIRST_NAME]",
     "lastName": "[LAST_NAME]",
     "email": "[EMAIL]",
     "phone": "[PHONE]",
-    "city": "Salt Lake City",
-    "state": "UT",
-    "country": "US",
-    "zipCode": "[ZIP]",
+    "city": "[CITY]",
+    "state": "[STATE]",
+    "country": "[COUNTRY_CODE]",
+    "zipCode": "[ZIP_CODE]",
     "linkedinUrl": "https://www.linkedin.com/in/[HANDLE]/",
-    "workAuthorization": "Authorized to work in the US",
+    "workAuthorization": "[WORK_AUTHORIZATION]",
     "requiresSponsorship": false,
     "willingToRelocate": true,
-    "yearsOfExperience": "2",
-    "highestEducation": "Master's Degree",
-    "veteranStatus": "I am not a protected veteran",
-    "disabilityStatus": "I do not wish to answer",
-    "gender": "Male",
-    "race": "Prefer not to say",
-    "desiredSalary": "150000",
-    "startDate": "Immediately",
+    "yearsOfExperience": "[YEARS_OF_EXPERIENCE]",
+    "highestEducation": "[HIGHEST_EDUCATION]",
+    "veteranStatus": "[VETERAN_STATUS]",
+    "disabilityStatus": "[DISABILITY_STATUS]",
+    "gender": "[GENDER]",
+    "race": "[RACE_ETHNICITY]",
+    "desiredSalary": "[DESIRED_SALARY]",
+    "startDate": "[START_DATE]",
     "resumePath": "./resumes/resume.pdf"
   },
 
@@ -373,21 +373,21 @@ For screener questions that appear on some quick-apply forms, the agent needs a 
 ```json
 {
   "defaultAnswers": {
-    "years of experience": "2",
-    "years of relevant experience": "2",
+    "years of experience": "[YEARS_OF_EXPERIENCE]",
+    "years of relevant experience": "[YEARS_OF_EXPERIENCE]",
     "are you legally authorized to work": "Yes",
     "do you now or will you in the future require sponsorship": "No",
     "are you willing to relocate": "Yes",
-    "what is your expected salary": "150000",
-    "desired salary": "150000",
-    "when can you start": "Immediately",
-    "highest level of education": "Master's Degree",
+    "what is your expected salary": "[DESIRED_SALARY]",
+    "desired salary": "[DESIRED_SALARY]",
+    "when can you start": "[START_DATE]",
+    "highest level of education": "[HIGHEST_EDUCATION]",
     "do you have experience with python": "Yes",
     "do you have experience with machine learning": "Yes",
     "linkedin profile": "https://www.linkedin.com/in/[HANDLE]/",
     "github": "https://github.com/[GITHUB_HANDLE]",
     "cover letter": "",
-    "disability status": "I do not wish to answer"
+    "disability status": "[DISABILITY_STATUS]"
   }
 }
 ```
@@ -694,7 +694,7 @@ RESPONSIBILITIES:
   - User agent: Real Chrome user agent string (not Playwright default)
   - Locale: en-US
   - Timezone: America/Denver (MST)
-  - Geolocation: Salt Lake City coordinates (optional)
+- Geolocation: operator-supplied coordinates (optional)
 - Support headless and headed modes (headed for setup, headless for cron)
 - Provide utility: launchForPlatform(platformName) → returns { browser, context, page }
 - Provide utility: checkLoginStatus(page, platform) → boolean

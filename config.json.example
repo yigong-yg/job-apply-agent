@@ -1,25 +1,25 @@
 {
   "user": {
-    "firstName": "Yi",
+    "firstName": "[FIRST_NAME]",
     "lastName": "[LAST_NAME]",
     "email": "[EMAIL]",
     "phone": "[PHONE]",
-    "city": "Salt Lake City",
-    "state": "UT",
-    "country": "US",
-    "zipCode": "[ZIP]",
+    "city": "[CITY]",
+    "state": "[STATE]",
+    "country": "[COUNTRY_CODE]",
+    "zipCode": "[ZIP_CODE]",
     "linkedinUrl": "https://linkedin.com/in/[HANDLE]",
-    "workAuthorization": "US Citizen",
+    "workAuthorization": "[WORK_AUTHORIZATION]",
     "requiresSponsorship": false,
     "willingToRelocate": true,
-    "yearsOfExperience": "3",
-    "highestEducation": "Master's Degree",
-    "veteranStatus": "I am not a protected veteran",
-    "disabilityStatus": "I do not wish to answer",
-    "gender": "Male",
-    "race": "Prefer not to say",
-    "desiredSalary": "120000",
-    "startDate": "Immediately",
+    "yearsOfExperience": "[YEARS_OF_EXPERIENCE]",
+    "highestEducation": "[HIGHEST_EDUCATION]",
+    "veteranStatus": "[VETERAN_STATUS]",
+    "disabilityStatus": "[DISABILITY_STATUS]",
+    "gender": "[GENDER]",
+    "race": "[RACE_ETHNICITY]",
+    "desiredSalary": "[DESIRED_SALARY]",
+    "startDate": "[START_DATE]",
     "resumePath": "./resumes/resume.pdf"
   },
 
@@ -36,19 +36,19 @@
     "linkedin": {
       "enabled": true,
       "maxApplicationsPerRun": 30,
-      "geoId": "102095887",
+      "geoId": "[LINKEDIN_GEO_ID]",
       "distance": 0.0,
       "f_SAL": ""
     },
     "indeed": {
       "enabled": true,
       "maxApplicationsPerRun": 30,
-      "searchUrl": "https://www.indeed.com/jobs?q=data+scientist&l=Salt+Lake+City%2C+UT&fromage=7&sc=0kf%3Aattr(DSQF7)%3B"
+      "searchUrl": "https://www.indeed.com/jobs?q=[KEYWORDS]&l=[CITY]%2C+[STATE]&fromage=7"
     },
     "dice": {
       "enabled": true,
       "maxApplicationsPerRun": 30,
-      "searchUrl": "https://www.dice.com/jobs?q=data+scientist&location=Salt+Lake+City%2C+UT&radius=50&postedDate=SEVEN"
+      "searchUrl": "https://www.dice.com/jobs?q=[KEYWORDS]&location=[CITY]%2C+[STATE]&radius=50&postedDate=SEVEN"
     },
     "jobright": {
       "enabled": true,

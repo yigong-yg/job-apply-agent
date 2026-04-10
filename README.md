@@ -39,10 +39,11 @@ set PYTHON=C:\path\to\python.exe && npm install
 
 ### 2) Configure profile and defaults
 
-- Edit `config.json`.
-- Replace all placeholder values like `[LAST_NAME]`, `[EMAIL]`, `[PHONE]`, `[HANDLE]`.
+- Copy `config.json.example` to `config.json`, `defaultAnswers.json.example` to `defaultAnswers.json`, and `.env.example` to `.env`.
+- Keep your real profile, session, resume, and runtime data only in those local files and folders. They are gitignored.
+- Replace all placeholder values like `[FIRST_NAME]`, `[LAST_NAME]`, `[EMAIL]`, `[PHONE]`, `[HANDLE]`, and `[DESIRED_SALARY]`.
 - Verify `platforms.<name>.enabled`, `maxApplicationsPerRun`, and `searchUrl`.
-- Edit `defaultAnswers.json` to align with your profile answers.
+- Edit `defaultAnswers.json` to align with your real profile answers.
 
 ### 3) Place resume file
 
