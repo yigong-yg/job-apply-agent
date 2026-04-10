@@ -419,9 +419,17 @@ async function extractSelectedJobDetail(page) {
       if (companyLink) company = companyLink.textContent.trim();
     }
 
+    // Job description text from the detail panel
+    let description = '';
+    if (mainEl) {
+      // The description is typically in an <article> inside main
+      const articleEl = mainEl.querySelector('article');
+      if (articleEl) description = (articleEl.innerText || '').trim().substring(0, 2000);
+    }
+
     const jobUrl = jobId ? `https://www.linkedin.com/jobs/view/${jobId}` : null;
 
-    return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref };
+    return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, description };
   }).catch(() => null);
 
   // Also try getting jobId from the top-level page URL (more reliable)
@@ -655,6 +663,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     }, logger);
   }
 
+  // ── Crash diagnostics (gitignored logs/) ──
+  page.on('crash', () => {
+    logger.error({ platform: 'linkedin' }, 'Page crashed');
+  });
+  page.context().on('close', () => {
+    logger.warn({ platform: 'linkedin' }, 'Browser context closed');
+  });
+
   // ── Navigate to search results ──
   const searchUrl = buildLinkedInSearchUrl(config);
   logger.info({ platform: 'linkedin', searchUrl }, 'Navigating to LinkedIn search');
@@ -734,6 +750,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (detail.title) jobTitle = detail.title;
         if (detail.company) company = detail.company;
 
+        // ── Skip promoted jobs (detail-verified, not card-level) ──
+        if (detail.isPromoted) {
+          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'promoted' }, 'Skipping promoted job');
+          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'promoted', source });
+          skipped++;
+          continue;
+        }
+
         // ── Guard: skip jobs that already failed this session ──
         if (failedJobIds.has(jobId)) {
           logger.debug({ platform: 'linkedin', jobId, reason: 'already_failed_this_session' }, 'Skipping');
@@ -795,7 +819,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // ── Step 7: Process inline apply steps ──
         const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
         const fillOptions = {
-          jobContext: { jobTitle, company, jobDescription: '' },
+          jobContext: { jobTitle, company, jobDescription: detail.description || '' },
           llmCache: llmCache || undefined,
           llmBudget,
           runId,
