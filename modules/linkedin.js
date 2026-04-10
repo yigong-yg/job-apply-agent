@@ -327,18 +327,45 @@ function summarizeResultCard(rawText) {
   if (!rawText || rawText.length < 20) return null;
 
   const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
-  // First meaningful line is the title (may include "(Verified job)" suffix)
+
+  // Two card formats:
+  //   Non-verified: Title → Company → Location → ...
+  //   Verified:     "Title (Verified job)" → Title (repeated) → Company → Location → ...
+  // The "(Verified job)" suffix on line 1 is the signal.
+
   let title = null;
   let company = null;
   let location = null;
 
-  for (const line of lines) {
-    // Skip very short lines, icons, dismiss buttons
-    if (line.length < 3 || line.startsWith('Dismiss')) continue;
-    if (!title) { title = line.replace(/\s*\(Verified job\)\s*/i, '').trim(); continue; }
-    if (!company) { company = line; continue; }
-    if (!location && /[A-Z]{2}\s*\(/.test(line)) { location = line; break; }
-    if (!location && /remote/i.test(line)) { location = line; break; }
+  const meaningful = lines.filter(l => l.length >= 3 && !l.startsWith('Dismiss'));
+  if (meaningful.length === 0) return null;
+
+  const firstLine = meaningful[0];
+  const isVerified = /\(Verified job\)/i.test(firstLine);
+  title = firstLine.replace(/\s*\(Verified job\)\s*/i, '').trim();
+
+  if (isVerified) {
+    // Verified: line 0 = "Title (Verified job)", line 1 = Title (skip), line 2 = Company, line 3 = Location
+    // Skip line 1 if it matches the cleaned title
+    let idx = 1;
+    if (meaningful[idx] && meaningful[idx].toLowerCase() === title.toLowerCase()) idx++;
+    if (meaningful[idx]) company = meaningful[idx];
+    // Look for location in remaining lines
+    for (let j = idx + 1; j < meaningful.length; j++) {
+      if (/[A-Z]{2}\s*\(/.test(meaningful[j]) || /remote/i.test(meaningful[j])) {
+        location = meaningful[j];
+        break;
+      }
+    }
+  } else {
+    // Non-verified: line 0 = Title, line 1 = Company, line 2+ = Location
+    if (meaningful[1]) company = meaningful[1];
+    for (let j = 2; j < meaningful.length; j++) {
+      if (/[A-Z]{2}\s*\(/.test(meaningful[j]) || /remote/i.test(meaningful[j])) {
+        location = meaningful[j];
+        break;
+      }
+    }
   }
 
   const hasEasyApplyBadge = rawText.includes('Easy Apply');
@@ -452,7 +479,8 @@ async function extractSelectedJobDetail(page) {
  */
 async function enterEasyApply(page, logger) {
   // Try the Easy Apply link (new UI: <a aria-label="Easy Apply to this job">)
-  const easyApplyLink = page.locator('a[aria-label="Easy Apply to this job"]');
+  // Use .first() — LinkedIn can render duplicate Easy Apply links for the same job
+  const easyApplyLink = page.locator('a[aria-label="Easy Apply to this job"]').first();
   if (await easyApplyLink.count() > 0) {
     await easyApplyLink.click({ force: true });
     await sleep(2000, 3000);
@@ -476,15 +504,6 @@ async function enterEasyApply(page, logger) {
 //  Inline Apply Step Handler
 // ══════════════════════════════════════════════════════════
 
-/**
- * Handle one step of the inline SDUI apply flow.
- * Replaces the old modal-centric handleModalStep().
- *
- * The apply form appears inline in the detail panel (or in the /preload/ iframe).
- * We fill fields, then click Next/Review/Submit.
- *
- * @param {import('playwright').Frame} frame - the LinkedIn app frame
- */
 /**
  * Handle one step of the SDUI apply flow.
  * The form lives inside #interop-outlet → shadowRoot (shadow DOM).
@@ -575,14 +594,53 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   }).catch(() => []);
 
   if (postClickErrors.length > 0) {
-    logger.debug({ platform: 'linkedin', jobId, errors: postClickErrors }, 'Shadow DOM validation errors');
+    // ── Structured diagnostics for validation failures ──
+    const fieldDiag = await page.evaluate(() => {
+      const interop = document.querySelector('#interop-outlet');
+      if (!interop || !interop.shadowRoot) return [];
+      const sr = interop.shadowRoot;
+      const fields = [];
+      for (const el of sr.querySelectorAll('input, select, textarea')) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (el.type === 'hidden') continue;
+        const parent = el.closest('div, fieldset, li');
+        const label = parent?.querySelector('label, legend');
+        const labelText = label ? label.textContent.trim().substring(0, 80) : '';
+        const hasError = parent?.querySelector('[class*="error"], [role="alert"]');
+        fields.push({
+          tag: el.tagName, type: el.type || '', label: labelText,
+          hasValue: !!(el.value && el.value.trim()),
+          valueLen: (el.value || '').length,
+          hasError: !!hasError,
+          inShadow: true,
+        });
+      }
+      // Also check radio groups
+      for (const radio of sr.querySelectorAll('input[type="radio"]')) {
+        const parent = radio.closest('fieldset, div, li');
+        const legend = parent?.querySelector('legend, label');
+        const groupLabel = legend ? legend.textContent.trim().substring(0, 80) : '';
+        if (groupLabel && !fields.some(f => f.label === groupLabel)) {
+          fields.push({ tag: 'INPUT', type: 'radio', label: groupLabel, hasValue: radio.checked, valueLen: 0, hasError: false, inShadow: true });
+        }
+      }
+      return fields;
+    }).catch(() => []);
+
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum,
+      errors: postClickErrors,
+      fields: fieldDiag,
+      btnText: btnText.trim(),
+    }, 'Validation failure — field diagnostics');
+
     // Try filling again with shadow form filler
     const retry = await fillShadowForm(page, defaultAnswers, logger, jobId);
     if (retry.filled > 0) {
       await sleep(300, 600);
       await btn.evaluate(e => e.click());
       await sleep(1000, 1500);
-      // Recheck
       const stillErrors = await page.evaluate(() => {
         const interop = document.querySelector('#interop-outlet');
         if (!interop || !interop.shadowRoot) return false;
@@ -750,13 +808,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (detail.title) jobTitle = detail.title;
         if (detail.company) company = detail.company;
 
-        // ── Skip promoted jobs (detail-verified, not card-level) ──
-        if (detail.isPromoted) {
-          logger.debug({ platform: 'linkedin', jobId, jobTitle, company, reason: 'promoted' }, 'Skipping promoted job');
-          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'promoted', source });
-          skipped++;
-          continue;
-        }
+        // Promoted jobs: tag source but do NOT skip — many are real jobs from real companies.
+        // source is already set to 'promoted' above for tracking/analysis.
 
         // ── Guard: skip jobs that already failed this session ──
         if (failedJobIds.has(jobId)) {

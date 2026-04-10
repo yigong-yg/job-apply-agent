@@ -55,8 +55,9 @@ test('defaults keywords when none provided', () => {
 
 // ── summarizeResultCard ──
 
-test('parses standard card text', () => {
+test('parses verified card text (title repeated on line 2)', () => {
   const text = `Data Scientist (Verified job)
+Data Scientist
 Stripe
 San Francisco, CA (Hybrid)
 $155K/yr - $185K/yr
@@ -67,6 +68,17 @@ Be an early applicant · Posted on April 9, 2026 · Easy Apply`;
   assert.strictEqual(s.location, 'San Francisco, CA (Hybrid)');
   assert(s.hasEasyApplyBadge);
   assert(!s.hasAppliedBadge);
+});
+
+test('parses non-verified card text', () => {
+  const text = `Data Analyst
+Infobahn Softworld Inc
+San Jose, CA (On-site)
+Viewed · Be an early applicant · Easy Apply`;
+  const s = summarizeResultCard(text);
+  assert.strictEqual(s.title, 'Data Analyst');
+  assert.strictEqual(s.company, 'Infobahn Softworld Inc');
+  assert.strictEqual(s.location, 'San Jose, CA (On-site)');
 });
 
 test('detects Applied badge', () => {
@@ -86,15 +98,18 @@ test('returns null for too-short text', () => {
 
 test('strips "(Verified job)" from title', () => {
   const text = `Senior Data Engineer (Verified job)
+Senior Data Engineer
 Meta
 Menlo Park, CA (On-site)
 Easy Apply`;
   const s = summarizeResultCard(text);
   assert.strictEqual(s.title, 'Senior Data Engineer');
+  assert.strictEqual(s.company, 'Meta');
 });
 
 test('parses card with Dismiss button in text', () => {
   const text = `AI Engineer (Verified job)
+AI Engineer
 Kickmaker
 San Francisco, CA (Hybrid)
 Dismiss AI Engineer job
