@@ -29,23 +29,132 @@ const { queueAppNotification } = require('../lib/notify');
 
 const SELECTOR_TIMEOUT = 10000;
 
-// ── Exact daily-limit message (must remain exact-match) ──
-const LINKEDIN_DAILY_SUBMISSION_LIMIT_MESSAGE =
-  'We limit daily submissions to maintain quality and prevent bots, helping each application get the right attention. Save this job and apply tomorrow.';
+// ── Exact daily-limit messages (must remain exact known variants) ──
+const LINKEDIN_DAILY_SUBMISSION_LIMIT_MESSAGES = [
+  'We limit daily submissions to maintain quality and prevent bots, helping each application get the right attention. Save this job and apply tomorrow.',
+  'Great effort applying today. We limit Easy Apply submissions to help ensure each application gets the right attention. Save this job and continue applying tomorrow. Learn more',
+];
 
 function normalizeVisibleText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
 function hasLinkedInDailySubmissionLimitMessage(text) {
-  return normalizeVisibleText(text).includes(
-    normalizeVisibleText(LINKEDIN_DAILY_SUBMISSION_LIMIT_MESSAGE)
+  const normalized = normalizeVisibleText(text);
+  if (!normalized) return false;
+  return LINKEDIN_DAILY_SUBMISSION_LIMIT_MESSAGES.some(message =>
+    normalized.includes(normalizeVisibleText(message))
   );
+}
+
+// ── Search-page diagnostic helpers ──
+//
+// Why these exist: the cron's daily LinkedIn loop started logging
+// `cardCount: 0` from 2026-04-26 onward despite identical code that was
+// applying 25–35 jobs/day the week prior. With only `cardCount: 0` to go on
+// it's impossible to tell whether the DOM moved, the session got bounced to
+// a login wall, a bot challenge fired, or LinkedIn's daily cap is suppressing
+// results. analyzeSearchPageState classifies the page from a structured
+// snapshot so the next run captures *why*, and pickCardStrategy chooses
+// among fallback selectors when the primary one comes up empty.
+
+function pickCardStrategy(counts) {
+  const c = counts || {};
+  if ((c.easyApplyCardCount || 0) > 0) return 'easy_apply_button';
+  if ((c.jobIdAttrCount || 0) > 0) return 'data_job_id';
+  if ((c.jobLinkCount || 0) > 0) return 'job_link';
+  return null;
+}
+
+/**
+ * Decide whether a role=button's accessible text looks like a job card.
+ *
+ * The 2026-04-30 search-results redesign dropped "Easy Apply" from card
+ * badges (now just " Apply") and randomized container class names — so the
+ * legacy `getByRole('button').filter({hasText: 'Easy Apply'})` selector
+ * matches nothing. Cards still render as role=button divs, but so do filter
+ * pills ("LinkedIn Apply"), nav buttons ("Jobs"), and tooltip triggers.
+ * This classifier separates the two using stable card-text markers
+ * captured from a real production diagnostic.
+ */
+function isJobCardText(text) {
+  if (!text || typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (trimmed.length < 30) return false;
+  if (!/\bApply\b/i.test(trimmed)) return false;
+  return /\(Verified job\)|Be an early applicant|\bago\b|Promoted by hirer/i.test(trimmed);
+}
+
+function analyzeSearchPageState(state) {
+  const s = state || {};
+  const url = String(s.url || '');
+  const bodyText = String(s.bodyText || '');
+  const easyApplyCardCount = s.easyApplyCardCount || 0;
+  const jobIdAttrCount = s.jobIdAttrCount || 0;
+  const jobLinkCount = s.jobLinkCount || 0;
+  const totalButtons = s.totalButtons || 0;
+
+  if (easyApplyCardCount > 0) {
+    return { kind: 'ok', message: `Found ${easyApplyCardCount} Easy Apply cards.` };
+  }
+
+  if (/\/login(?:\?|$|\/)/i.test(url) || /\/authwall/i.test(url)) {
+    return { kind: 'login_required', message: `Login wall detected — URL redirected to ${url}.` };
+  }
+
+  if (/\/checkpoint\/challenge/i.test(url) ||
+      /security check|security verification|verify you'?re human|prove you'?re not a robot/i.test(bodyText)) {
+    return { kind: 'bot_challenge', message: 'Bot or security challenge page detected.' };
+  }
+
+  if (hasLinkedInDailySubmissionLimitMessage(bodyText) || /reached today.?s easy apply limit/i.test(bodyText)) {
+    return { kind: 'rate_limited', message: 'LinkedIn daily Easy Apply limit reached.' };
+  }
+
+  if (/no matching jobs|no jobs matching|0 results|no results found/i.test(bodyText)) {
+    return { kind: 'no_results', message: 'Search returned no matching jobs.' };
+  }
+
+  if (/(sign in|join now)/i.test(bodyText) && jobIdAttrCount === 0 && jobLinkCount === 0) {
+    return { kind: 'login_required', message: 'Page shows sign-in copy with no job content — likely an authwall.' };
+  }
+
+  if (jobIdAttrCount > 0 || jobLinkCount > 0) {
+    return {
+      kind: 'dom_changed',
+      message: `Job entities present (jobIdAttrCount=${jobIdAttrCount}, jobLinkCount=${jobLinkCount}) but Easy Apply selector found 0 — DOM likely changed.`,
+    };
+  }
+
+  return { kind: 'unknown', message: `No cards and no known signal matched (totalButtons=${totalButtons}).` };
 }
 
 // ── Job filter (pure, no network) ──
 
-function shouldApply(title, company, config) {
+function matchesAllowedLocation(location, configuredLocation) {
+  const text = String(location || '').trim();
+  if (!text) return true; // Missing card location should not become a false negative.
+
+  const candidate = String(configuredLocation || '').trim().toLowerCase();
+  if (!candidate) return true;
+
+  const lower = text.toLowerCase();
+  const aliasPatterns = {
+    california: [/\bcalifornia\b/i, /,\s*ca\b/i, /\bca\s*\(/i],
+    newyork: [/\bnew york\b/i, /,\s*ny\b/i, /\bny\s*\(/i],
+    massachusetts: [/\bmassachusetts\b/i, /,\s*ma\b/i, /\bma\s*\(/i],
+  };
+
+  const normalized = candidate.replace(/[\s,]+/g, '');
+  const patterns = aliasPatterns[normalized];
+  if (patterns) return patterns.some(re => re.test(lower));
+
+  return lower.includes(candidate);
+}
+
+function shouldApply(title, company, locationOrConfig, maybeConfig) {
+  const location = maybeConfig ? locationOrConfig : null;
+  const config = maybeConfig || locationOrConfig || {};
   const filter = config.search?.jobFilter;
   if (!filter) return { apply: true };
 
@@ -66,6 +175,14 @@ function shouldApply(title, company, config) {
       if (re.test(title || '')) {
         return { apply: false, skipReason: `blocked_title:${kw}` };
       }
+    }
+  }
+
+  const locationFilter = config.search?.locationFilter;
+  if (Array.isArray(locationFilter) && locationFilter.length > 0) {
+    const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
+    if (!matchedLocation) {
+      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
     }
   }
 
@@ -293,7 +410,7 @@ function buildLinkedInSearchUrl(config) {
   params.set('keywords', keywords);
   if (li.geoId) params.set('geoId', li.geoId);
   if (li.distance != null) params.set('distance', String(li.distance));
-  params.set('f_TPR', 'r86400');
+  params.set('f_TPR', li.f_TPR || 'r86400');
   params.set('f_AL', 'true');
   if (li.f_SAL) params.set('f_SAL', li.f_SAL);
 
@@ -305,16 +422,152 @@ function buildLinkedInSearchUrl(config) {
 // ══════════════════════════════════════════════════════════
 
 /**
- * Find all result card buttons on the current page.
- * Cards are accessible as role=button via Playwright's getByRole.
- * They contain "Easy Apply" in their text and are on the top-level page.
+ * Find all result card locators on the current page.
+ *
+ * Multi-strategy: from 2026-04-26 onward the cron started logging cardCount=0
+ * even though the same code worked the day before (last commit to this file
+ * was 2026-04-14). Whatever LinkedIn changed, the legacy role=button +
+ * "Easy Apply" filter no longer reliably matches. Fall back through stable
+ * data-attribute selectors so the agent keeps applying instead of silently
+ * exiting after 22 seconds.
  */
 async function listResultCards(page) {
-  // Wait for at least one card to render
   try {
-    await page.getByRole('button').filter({ hasText: 'Easy Apply' }).first().waitFor({ timeout: SELECTOR_TIMEOUT });
+    await Promise.race([
+      page.getByRole('button').filter({ hasText: 'Easy Apply' }).first().waitFor({ timeout: SELECTOR_TIMEOUT }),
+      page.locator('li[data-occludable-job-id]').first().waitFor({ timeout: SELECTOR_TIMEOUT }),
+      page.locator('[data-job-id]').first().waitFor({ timeout: SELECTOR_TIMEOUT }),
+      page.getByRole('button')
+        .filter({ hasText: /\(Verified job\)|Be an early applicant|Promoted by hirer/i })
+        .first().waitFor({ timeout: SELECTOR_TIMEOUT }),
+    ]);
   } catch (_) {}
-  return page.getByRole('button').filter({ hasText: 'Easy Apply' }).all();
+
+  const primary = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).all();
+  if (primary.length > 0) return primary;
+
+  const liCards = await page.locator('li[data-occludable-job-id]').all();
+  if (liCards.length > 0) return liCards;
+
+  const dataIdCards = await page.locator('[data-job-id]').all();
+  if (dataIdCards.length > 0) return dataIdCards;
+
+  // 2026-04-26+ DOM: cards are role=button divs with hashed class names and
+  // " Apply" (no longer "Easy Apply") in their accessible text. Discriminate
+  // them from filter pills / nav buttons by checking for stable card markers.
+  // Single page.evaluateAll() round-trip — chatty per-button innerText() loops
+  // appeared to compound the new SPA's renderer pressure during testing.
+  const cardIndices = await page.getByRole('button').evaluateAll((els) => {
+    return els
+      .map((el, i) => {
+        const text = (el.textContent || '').trim();
+        if (text.length < 30) return -1;
+        if (!/\bApply\b/i.test(text)) return -1;
+        if (!/\(Verified job\)|Be an early applicant|\bago\b|Promoted by hirer/i.test(text)) return -1;
+        return i;
+      })
+      .filter(i => i >= 0);
+  }).catch(() => []);
+
+  if (cardIndices.length === 0) return [];
+  const baseLocator = page.getByRole('button');
+  return cardIndices.map(i => baseLocator.nth(i));
+}
+
+async function countResultCards(page) {
+  // Lightweight pagination check — does NOT need an exact count. Used by
+  // goToNextPage only to confirm "the next page rendered something". Avoid
+  // calling listResultCards here so we don't run the full multi-strategy
+  // iteration just to verify page navigation worked.
+  const easy = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).count().catch(() => 0);
+  if (easy > 0) return easy;
+  const li = await page.locator('li[data-occludable-job-id]').count().catch(() => 0);
+  if (li > 0) return li;
+  return page.getByRole('button').filter({ hasText: 'Apply' }).count().catch(() => 0);
+}
+
+/**
+ * Snapshot the search page so analyzeSearchPageState can classify why no
+ * cards were found. Runs entirely in the page context; returns null on
+ * failure rather than throwing, since this path is itself a diagnostic for
+ * a failure case and must not introduce a second one.
+ */
+async function captureSearchPageState(page) {
+  return page.evaluate(() => {
+    const easyApplyCardCount = Array.from(document.querySelectorAll('[role="button"], button'))
+      .filter(el => (el.textContent || '').includes('Easy Apply')).length;
+    const liCardCount = document.querySelectorAll('li[data-occludable-job-id]').length;
+    const jobIdAttrCount = document.querySelectorAll('[data-job-id], [data-occludable-job-id]').length;
+    const jobLinkCount = document.querySelectorAll('a[href*="/jobs/view/"]').length;
+    const totalButtons = document.querySelectorAll('button, [role="button"]').length;
+    const bodyText = document.body && document.body.innerText
+      ? document.body.innerText.slice(0, 8000)
+      : '';
+
+    // ── Extra signals collected while we figure out the new card markup ──
+    const verifiedJobAncestors = [];
+    const verifiedNodes = Array.from(document.querySelectorAll('*'))
+      .filter(el => el.children.length === 0 && /\(Verified job\)/.test(el.textContent || ''));
+    for (const node of verifiedNodes.slice(0, 3)) {
+      let cur = node;
+      const chain = [];
+      for (let depth = 0; depth < 10 && cur; depth++) {
+        const tag = (cur.tagName || '').toLowerCase();
+        const id = cur.id ? `#${cur.id}` : '';
+        const cls = cur.className && typeof cur.className === 'string'
+          ? `.${cur.className.trim().split(/\s+/).slice(0, 3).join('.')}`
+          : '';
+        const role = cur.getAttribute && cur.getAttribute('role') ? `[role=${cur.getAttribute('role')}]` : '';
+        const dataJobId = cur.getAttribute && cur.getAttribute('data-job-id') ? '[data-job-id]' : '';
+        const dataOccl = cur.getAttribute && cur.getAttribute('data-occludable-job-id') ? '[data-occludable-job-id]' : '';
+        chain.push(`${tag}${id}${cls}${role}${dataJobId}${dataOccl}`);
+        cur = cur.parentElement;
+      }
+      verifiedJobAncestors.push(chain);
+    }
+
+    const cardClassCandidates = {};
+    for (const sel of [
+      'li.scaffold-layout__list-item',
+      '[class*="job-card-job-posting-card-wrapper"]',
+      '[class*="job-card-container"]',
+      '[class*="job-card-list"]',
+      '[class*="jobs-search-results__list-item"]',
+      'div[data-view-name="job-card"]',
+      'a[data-control-name*="job_card"]',
+      '[role="article"]',
+      '[role="link"][href*="/jobs/view/"]',
+    ]) {
+      try { cardClassCandidates[sel] = document.querySelectorAll(sel).length; }
+      catch (_) { cardClassCandidates[sel] = -1; }
+    }
+
+    return {
+      url: window.location.href,
+      title: document.title,
+      bodyText,
+      easyApplyCardCount,
+      liCardCount,
+      jobIdAttrCount,
+      jobLinkCount,
+      totalButtons,
+      cardClassCandidates,
+      verifiedJobAncestors,
+    };
+  }).catch(() => null);
+}
+
+async function screenshotDebug(page, label) {
+  try {
+    const dir = path.join(process.cwd(), 'logs', 'screenshots');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const today = new Date().toISOString().slice(0, 10);
+    const fname = `${today}-linkedin-${label}.png`;
+    await page.screenshot({ path: path.join(dir, fname), fullPage: false });
+    return path.join(dir, fname);
+  } catch (_) {
+    return null;
+  }
 }
 
 /**
@@ -507,16 +760,13 @@ async function enterEasyApply(page, logger) {
 /**
  * Handle one step of the SDUI apply flow.
  * The form lives inside #interop-outlet → shadowRoot (shadow DOM).
- * Playwright's page.locator() pierces shadow DOM; page.$() and fillForm do NOT.
- * We use fillShadowForm() for field filling and page.locator() for button clicks.
+ * The shared fillForm()/retryInvalidFields() path owns text/select semantics.
+ * page.locator() is used for action buttons in the shadow DOM.
  */
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
   // ── Fill form fields inside shadow DOM ──
-  await fillShadowForm(page, defaultAnswers, logger, jobId);
-
-  // Also try standard fillForm on the page for non-shadow fields (fallback)
   try {
     await fillForm(page, defaultAnswers, config, logger, 'linkedin', jobId, options);
   } catch (_) {}
@@ -635,9 +885,8 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       btnText: btnText.trim(),
     }, 'Validation failure — field diagnostics');
 
-    // Try filling again with shadow form filler
-    const retry = await fillShadowForm(page, defaultAnswers, logger, jobId);
-    if (retry.filled > 0) {
+    const retry = await retryInvalidFields(page, defaultAnswers, config, logger, 'linkedin', jobId, options).catch(() => ({ retryFilled: 0 }));
+    if (retry.retryFilled > 0) {
       await sleep(300, 600);
       await btn.evaluate(e => e.click());
       await sleep(1000, 1500);
@@ -666,7 +915,7 @@ async function goToNextPage(page, currentPage, logger) {
   if (await pageBtn.count() > 0) {
     await pageBtn.click({ force: true });
     await sleep(2000, 3000);
-    const cards = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).count();
+    const cards = await countResultCards(page);
     if (cards > 0) {
       logger.info({ platform: 'linkedin', page: nextPageNum, cardCount: cards }, `Navigated to page ${nextPageNum}`);
       return true;
@@ -680,7 +929,7 @@ async function goToNextPage(page, currentPage, logger) {
     if (text.trim() === 'Next' || text.trim().includes('Next')) {
       await nextBtn.click({ force: true });
       await sleep(2000, 3000);
-      const cards = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).count();
+      const cards = await countResultCards(page);
       if (cards > 0) {
         logger.info({ platform: 'linkedin', page: nextPageNum }, `Navigated to page ${nextPageNum} via Next`);
         return true;
@@ -705,6 +954,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   let applied = 0;
   let skipped = 0;
   let errors = 0;
+  let alreadyApplied = 0;
+  let internalSkipped = 0;
   let seq = 0;
   const failedJobIds = new Set(); // Track failed jobs to prevent retrying same job endlessly
 
@@ -719,6 +970,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       dsFills: 0, skipReason, errorMessage, sessionId, seq,
       source: source || 'organic', dryRun,
     }, logger);
+  }
+
+  function recordOutcome(outcome) {
+    recordAndNotify(outcome);
+    if (outcome.status === 'submitted' || outcome.status === 'dry_run') applied++;
+    else if (outcome.status === 'skipped') skipped++;
+    else if (outcome.status === 'already_applied') alreadyApplied++;
+    else if (outcome.status === 'error') errors++;
   }
 
   // ── Crash diagnostics (gitignored logs/) ──
@@ -749,7 +1008,38 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     }
 
     logger.info({ platform: 'linkedin', page: currentPage, cardCount: cards.length }, `Processing page ${currentPage}`);
-    if (cards.length === 0) break;
+    if (cards.length === 0) {
+      // Capture page state so the next operator (or Claude session) can see
+      // exactly why we found nothing. Pre-fix this branch logged only
+      // `cardCount: 0` and exited — five days of zero applications passed
+      // before anyone could tell whether it was a DOM change, a login
+      // bounce, a bot challenge, or a daily cap.
+      const state = await captureSearchPageState(page);
+      if (state) {
+        const diag = analyzeSearchPageState(state);
+        const screenshotPath = await screenshotDebug(page, `nocards-page${currentPage}`);
+        logger.warn({
+          platform: 'linkedin',
+          page: currentPage,
+          diagnosticKind: diag.kind,
+          diagnosticMessage: diag.message,
+          finalUrl: state.url,
+          pageTitle: state.title,
+          easyApplyCardCount: state.easyApplyCardCount,
+          liCardCount: state.liCardCount,
+          jobIdAttrCount: state.jobIdAttrCount,
+          jobLinkCount: state.jobLinkCount,
+          totalButtons: state.totalButtons,
+          cardClassCandidates: state.cardClassCandidates,
+          verifiedJobAncestors: state.verifiedJobAncestors,
+          bodyTextSample: state.bodyText.slice(0, 600),
+          screenshotPath,
+        }, 'No result cards found — capturing page diagnostic');
+      } else {
+        logger.warn({ platform: 'linkedin', page: currentPage }, 'No result cards and could not capture page state');
+      }
+      break;
+    }
 
     for (let i = 0; i < cards.length && applied < maxApplications; i++) {
       const card = cards[i];
@@ -766,7 +1056,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         if (!summary) {
           logger.debug({ platform: 'linkedin', cardIdx: i, reason: 'card_not_rendered' }, 'Skipping unloaded card');
-          skipped++;
+          internalSkipped++;
           continue;
         }
 
@@ -775,17 +1065,16 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         // Early-skip: card shows "Applied" badge
         if (summary.hasAppliedBadge) {
-          skipped++;
+          internalSkipped++;
           continue;
         }
 
         // ── Step 2: Job filter (before clicking into detail) ──
-        const { apply: passFilter, skipReason: filterReason } = shouldApply(jobTitle, company, config);
+        const { apply: passFilter, skipReason: filterReason } = shouldApply(jobTitle, company, summary.location, config);
         if (!passFilter) {
           logger.debug({ platform: 'linkedin', jobTitle, company, reason: filterReason }, 'Filtered out');
           // We don't have jobId yet — record with title as identifier
-          recordAndNotify({ status: 'skipped', jobId: 'filtered', jobTitle, company, skipReason: filterReason, source });
-          skipped++;
+          recordOutcome({ status: 'skipped', jobId: 'filtered', jobTitle, company, skipReason: filterReason, source });
           continue;
         }
 
@@ -796,7 +1085,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         const detail = await extractSelectedJobDetail(page);
         if (!detail || !detail.jobId) {
           logger.debug({ platform: 'linkedin', jobTitle, company, reason: 'no_job_id' }, 'Could not extract job ID from detail');
-          skipped++;
+          internalSkipped++;
           continue;
         }
 
@@ -814,31 +1103,28 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // ── Guard: skip jobs that already failed this session ──
         if (failedJobIds.has(jobId)) {
           logger.debug({ platform: 'linkedin', jobId, reason: 'already_failed_this_session' }, 'Skipping');
-          skipped++;
+          internalSkipped++;
           continue;
         }
 
         // ── Step 5: DB dedup (now that we have canonical jobId) ──
         if (state.hasApplied('linkedin', jobId)) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'already_applied_db' }, 'Skipping');
-          recordAndNotify({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_db', source });
-          skipped++;
+          recordOutcome({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_db', source });
           continue;
         }
 
         // Already applied per LinkedIn's detail panel
         if (detail.alreadyApplied) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'already_applied_linkedin' }, 'Skipping');
-          recordAndNotify({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_linkedin', source });
-          skipped++;
+          recordOutcome({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_linkedin', source });
           continue;
         }
 
         // ── Step 6: Enter Easy Apply ──
         if (!detail.easyApplyHref) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'no_easy_apply_button' }, 'Skipping');
-          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
-          skipped++;
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
           continue;
         }
 
@@ -846,13 +1132,11 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         const entryResult = await enterEasyApply(page, logger);
 
         if (entryResult === 'already_applied') {
-          recordAndNotify({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_linkedin', source });
-          skipped++;
+          recordOutcome({ status: 'already_applied', jobId, jobTitle, company, jobUrl, skipReason: 'already_applied_linkedin', source });
           continue;
         }
         if (entryResult === 'no_easy_apply') {
-          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
-          skipped++;
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
           continue;
         }
 
@@ -864,9 +1148,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         }).catch(() => '');
         if (hasLinkedInDailySubmissionLimitMessage(pageText) || hasLinkedInDailySubmissionLimitMessage(shadowText)) {
           logger.warn({ platform: 'linkedin', applied, jobId, jobTitle }, 'Daily submission limit — ending session');
-          recordAndNotify({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'daily_limit_reached', source });
-          skipped++;
-          return { applied, skipped, errors, stopSession: true, stopSessionReason: 'linkedin_daily_submission_limit' };
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'daily_limit_reached', source });
+          return { applied, skipped, errors, alreadyApplied, internalSkipped, stopSession: true, stopSessionReason: 'linkedin_daily_submission_limit' };
         }
 
         // ── Step 7: Process inline apply steps ──
@@ -920,8 +1203,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             }
 
             logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Application submitted');
-            recordAndNotify({ status: dryRun ? 'dry_run' : 'submitted', jobId, jobTitle, company, jobUrl, steps: stepCount, source });
-            applied++;
+            recordOutcome({ status: dryRun ? 'dry_run' : 'submitted', jobId, jobTitle, company, jobUrl, steps: stepCount, source });
 
             // Dismiss post-submit UI
             await sleep(1000, 2000);
@@ -969,10 +1251,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         await sleep(1000, 2000);
 
         logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
-        errors++;
         if (jobId) failedJobIds.add(jobId);
         await screenshotError(page, 'linkedin', jobId, config);
-        recordAndNotify({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
+        recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
       }
     }
 
@@ -987,7 +1268,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     }
   }
 
-  return { applied, skipped, errors };
+  return { applied, skipped, errors, alreadyApplied, internalSkipped };
 }
 
 module.exports = {
@@ -998,4 +1279,7 @@ module.exports = {
   shouldApply,
   hasLinkedInDailySubmissionLimitMessage,
   normalizeVisibleText,
+  analyzeSearchPageState,
+  pickCardStrategy,
+  isJobCardText,
 };

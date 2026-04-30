@@ -7,6 +7,9 @@ const {
   shouldApply,
   hasLinkedInDailySubmissionLimitMessage,
   normalizeVisibleText,
+  analyzeSearchPageState,
+  pickCardStrategy,
+  isJobCardText,
 } = require('../modules/linkedin');
 
 let passed = 0;
@@ -30,6 +33,14 @@ test('builds /jobs/search-results/ URL with keywords', () => {
   assert(url.includes('geoId=102095887'));
   assert(url.includes('f_AL=true'));
   assert(url.includes('f_TPR=r86400'));
+});
+
+test('uses configured LinkedIn date window when provided', () => {
+  const url = buildLinkedInSearchUrl({
+    search: { keywords: ['data scientist'] },
+    platforms: { linkedin: { f_TPR: 'r604800' } },
+  });
+  assert(url.includes('f_TPR=r604800'));
 });
 
 test('includes f_SAL when provided', () => {
@@ -158,6 +169,25 @@ test('requires title keyword match (single word boundary)', () => {
   assert(!shouldApply('HTML Developer', 'Co', config).apply);
 });
 
+test('allows configured state aliases in location filter', () => {
+  const config = { search: { locationFilter: ['California', 'New York', 'Massachusetts'], jobFilter: {} } };
+  assert(shouldApply('Data Scientist', 'Co', 'San Francisco, CA (Hybrid)', config).apply);
+  assert(shouldApply('Data Scientist', 'Co', 'New York, NY (On-site)', config).apply);
+  assert(shouldApply('Data Scientist', 'Co', 'Boston, MA (Remote)', config).apply);
+});
+
+test('blocks out-of-state locations when location filter is configured', () => {
+  const config = { search: { locationFilter: ['California', 'New York', 'Massachusetts'], jobFilter: {} } };
+  const r = shouldApply('Data Scientist', 'Co', 'Seattle, WA (On-site)', config);
+  assert(!r.apply);
+  assert(r.skipReason.startsWith('location_no_match:'));
+});
+
+test('does not block when card location is missing', () => {
+  const config = { search: { locationFilter: ['California'], jobFilter: {} } };
+  assert(shouldApply('Data Scientist', 'Co', '', config).apply);
+});
+
 // ── hasLinkedInDailySubmissionLimitMessage ──
 
 test('detects exact daily limit message', () => {
@@ -170,8 +200,14 @@ test('detects message with extra whitespace', () => {
   assert(hasLinkedInDailySubmissionLimitMessage(msg));
 });
 
+test('detects the current Easy Apply limit dialog copy', () => {
+  const msg = 'You reached today’s Easy Apply limit Great effort applying today. We limit Easy Apply submissions to help ensure each application gets the right attention. Save this job and continue applying tomorrow. Learn more Got it';
+  assert(hasLinkedInDailySubmissionLimitMessage(msg));
+});
+
 test('does not match partial text', () => {
   assert(!hasLinkedInDailySubmissionLimitMessage('We limit daily submissions'));
+  assert(!hasLinkedInDailySubmissionLimitMessage('Great effort applying today.'));
 });
 
 test('does not match empty text', () => {
@@ -188,6 +224,226 @@ test('normalizes whitespace', () => {
 test('handles null/undefined', () => {
   assert.strictEqual(normalizeVisibleText(null), '');
   assert.strictEqual(normalizeVisibleText(undefined), '');
+});
+
+// ── analyzeSearchPageState (diagnostic for empty card list) ──
+//
+// Symptom we're guarding against: cron runs from 2026-04-26 onward all log
+// `cardCount: 0` even though the same code applied 25–35 jobs on 2026-04-25.
+// We can't keep flying blind — the diagnostic must tell us *why* a page has
+// zero Easy Apply cards.
+
+test('analyzeSearchPageState returns ok when easy-apply cards are present', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/jobs/search-results/?keywords=data+scientist&f_AL=true',
+    title: 'Data Scientist Jobs | LinkedIn',
+    bodyText: '25 results. Easy Apply Stripe Data Scientist',
+    easyApplyCardCount: 25,
+    jobIdAttrCount: 25,
+    jobLinkCount: 25,
+    totalButtons: 60,
+  });
+  assert.strictEqual(r.kind, 'ok');
+});
+
+test('analyzeSearchPageState detects a login redirect', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/login?session_redirect=...',
+    title: 'Sign In | LinkedIn',
+    bodyText: 'Sign in or join now',
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 0,
+    jobLinkCount: 0,
+    totalButtons: 4,
+  });
+  assert.strictEqual(r.kind, 'login_required');
+});
+
+test('analyzeSearchPageState detects an authwall login wall on the search URL', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/jobs/search-results/?keywords=data+scientist',
+    title: 'LinkedIn',
+    bodyText: 'Sign in to see who has viewed your profile. Join now',
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 0,
+    jobLinkCount: 0,
+    totalButtons: 5,
+  });
+  assert.strictEqual(r.kind, 'login_required');
+});
+
+test('analyzeSearchPageState detects a bot/security challenge', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/checkpoint/challenge/...',
+    title: 'Security Verification | LinkedIn',
+    bodyText: "Let's do a quick security check",
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 0,
+    jobLinkCount: 0,
+    totalButtons: 3,
+  });
+  assert.strictEqual(r.kind, 'bot_challenge');
+});
+
+test('analyzeSearchPageState detects rate-limited page (daily cap message)', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/jobs/search-results/?keywords=data+scientist&f_AL=true',
+    title: 'Jobs | LinkedIn',
+    bodyText: 'You reached today’s Easy Apply limit Great effort applying today. We limit Easy Apply submissions to help ensure each application gets the right attention. Save this job and continue applying tomorrow. Learn more',
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 0,
+    jobLinkCount: 0,
+    totalButtons: 6,
+  });
+  assert.strictEqual(r.kind, 'rate_limited');
+});
+
+test('analyzeSearchPageState detects "no matching jobs" empty state', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/jobs/search-results/?keywords=quantum+widget+wizard&f_AL=true',
+    title: 'Jobs | LinkedIn',
+    bodyText: 'No matching jobs found. Try removing a filter or expanding your search.',
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 0,
+    jobLinkCount: 0,
+    totalButtons: 12,
+  });
+  assert.strictEqual(r.kind, 'no_results');
+});
+
+test('analyzeSearchPageState reports dom_changed when job links exist but Easy Apply selector is empty', () => {
+  // This is exactly the scenario we suspect from 2026-04-26+: cards render
+  // (job IDs and view links exist) but the role=button + "Easy Apply" text
+  // selector finds nothing. We need a clear signal so the next iteration
+  // knows the DOM moved.
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/jobs/search-results/?keywords=data+scientist&f_AL=true',
+    title: 'Jobs | LinkedIn',
+    bodyText: 'Stripe Data Scientist Easy Apply 1d ago',
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 25,
+    jobLinkCount: 25,
+    totalButtons: 70,
+  });
+  assert.strictEqual(r.kind, 'dom_changed');
+});
+
+test('analyzeSearchPageState reports unknown when nothing matches', () => {
+  const r = analyzeSearchPageState({
+    url: 'https://www.linkedin.com/jobs/search-results/?keywords=foo',
+    title: 'Jobs | LinkedIn',
+    bodyText: '',
+    easyApplyCardCount: 0,
+    jobIdAttrCount: 0,
+    jobLinkCount: 0,
+    totalButtons: 0,
+  });
+  assert.strictEqual(r.kind, 'unknown');
+});
+
+test('analyzeSearchPageState always returns a non-empty message string', () => {
+  const states = [
+    { kind: 'ok', s: { url: '', title: '', bodyText: '', easyApplyCardCount: 1, jobIdAttrCount: 0, jobLinkCount: 0, totalButtons: 1 } },
+    { kind: 'login_required', s: { url: 'https://www.linkedin.com/login', title: '', bodyText: '', easyApplyCardCount: 0, jobIdAttrCount: 0, jobLinkCount: 0, totalButtons: 0 } },
+    { kind: 'unknown', s: { url: '', title: '', bodyText: '', easyApplyCardCount: 0, jobIdAttrCount: 0, jobLinkCount: 0, totalButtons: 0 } },
+  ];
+  for (const { s } of states) {
+    const r = analyzeSearchPageState(s);
+    assert(typeof r.message === 'string' && r.message.length > 0, `kind=${r.kind} should have a message`);
+  }
+});
+
+// ── pickCardStrategy (multi-strategy fallback) ──
+//
+// The original selector — getByRole('button').filter({hasText:'Easy Apply'}) —
+// hasn't found a card since 2026-04-25. We need the agent to try alternatives
+// before giving up: data-job-id elements, then `/jobs/view/{N}/` anchors.
+
+test('pickCardStrategy prefers easy_apply_button when those cards exist', () => {
+  const s = pickCardStrategy({ easyApplyCardCount: 25, jobIdAttrCount: 25, jobLinkCount: 25 });
+  assert.strictEqual(s, 'easy_apply_button');
+});
+
+test('pickCardStrategy falls back to data_job_id when Easy Apply text is missing', () => {
+  const s = pickCardStrategy({ easyApplyCardCount: 0, jobIdAttrCount: 25, jobLinkCount: 25 });
+  assert.strictEqual(s, 'data_job_id');
+});
+
+test('pickCardStrategy falls back to job_link as a last resort', () => {
+  const s = pickCardStrategy({ easyApplyCardCount: 0, jobIdAttrCount: 0, jobLinkCount: 25 });
+  assert.strictEqual(s, 'job_link');
+});
+
+test('pickCardStrategy returns null when nothing card-like is present', () => {
+  const s = pickCardStrategy({ easyApplyCardCount: 0, jobIdAttrCount: 0, jobLinkCount: 0 });
+  assert.strictEqual(s, null);
+});
+
+test('pickCardStrategy treats missing counts as zero', () => {
+  const s = pickCardStrategy({});
+  assert.strictEqual(s, null);
+});
+
+// ── isJobCardText (discriminate cards from filter pills / nav buttons) ──
+//
+// Live diagnostic from 2026-04-30 dry-run captured the new card layout:
+// cards are <div role="button"> elements whose accessible text reads like
+//   "Data Scientist (Verified job) Data Scientist  H&R Block  Missouri,
+//    United States (Remote)  Be an early applicant  ·  Posted 22 hours ago
+//    ·   Apply"
+// Filter pills ("LinkedIn Apply", "Past 24 hours") and nav buttons ("Jobs",
+// "Messaging") are also role=button on the same page. We need a content
+// classifier that tells job cards apart from those.
+
+test('isJobCardText accepts a verified-job card', () => {
+  const text = `Data Scientist (Verified job)\nData Scientist\nH&R Block\nMissouri, United States (Remote)\nBe an early applicant\n · \nPosted 22 hours ago\n · \n Apply`;
+  assert.strictEqual(isJobCardText(text), true);
+});
+
+test('isJobCardText accepts a non-verified card with post-time + Apply', () => {
+  const text = `Machine Learning Engineer\nMachine Learning Engineer\nEmonics LLC\nHouston, TX (On-site)\n · Posted 3 days ago\n · \n Apply`;
+  assert.strictEqual(isJobCardText(text), true);
+});
+
+test('isJobCardText accepts a card with "Be an early applicant" + Apply', () => {
+  const text = `Senior Data Engineer\nStripe\nSan Francisco, CA (Hybrid)\nBe an early applicant\n · \n Apply`;
+  assert.strictEqual(isJobCardText(text), true);
+});
+
+test('isJobCardText rejects the LinkedIn Apply filter pill', () => {
+  // The filter pill at the top of the search page is also role=button and
+  // contains "Apply" — this is the false positive we have to exclude.
+  assert.strictEqual(isJobCardText('LinkedIn Apply'), false);
+});
+
+test('isJobCardText rejects nav buttons', () => {
+  assert.strictEqual(isJobCardText('Jobs'), false);
+  assert.strictEqual(isJobCardText('Messaging'), false);
+  assert.strictEqual(isJobCardText('Notifications'), false);
+});
+
+test('isJobCardText rejects bare "Apply" buttons', () => {
+  assert.strictEqual(isJobCardText('Apply'), false);
+  assert.strictEqual(isJobCardText(' Apply '), false);
+});
+
+test('isJobCardText rejects empty / null text', () => {
+  assert.strictEqual(isJobCardText(''), false);
+  assert.strictEqual(isJobCardText(null), false);
+  assert.strictEqual(isJobCardText(undefined), false);
+});
+
+test('isJobCardText rejects "Past 24 hours" filter button', () => {
+  assert.strictEqual(isJobCardText('Past 24 hours'), false);
+});
+
+test('isJobCardText rejects "How promoted jobs are ranked" tooltip trigger', () => {
+  assert.strictEqual(isJobCardText('How promoted jobs are ranked'), false);
+});
+
+test('isJobCardText accepts a card text with promoted source', () => {
+  const text = `Promoted by hirer\nData Analyst\nData Analyst\nMatricstek Inc.\nUnited States\nBe an early applicant\n · Apply`;
+  assert.strictEqual(isJobCardText(text), true);
 });
 
 // ── Summary ──
