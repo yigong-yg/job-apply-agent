@@ -10,6 +10,8 @@ const {
   analyzeSearchPageState,
   pickCardStrategy,
   isJobCardText,
+  APPLY_LINK_ARIA_LABELS,
+  buildApplyLinkSelector,
 } = require('../modules/linkedin');
 
 let passed = 0;
@@ -444,6 +446,47 @@ test('isJobCardText rejects "How promoted jobs are ranked" tooltip trigger', () 
 test('isJobCardText accepts a card text with promoted source', () => {
   const text = `Promoted by hirer\nData Analyst\nData Analyst\nMatricstek Inc.\nUnited States\nBe an early applicant\n · Apply`;
   assert.strictEqual(isJobCardText(text), true);
+});
+
+// ── Apply-link aria-label registry ──
+//
+// 2026-04-30 probe of the redesigned detail panel found:
+//   <a aria-label="LinkedIn Apply to this job"
+//      href=".../jobs/view/{N}/apply/?openSDUIApplyFlow=true&...">Apply</a>
+// The legacy aria-label "Easy Apply to this job" no longer exists. The DB
+// shows 34 cards skipped with reason `no_easy_apply_button` in the dry-run
+// — every one of them an actual Easy-Apply job whose link the old selector
+// missed. We register the new label, keep the old label as a fallback in
+// case LinkedIn is mid-rollout, and pin both via a test so a future selector
+// migration can't silently regress.
+
+test('APPLY_LINK_ARIA_LABELS contains the 2026-04-26 LinkedIn Apply variant', () => {
+  assert(Array.isArray(APPLY_LINK_ARIA_LABELS), 'APPLY_LINK_ARIA_LABELS must be an array');
+  assert(APPLY_LINK_ARIA_LABELS.includes('LinkedIn Apply to this job'),
+    `expected "LinkedIn Apply to this job" in APPLY_LINK_ARIA_LABELS, got ${JSON.stringify(APPLY_LINK_ARIA_LABELS)}`);
+});
+
+test('APPLY_LINK_ARIA_LABELS keeps the legacy "Easy Apply to this job" as fallback', () => {
+  assert(APPLY_LINK_ARIA_LABELS.includes('Easy Apply to this job'),
+    `expected "Easy Apply to this job" still listed for legacy compatibility`);
+});
+
+test('APPLY_LINK_ARIA_LABELS prioritizes the new label over the legacy one', () => {
+  // Lookup order matters — both for readability and so that any code which
+  // .find()s the first-matching record returns the live aria-label first.
+  const newIdx = APPLY_LINK_ARIA_LABELS.indexOf('LinkedIn Apply to this job');
+  const legacyIdx = APPLY_LINK_ARIA_LABELS.indexOf('Easy Apply to this job');
+  assert(newIdx >= 0 && legacyIdx >= 0);
+  assert(newIdx < legacyIdx, 'new label should be listed before legacy');
+});
+
+test('buildApplyLinkSelector emits a comma-separated CSS selector covering all aria-labels', () => {
+  const sel = buildApplyLinkSelector();
+  assert.strictEqual(typeof sel, 'string');
+  assert(sel.includes('a[aria-label="LinkedIn Apply to this job"]'));
+  assert(sel.includes('a[aria-label="Easy Apply to this job"]'));
+  // Should be a valid multi-selector
+  assert(sel.split(',').length >= 2);
 });
 
 // ── Summary ──

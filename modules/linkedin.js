@@ -29,6 +29,26 @@ const { queueAppNotification } = require('../lib/notify');
 
 const SELECTOR_TIMEOUT = 10000;
 
+// ── Apply-link aria-labels ──
+//
+// LinkedIn renamed the apply-link aria-label from "Easy Apply to this job"
+// to "LinkedIn Apply to this job" as part of the same redesign that broke
+// card discovery (probe captured 2026-04-30 — the new link is an
+// <a aria-label="LinkedIn Apply to this job"
+//    href=".../jobs/view/{N}/apply/?openSDUIApplyFlow=true&...">). The
+// legacy label stays in the registry for a few weeks in case LinkedIn is
+// mid-rollout — neither matches a filter pill, so listing both is safe.
+const APPLY_LINK_ARIA_LABELS = [
+  'LinkedIn Apply to this job',
+  'Easy Apply to this job',
+];
+
+function buildApplyLinkSelector() {
+  return APPLY_LINK_ARIA_LABELS
+    .map(label => `a[aria-label="${label}"]`)
+    .join(', ');
+}
+
 // ── Exact daily-limit messages (must remain exact known variants) ──
 const LINKEDIN_DAILY_SUBMISSION_LIMIT_MESSAGES = [
   'We limit daily submissions to maintain quality and prevent bots, helping each application get the right attention. Save this job and apply tomorrow.',
@@ -666,8 +686,11 @@ async function extractSelectedJobDetail(page) {
       }
     }
 
-    // Easy Apply link
-    const easyApplyLink = document.querySelector('a[aria-label="Easy Apply to this job"]');
+    // Apply link — try both the new "LinkedIn Apply to this job" aria-label
+    // (2026-04-26+) and the legacy "Easy Apply to this job" for safety.
+    const easyApplyLink = document.querySelector(
+      'a[aria-label="LinkedIn Apply to this job"], a[aria-label="Easy Apply to this job"]'
+    );
     const easyApplyHref = easyApplyLink ? easyApplyLink.href : null;
 
     // Extract job ID from Easy Apply href as fallback
@@ -731,9 +754,10 @@ async function extractSelectedJobDetail(page) {
  * Returns 'entered', 'already_applied', or 'no_easy_apply'.
  */
 async function enterEasyApply(page, logger) {
-  // Try the Easy Apply link (new UI: <a aria-label="Easy Apply to this job">)
-  // Use .first() — LinkedIn can render duplicate Easy Apply links for the same job
-  const easyApplyLink = page.locator('a[aria-label="Easy Apply to this job"]').first();
+  // Try the Apply link. Post-2026-04-26 the aria-label is "LinkedIn Apply
+  // to this job"; pre-2026-04-26 it was "Easy Apply to this job".
+  // Use .first() — LinkedIn can render duplicate links for the same job.
+  const easyApplyLink = page.locator(buildApplyLinkSelector()).first();
   if (await easyApplyLink.count() > 0) {
     await easyApplyLink.click({ force: true });
     await sleep(2000, 3000);
@@ -1282,4 +1306,6 @@ module.exports = {
   analyzeSearchPageState,
   pickCardStrategy,
   isJobCardText,
+  APPLY_LINK_ARIA_LABELS,
+  buildApplyLinkSelector,
 };
