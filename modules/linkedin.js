@@ -783,14 +783,35 @@ async function enterEasyApply(page, logger) {
 
 /**
  * Handle one step of the SDUI apply flow.
- * The form lives inside #interop-outlet → shadowRoot (shadow DOM).
- * The shared fillForm()/retryInvalidFields() path owns text/select semantics.
- * page.locator() is used for action buttons in the shadow DOM.
+ *
+ * The form lives inside #interop-outlet → shadowRoot. Standard CSS queries
+ * via page.$$() (which fillForm uses) cannot pierce shadow boundaries, so
+ * the shadow-DOM filler runs first to handle inputs/radios/checkboxes
+ * inside the shadow root. fillForm then sweeps anything on the top-level
+ * page (resume upload, non-shadow controls). page.locator() pierces shadow
+ * DOM for action-button clicks.
+ *
+ * Without the shadow pre-fill, every required field in the apply form is
+ * invisible to the filler — the Next button stays disabled, the same
+ * label fingerprint repeats, and `applyLinkedIn` throws
+ * "Apply flow cycled — unfilled required fields" (regression observed
+ * during the 2026-04-30 dry-run on kadence ML Researcher 4408212119).
  */
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
-  // ── Fill form fields inside shadow DOM ──
+  // ── Fill fields inside the apply form's shadow DOM ──
+  const shadowFill = await fillShadowForm(page, defaultAnswers, logger, jobId)
+    .catch(() => ({ filled: 0, unfilled: [] }));
+  if (shadowFill.filled > 0 || shadowFill.unfilled.length > 0) {
+    logger.debug({
+      jobId, stepNum,
+      shadowFilled: shadowFill.filled,
+      shadowUnfilledCount: shadowFill.unfilled.length,
+    }, 'Shadow form pre-fill');
+  }
+
+  // ── Top-level form (resume upload, non-shadow controls) ──
   try {
     await fillForm(page, defaultAnswers, config, logger, 'linkedin', jobId, options);
   } catch (_) {}
@@ -1004,8 +1025,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     else if (outcome.status === 'error') errors++;
   }
 
-  // ── Crash diagnostics (gitignored logs/) ──
+  // ── Crash diagnostics + recovery flag ──
+  // The redesigned /jobs/search-results/ SPA grows the renderer heap on each
+  // card click (no virtualization, accumulated React state). Without the
+  // preemptive reload below, dry-runs reproducibly crashed after 3-6 cards.
+  let pageCrashed = false;
   page.on('crash', () => {
+    pageCrashed = true;
     logger.error({ platform: 'linkedin' }, 'Page crashed');
   });
   page.context().on('close', () => {
@@ -1020,6 +1046,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   await sleep(3000, 5000);
 
   let currentPage = 1;
+  let cardsSinceReload = 0;
+  const RELOAD_EVERY_CARDS = config.behavior?.linkedinReloadEveryCards || 5;
 
   while (applied < maxApplications && currentPage <= maxPages) {
     // ── List result cards on current page (top-level page) ──
@@ -1066,6 +1094,39 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     }
 
     for (let i = 0; i < cards.length && applied < maxApplications; i++) {
+      // ── Preemptive renderer reload ──
+      // Reset the SPA's accumulated state before it crashes. We reload at
+      // the TOP of an iteration (no card in flight) so we never orphan an
+      // apply flow. The crash flag also kicks the loop into recovery if the
+      // renderer died mid-iteration.
+      if (pageCrashed || cardsSinceReload >= RELOAD_EVERY_CARDS) {
+        const reason = pageCrashed ? 'crash_recovery' : 'preemptive_reload';
+        logger.info({
+          platform: 'linkedin', page: currentPage,
+          cardsSinceReload, reason,
+        }, 'Reloading search page to reset renderer');
+        try {
+          const reloadUrl = currentPage > 1
+            ? `${searchUrl}&start=${(currentPage - 1) * 25}`
+            : searchUrl;
+          await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await sleep(3000, 5000);
+        } catch (e) {
+          logger.warn({ platform: 'linkedin', error: e.message }, 'Reload failed; ending platform run');
+          break;
+        }
+        pageCrashed = false;
+        cardsSinceReload = 0;
+        try {
+          cards = await listResultCards(page);
+        } catch (_) {
+          break;
+        }
+        if (cards.length === 0) break;
+        i = -1;
+        continue;
+      }
+
       const card = cards[i];
       let jobId = null;
       let jobTitle = null;
@@ -1120,6 +1181,25 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Prefer detail-level title/company if available
         if (detail.title) jobTitle = detail.title;
         if (detail.company) company = detail.company;
+
+        // ── Re-run job filter with canonical company name ──
+        // summarizeResultCard can mis-parse company on promoted/non-standard
+        // cards (the 14-day audit found 13/176 submitted jobs went to
+        // blocked staffing firms like BeaconFire — every one had a real
+        // company name only visible in the detail panel, never re-checked).
+        const recheck = shouldApply(jobTitle, company, summary.location, config);
+        if (!recheck.apply) {
+          logger.debug({
+            platform: 'linkedin', jobId, jobTitle, company,
+            reason: recheck.skipReason,
+          }, 'Filtered out on post-detail re-check');
+          recordOutcome({
+            status: 'skipped', jobId, jobTitle, company, jobUrl,
+            skipReason: `${recheck.skipReason}:post_detail`,
+            source,
+          });
+          continue;
+        }
 
         // Promoted jobs: tag source but do NOT skip — many are real jobs from real companies.
         // source is already set to 'promoted' above for tracking/analysis.
@@ -1207,6 +1287,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           }).catch(() => '');
 
           if (fingerprint && seenFingerprints.has(fingerprint)) {
+            // Surface the actual unfilled labels — pre-fix the throw gave us
+            // no signal about which fields the agent couldn't resolve.
+            const labels = fingerprint.split('||').filter(Boolean).slice(0, 12);
+            logger.warn({
+              jobId, jobTitle, company,
+              stepNum: stepCount,
+              unfilledLabels: labels,
+            }, 'Apply flow cycled — unfilled required fields (label diagnostic)');
             throw new Error('Apply flow cycled — unfilled required fields');
           }
           if (fingerprint) seenFingerprints.add(fingerprint);
@@ -1279,6 +1367,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         await screenshotError(page, 'linkedin', jobId, config);
         recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
       }
+
+      cardsSinceReload++;
     }
 
     // ── Pagination ──
