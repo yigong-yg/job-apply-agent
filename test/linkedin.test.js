@@ -147,6 +147,41 @@ test('blocks by company name (substring match)', () => {
   assert(r.skipReason.includes('blocked_company'));
 });
 
+test('blocks likely recruiting agencies by default when jobFilter is configured', () => {
+  const config = { search: { jobFilter: {} } };
+  assert(!shouldApply('Data Scientist', 'BeaconFire', config).apply);
+  assert(!shouldApply('Data Scientist', 'Proven Recruiting', config).apply);
+  assert(!shouldApply('ML Engineer', 'HirePower Staffing Solution', config).apply);
+  assert(!shouldApply('AI Engineer', 'Jobright.ai', config).apply);
+});
+
+test('does not block direct employers with agency filter enabled', () => {
+  const config = { search: { jobFilter: {} } };
+  assert(shouldApply('Data Scientist', 'TikTok USDS Joint Venture', config).apply);
+  assert(shouldApply('Machine Learning Engineer', 'Roku', config).apply);
+  assert(shouldApply('AI Engineer', 'Enigma', config).apply);
+  assert(shouldApply('Data Engineer', 'Mainspring Energy', config).apply);
+});
+
+test('can disable default recruiting agency block', () => {
+  const config = { search: { jobFilter: { blockLikelyRecruitingAgencies: false } } };
+  assert(shouldApply('Data Scientist', 'BeaconFire', config).apply);
+});
+
+test('blocks configured company keyword and pattern signals', () => {
+  const config = {
+    search: {
+      jobFilter: {
+        blockLikelyRecruitingAgencies: false,
+        blockCompanyKeywords: ['sourcing firm'],
+        blockCompanyPatterns: ['^Example Talent$'],
+      },
+    },
+  };
+  assert(!shouldApply('Data Scientist', 'Bright Sourcing Firm LLC', config).apply);
+  assert(!shouldApply('Data Scientist', 'Example Talent', config).apply);
+});
+
 test('blocks by title keyword (word boundary)', () => {
   const config = { search: { jobFilter: { blockTitleKeywords: ['intern'] } } };
   const r = shouldApply('Data Analyst Intern', 'Acme', config);
