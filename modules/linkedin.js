@@ -172,10 +172,107 @@ function matchesAllowedLocation(location, configuredLocation) {
   return lower.includes(candidate);
 }
 
+const DEFAULT_AGENCY_COMPANY_KEYWORDS = [
+  'recruiting',
+  'recruitment',
+  'staffing',
+  'executive search',
+  'search group',
+  'search firm',
+  'talent acquisition',
+  'talent solutions',
+  'staffing solution',
+  'workforce solutions',
+  'employment agency',
+  'placement agency',
+  'consulting services',
+  'technology consulting',
+  'it consulting',
+];
+
+const DEFAULT_AGENCY_COMPANY_PATTERNS = [
+  '\\bjobright\\.ai\\b',
+  '\\bharnham\\b',
+  '\\bproven recruiting\\b',
+  '\\bgreen key resources\\b',
+  '\\bbeaconfire\\b',
+  '\\binsight global\\b',
+  '\\bkforce\\b',
+  '\\brobert half\\b',
+  '\\bgoliath partners\\b',
+  '\\bacceler8 talent\\b',
+  '\\bsynergisticit\\b',
+  '\\bledgent technology\\b',
+  '\\bcompunnel\\b',
+  '\\bnet2source\\b',
+  '\\bakkodis\\b',
+  '\\bcybercoders\\b',
+  '\\bjobot\\b',
+  '\\baquent\\b',
+  '\\bbayone solutions\\b',
+  '\\bdewinter group\\b',
+  '\\bhireclout\\b',
+  '\\bworkgenius group\\b',
+];
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchesCompanyKeyword(companyLower, keyword) {
+  const normalized = String(keyword || '').trim().toLowerCase();
+  if (!normalized) return false;
+  const escaped = escapeRegExp(normalized).replace(/\s+/g, '\\s+');
+  return new RegExp(`\\b${escaped}\\b`, 'i').test(companyLower);
+}
+
+function matchesCompanyPattern(company, pattern) {
+  if (!pattern) return false;
+  try {
+    return new RegExp(pattern, 'i').test(company);
+  } catch (_) {
+    return false;
+  }
+}
+
+function matchAgencyCompanySignal(company, filter) {
+  if (!company) return null;
+
+  const companyLower = company.toLowerCase();
+  const configuredKeywords = Array.isArray(filter.blockCompanyKeywords) ? filter.blockCompanyKeywords : [];
+  const defaultKeywords = filter.blockLikelyRecruitingAgencies === false ? [] : DEFAULT_AGENCY_COMPANY_KEYWORDS;
+  const keywords = [...defaultKeywords, ...configuredKeywords];
+  for (const keyword of keywords) {
+    if (matchesCompanyKeyword(companyLower, keyword)) {
+      return { reason: `blocked_company_keyword:${keyword}` };
+    }
+  }
+
+  const configuredPatterns = Array.isArray(filter.blockCompanyPatterns) ? filter.blockCompanyPatterns : [];
+  const defaultPatterns = filter.blockLikelyRecruitingAgencies === false ? [] : DEFAULT_AGENCY_COMPANY_PATTERNS;
+  const patterns = [...defaultPatterns, ...configuredPatterns];
+  for (const pattern of patterns) {
+    if (matchesCompanyPattern(company, pattern)) {
+      return { reason: `blocked_company_pattern:${pattern}` };
+    }
+  }
+
+  return null;
+}
+
 function shouldApply(title, company, locationOrConfig, maybeConfig) {
   const location = maybeConfig ? locationOrConfig : null;
   const config = maybeConfig || locationOrConfig || {};
   const filter = config.search?.jobFilter;
+
+  const locationFilter = config.search?.locationFilter;
+  if (Array.isArray(locationFilter) && locationFilter.length > 0) {
+    const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
+    if (!matchedLocation) {
+      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
+    }
+  }
+
   if (!filter) return { apply: true };
 
   const titleLower = (title || '').toLowerCase();
@@ -189,20 +286,17 @@ function shouldApply(title, company, locationOrConfig, maybeConfig) {
     }
   }
 
+  const agencySignal = matchAgencyCompanySignal(company || '', filter);
+  if (agencySignal) {
+    return { apply: false, skipReason: agencySignal.reason };
+  }
+
   if (filter.blockTitleKeywords) {
     for (const kw of filter.blockTitleKeywords) {
       const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
       if (re.test(title || '')) {
         return { apply: false, skipReason: `blocked_title:${kw}` };
       }
-    }
-  }
-
-  const locationFilter = config.search?.locationFilter;
-  if (Array.isArray(locationFilter) && locationFilter.length > 0) {
-    const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
-    if (!matchedLocation) {
-      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
     }
   }
 
@@ -499,11 +593,19 @@ async function countResultCards(page) {
   // goToNextPage only to confirm "the next page rendered something". Avoid
   // calling listResultCards here so we don't run the full multi-strategy
   // iteration just to verify page navigation worked.
-  const easy = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).count().catch(() => 0);
-  if (easy > 0) return easy;
   const li = await page.locator('li[data-occludable-job-id]').count().catch(() => 0);
   if (li > 0) return li;
-  return page.getByRole('button').filter({ hasText: 'Apply' }).count().catch(() => 0);
+  const dataId = await page.locator('[data-job-id]').count().catch(() => 0);
+  if (dataId > 0) return dataId;
+
+  return page.getByRole('button').evaluateAll((els) => {
+    return els.filter((el) => {
+      const text = (el.textContent || '').trim();
+      if (text.length < 30) return false;
+      if (!/\bApply\b/i.test(text)) return false;
+      return /\(Verified job\)|Be an early applicant|\bago\b|Promoted by hirer/i.test(text);
+    }).length;
+  }).catch(() => 0);
 }
 
 /**
@@ -777,6 +879,44 @@ async function enterEasyApply(page, logger) {
   return 'no_easy_apply';
 }
 
+async function collectApplyValidationErrors(page) {
+  return page.evaluate(() => {
+    const interop = document.querySelector('#interop-outlet');
+    if (!interop || !interop.shadowRoot) return [];
+    const sr = interop.shadowRoot;
+    const errors = [];
+
+    function add(text) {
+      const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+      if (normalized && normalized.length > 3 && normalized.length < 220) {
+        errors.push(normalized.substring(0, 160));
+      }
+    }
+
+    for (const el of sr.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
+      add(el.textContent || '');
+    }
+
+    const asciiText = (sr.textContent || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    const validationSignals = [
+      'please enter a valid answer',
+      'please make a selection',
+      'enter a decimal number',
+      'enter a number',
+      'veuillez saisir une reponse valable',
+      'effectuez une selection',
+    ];
+    for (const signal of validationSignals) {
+      if (asciiText.includes(signal)) add(signal);
+    }
+
+    return [...new Set(errors)];
+  }).catch(() => []);
+}
+
 // ══════════════════════════════════════════════════════════
 //  Inline Apply Step Handler
 // ══════════════════════════════════════════════════════════
@@ -873,20 +1013,7 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   await sleep(1000, 1500);
 
   // Check for validation errors inside shadow DOM
-  const postClickErrors = await page.evaluate(() => {
-    const interop = document.querySelector('#interop-outlet');
-    if (!interop || !interop.shadowRoot) return [];
-    const sr = interop.shadowRoot;
-    const errs = [];
-    for (const el of sr.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
-      const t = (el.textContent || '').trim();
-      if (t && t.length > 3 && !t.includes('Required')) errs.push(t.substring(0, 100));
-    }
-    // Also check for "Please enter a valid answer" pattern
-    const allText = sr.textContent || '';
-    if (allText.includes('Please enter a valid answer')) errs.push('Please enter a valid answer');
-    return errs;
-  }).catch(() => []);
+  const postClickErrors = await collectApplyValidationErrors(page);
 
   if (postClickErrors.length > 0) {
     // ── Structured diagnostics for validation failures ──
@@ -935,12 +1062,11 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       await sleep(300, 600);
       await btn.evaluate(e => e.click());
       await sleep(1000, 1500);
-      const stillErrors = await page.evaluate(() => {
-        const interop = document.querySelector('#interop-outlet');
-        if (!interop || !interop.shadowRoot) return false;
-        return interop.shadowRoot.textContent.includes('Please enter a valid answer');
-      }).catch(() => false);
-      if (stillErrors) return 'retry_failed';
+      const stillErrors = await collectApplyValidationErrors(page);
+      if (stillErrors.length > 0) {
+        logger.warn({ platform: 'linkedin', jobId, stepNum, errors: stillErrors }, 'Validation still failing after retry');
+        return 'retry_failed';
+      }
       return 'next';
     }
     return 'retry_failed';
@@ -1047,6 +1173,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
   let currentPage = 1;
   let cardsSinceReload = 0;
+  let abortPlatformRun = false;
   const RELOAD_EVERY_CARDS = config.behavior?.linkedinReloadEveryCards || 5;
 
   while (applied < maxApplications && currentPage <= maxPages) {
@@ -1113,16 +1240,23 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           await sleep(3000, 5000);
         } catch (e) {
           logger.warn({ platform: 'linkedin', error: e.message }, 'Reload failed; ending platform run');
+          abortPlatformRun = true;
           break;
         }
         pageCrashed = false;
         cardsSinceReload = 0;
         try {
           cards = await listResultCards(page);
-        } catch (_) {
+        } catch (e) {
+          logger.warn({ platform: 'linkedin', error: e.message }, 'Could not re-list result cards after reload; ending platform run');
+          abortPlatformRun = true;
           break;
         }
-        if (cards.length === 0) break;
+        if (cards.length === 0) {
+          logger.warn({ platform: 'linkedin', page: currentPage }, 'Reload returned no result cards; ending platform run');
+          abortPlatformRun = true;
+          break;
+        }
         i = -1;
         continue;
       }
@@ -1165,6 +1299,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         // ── Step 3: Click card to load detail ──
         await selectCard(card);
+        cardsSinceReload++;
 
         // ── Step 4: Extract detail (jobId, promoted, easyApply) ──
         const detail = await extractSelectedJobDetail(page);
@@ -1368,8 +1503,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
       }
 
-      cardsSinceReload++;
     }
+
+    if (abortPlatformRun) break;
 
     // ── Pagination ──
     if (applied < maxApplications && currentPage < maxPages) {

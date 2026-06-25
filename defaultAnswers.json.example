@@ -50,6 +50,9 @@
     "portfolio": "[PORTFOLIO_URL]",
     "portfolio url": "[PORTFOLIO_URL]",
     "website": "[PORTFOLIO_URL]",
+    "preferred name": "[PREFERRED_NAME]",
+    "current employer": "[CURRENT_EMPLOYER_OR_NA]",
+    "most recent employer": "[CURRENT_EMPLOYER_OR_NA]",
     "cover letter": "",
     "additional information": "",
     "anything else": "",
@@ -72,6 +75,8 @@
     "city": "[CITY]",
     "location city": "[CITY]",
     "degree": "[DEGREE_NAME]",
+    "graduation year": "[GRADUATION_YEAR]",
+    "percentage": "[DEFAULT_PERCENTAGE_ANSWER]",
     "discipline": "[FIELD_OF_STUDY]",
     "gpa": "[GPA]",
     "pronouns other": ""
