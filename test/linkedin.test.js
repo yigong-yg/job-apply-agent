@@ -220,6 +220,15 @@ test('blocks out-of-state locations when location filter is configured', () => {
   assert(r.skipReason.startsWith('location_no_match:'));
 });
 
+test('applies location filter even without jobFilter configured', () => {
+  const config = { search: { locationFilter: ['California'] } };
+  assert(shouldApply('Data Scientist', 'Co', 'San Francisco, CA (Hybrid)', config).apply);
+
+  const r = shouldApply('Data Scientist', 'Co', 'Seattle, WA (On-site)', config);
+  assert(!r.apply);
+  assert(r.skipReason.startsWith('location_no_match:'));
+});
+
 test('does not block when card location is missing', () => {
   const config = { search: { locationFilter: ['California'], jobFilter: {} } };
   assert(shouldApply('Data Scientist', 'Co', '', config).apply);

@@ -264,6 +264,15 @@ function shouldApply(title, company, locationOrConfig, maybeConfig) {
   const location = maybeConfig ? locationOrConfig : null;
   const config = maybeConfig || locationOrConfig || {};
   const filter = config.search?.jobFilter;
+
+  const locationFilter = config.search?.locationFilter;
+  if (Array.isArray(locationFilter) && locationFilter.length > 0) {
+    const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
+    if (!matchedLocation) {
+      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
+    }
+  }
+
   if (!filter) return { apply: true };
 
   const titleLower = (title || '').toLowerCase();
@@ -288,14 +297,6 @@ function shouldApply(title, company, locationOrConfig, maybeConfig) {
       if (re.test(title || '')) {
         return { apply: false, skipReason: `blocked_title:${kw}` };
       }
-    }
-  }
-
-  const locationFilter = config.search?.locationFilter;
-  if (Array.isArray(locationFilter) && locationFilter.length > 0) {
-    const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
-    if (!matchedLocation) {
-      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
     }
   }
 
@@ -592,11 +593,19 @@ async function countResultCards(page) {
   // goToNextPage only to confirm "the next page rendered something". Avoid
   // calling listResultCards here so we don't run the full multi-strategy
   // iteration just to verify page navigation worked.
-  const easy = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).count().catch(() => 0);
-  if (easy > 0) return easy;
   const li = await page.locator('li[data-occludable-job-id]').count().catch(() => 0);
   if (li > 0) return li;
-  return page.getByRole('button').filter({ hasText: 'Apply' }).count().catch(() => 0);
+  const dataId = await page.locator('[data-job-id]').count().catch(() => 0);
+  if (dataId > 0) return dataId;
+
+  return page.getByRole('button').evaluateAll((els) => {
+    return els.filter((el) => {
+      const text = (el.textContent || '').trim();
+      if (text.length < 30) return false;
+      if (!/\bApply\b/i.test(text)) return false;
+      return /\(Verified job\)|Be an early applicant|\bago\b|Promoted by hirer/i.test(text);
+    }).length;
+  }).catch(() => 0);
 }
 
 /**
@@ -914,14 +923,35 @@ async function collectApplyValidationErrors(page) {
 
 /**
  * Handle one step of the SDUI apply flow.
- * The form lives inside #interop-outlet → shadowRoot (shadow DOM).
- * The shared fillForm()/retryInvalidFields() path owns text/select semantics.
- * page.locator() is used for action buttons in the shadow DOM.
+ *
+ * The form lives inside #interop-outlet → shadowRoot. Standard CSS queries
+ * via page.$$() (which fillForm uses) cannot pierce shadow boundaries, so
+ * the shadow-DOM filler runs first to handle inputs/radios/checkboxes
+ * inside the shadow root. fillForm then sweeps anything on the top-level
+ * page (resume upload, non-shadow controls). page.locator() pierces shadow
+ * DOM for action-button clicks.
+ *
+ * Without the shadow pre-fill, every required field in the apply form is
+ * invisible to the filler — the Next button stays disabled, the same
+ * label fingerprint repeats, and `applyLinkedIn` throws
+ * "Apply flow cycled — unfilled required fields" (regression observed
+ * during the 2026-04-30 dry-run on kadence ML Researcher 4408212119).
  */
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
-  // ── Fill form fields inside shadow DOM ──
+  // ── Fill fields inside the apply form's shadow DOM ──
+  const shadowFill = await fillShadowForm(page, defaultAnswers, logger, jobId)
+    .catch(() => ({ filled: 0, unfilled: [] }));
+  if (shadowFill.filled > 0 || shadowFill.unfilled.length > 0) {
+    logger.debug({
+      jobId, stepNum,
+      shadowFilled: shadowFill.filled,
+      shadowUnfilledCount: shadowFill.unfilled.length,
+    }, 'Shadow form pre-fill');
+  }
+
+  // ── Top-level form (resume upload, non-shadow controls) ──
   try {
     await fillForm(page, defaultAnswers, config, logger, 'linkedin', jobId, options);
   } catch (_) {}
@@ -1121,8 +1151,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     else if (outcome.status === 'error') errors++;
   }
 
-  // ── Crash diagnostics (gitignored logs/) ──
+  // ── Crash diagnostics + recovery flag ──
+  // The redesigned /jobs/search-results/ SPA grows the renderer heap on each
+  // card click (no virtualization, accumulated React state). Without the
+  // preemptive reload below, dry-runs reproducibly crashed after 3-6 cards.
+  let pageCrashed = false;
   page.on('crash', () => {
+    pageCrashed = true;
     logger.error({ platform: 'linkedin' }, 'Page crashed');
   });
   page.context().on('close', () => {
@@ -1137,6 +1172,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   await sleep(3000, 5000);
 
   let currentPage = 1;
+  let cardsSinceReload = 0;
+  let abortPlatformRun = false;
+  const RELOAD_EVERY_CARDS = config.behavior?.linkedinReloadEveryCards || 5;
 
   while (applied < maxApplications && currentPage <= maxPages) {
     // ── List result cards on current page (top-level page) ──
@@ -1183,6 +1221,46 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     }
 
     for (let i = 0; i < cards.length && applied < maxApplications; i++) {
+      // ── Preemptive renderer reload ──
+      // Reset the SPA's accumulated state before it crashes. We reload at
+      // the TOP of an iteration (no card in flight) so we never orphan an
+      // apply flow. The crash flag also kicks the loop into recovery if the
+      // renderer died mid-iteration.
+      if (pageCrashed || cardsSinceReload >= RELOAD_EVERY_CARDS) {
+        const reason = pageCrashed ? 'crash_recovery' : 'preemptive_reload';
+        logger.info({
+          platform: 'linkedin', page: currentPage,
+          cardsSinceReload, reason,
+        }, 'Reloading search page to reset renderer');
+        try {
+          const reloadUrl = currentPage > 1
+            ? `${searchUrl}&start=${(currentPage - 1) * 25}`
+            : searchUrl;
+          await page.goto(reloadUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await sleep(3000, 5000);
+        } catch (e) {
+          logger.warn({ platform: 'linkedin', error: e.message }, 'Reload failed; ending platform run');
+          abortPlatformRun = true;
+          break;
+        }
+        pageCrashed = false;
+        cardsSinceReload = 0;
+        try {
+          cards = await listResultCards(page);
+        } catch (e) {
+          logger.warn({ platform: 'linkedin', error: e.message }, 'Could not re-list result cards after reload; ending platform run');
+          abortPlatformRun = true;
+          break;
+        }
+        if (cards.length === 0) {
+          logger.warn({ platform: 'linkedin', page: currentPage }, 'Reload returned no result cards; ending platform run');
+          abortPlatformRun = true;
+          break;
+        }
+        i = -1;
+        continue;
+      }
+
       const card = cards[i];
       let jobId = null;
       let jobTitle = null;
@@ -1221,6 +1299,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         // ── Step 3: Click card to load detail ──
         await selectCard(card);
+        cardsSinceReload++;
 
         // ── Step 4: Extract detail (jobId, promoted, easyApply) ──
         const detail = await extractSelectedJobDetail(page);
@@ -1237,6 +1316,25 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Prefer detail-level title/company if available
         if (detail.title) jobTitle = detail.title;
         if (detail.company) company = detail.company;
+
+        // ── Re-run job filter with canonical company name ──
+        // summarizeResultCard can mis-parse company on promoted/non-standard
+        // cards (the 14-day audit found 13/176 submitted jobs went to
+        // blocked staffing firms like BeaconFire — every one had a real
+        // company name only visible in the detail panel, never re-checked).
+        const recheck = shouldApply(jobTitle, company, summary.location, config);
+        if (!recheck.apply) {
+          logger.debug({
+            platform: 'linkedin', jobId, jobTitle, company,
+            reason: recheck.skipReason,
+          }, 'Filtered out on post-detail re-check');
+          recordOutcome({
+            status: 'skipped', jobId, jobTitle, company, jobUrl,
+            skipReason: `${recheck.skipReason}:post_detail`,
+            source,
+          });
+          continue;
+        }
 
         // Promoted jobs: tag source but do NOT skip — many are real jobs from real companies.
         // source is already set to 'promoted' above for tracking/analysis.
@@ -1324,6 +1422,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           }).catch(() => '');
 
           if (fingerprint && seenFingerprints.has(fingerprint)) {
+            // Surface the actual unfilled labels — pre-fix the throw gave us
+            // no signal about which fields the agent couldn't resolve.
+            const labels = fingerprint.split('||').filter(Boolean).slice(0, 12);
+            logger.warn({
+              jobId, jobTitle, company,
+              stepNum: stepCount,
+              unfilledLabels: labels,
+            }, 'Apply flow cycled — unfilled required fields (label diagnostic)');
             throw new Error('Apply flow cycled — unfilled required fields');
           }
           if (fingerprint) seenFingerprints.add(fingerprint);
@@ -1396,7 +1502,10 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         await screenshotError(page, 'linkedin', jobId, config);
         recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
       }
+
     }
+
+    if (abortPlatformRun) break;
 
     // ── Pagination ──
     if (applied < maxApplications && currentPage < maxPages) {
