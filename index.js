@@ -177,6 +177,7 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
   ];
 
   let totalApplied = 0;
+  let totalAlreadyApplied = 0;
   let totalSkipped = 0;
   let totalErrors = 0;
   const sessionStatus = [];
@@ -187,15 +188,16 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
       sessionStatus.push(`${platform} ✗ (expired)`);
       continue;
     }
-    const platformStats = dbStats[platform] || { applied: 0, skipped: 0, errors: 0, dry_run: 0 };
-    const { applied = 0, skipped = 0, errors = 0, dry_run = 0 } = platformStats;
+    const platformStats = dbStats[platform] || { applied: 0, skipped: 0, errors: 0, dry_run: 0, already_applied: 0 };
+    const { applied = 0, skipped = 0, errors = 0, dry_run = 0, already_applied = 0 } = platformStats;
     totalApplied += applied + dry_run;
+    totalAlreadyApplied += already_applied;
     totalSkipped += skipped;
     totalErrors += errors;
 
     const statusLine = dry_run > 0
-      ? `  ${platform.padEnd(10)}: ${dry_run} dry_run | ${skipped} skipped | ${errors} errors`
-      : `  ${platform.padEnd(10)}: ${applied} applied | ${skipped} skipped | ${errors} errors`;
+      ? `  ${platform.padEnd(10)}: ${dry_run} dry_run | ${already_applied} already_applied | ${skipped} skipped | ${errors} errors`
+      : `  ${platform.padEnd(10)}: ${applied} applied | ${already_applied} already_applied | ${skipped} skipped | ${errors} errors`;
     lines.push(statusLine);
     sessionStatus.push(`${platform} ✓`);
   }
@@ -214,8 +216,9 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
     else if (source === 'config') sourceCategories.defaultAnswers += count; // file uploads etc.
   }
 
+  const totalScanned = totalApplied + totalAlreadyApplied + totalSkipped + totalErrors;
   lines.push('─'.repeat(55));
-  lines.push(`  TOTAL:      ${totalApplied} applied | ${totalSkipped} skipped | ${totalErrors} errors`);
+  lines.push(`  TOTAL:      ${totalApplied} applied | ${totalAlreadyApplied} already_applied | ${totalSkipped} skipped | ${totalErrors} errors`);
   lines.push(`  Sessions:  ${sessionStatus.join(' | ')}`);
   lines.push(`  Fill Sources: ${sourceCategories.defaultAnswers} defaultAnswers | ${sourceCategories.rule} rule | ${sourceCategories.llm} llm | ${sourceCategories.safe_default} safe_default | ${sourceCategories.cannot_fill} cannot_fill`);
   lines.push(`  Unmatched Fields: ${unmatchedCount} new (see unfilled_fields table)`);
@@ -223,9 +226,9 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
 
   const report = lines.join('\n');
   console.log('\n' + report + '\n');
-  logger.info({ runId, totalApplied, totalSkipped, totalErrors }, 'Run complete');
+  logger.info({ runId, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned }, 'Run complete');
 
-  return { report, totalApplied, totalSkipped, totalErrors, durationMin: duration, sessions: sessionStatus };
+  return { report, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin: duration, sessions: sessionStatus };
 }
 
 /**
@@ -395,19 +398,19 @@ async function main() {
   }
 
   state.completeRun(runId, aggregatedStats);
-  const { report, totalApplied, totalSkipped, totalErrors, durationMin, sessions } =
+  const { report, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin, sessions } =
     await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
 
   // Flush any remaining per-app notifications
   await flushAppNotifications(logger);
 
   // Send session summary to Discord
-  const scanned = Object.values(runStats).filter(Boolean).reduce((s, p) => s + (p.applied || 0) + (p.skipped || 0) + (p.errors || 0), 0);
   await sendSessionSummary({
     sessionId,
     durationMin,
-    scanned,
+    scanned: totalScanned,
     applied: totalApplied,
+    alreadyApplied: totalAlreadyApplied,
     skipped: totalSkipped,
     failed: totalErrors,
     dsCalls: state.getLlmCallCount(runId),
@@ -423,7 +426,7 @@ async function main() {
     dryRun: runtime.dryRun,
     sessionId,
     applied: totalApplied,
-    scanned,
+    scanned: totalScanned,
   }, logger);
 
   process.exit(0);
