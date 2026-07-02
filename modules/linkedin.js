@@ -151,6 +151,14 @@ function analyzeSearchPageState(state) {
 
 // ── Job filter (pure, no network) ──
 
+// Remote-flavored location strings ("United States (Remote)", "Remote - US",
+// "Anywhere in the United States") never contain an allowlisted state, so
+// they must match semantically, not by state alias (spec R2).
+function isRemoteLocation(location) {
+  const text = String(location || '');
+  return /\bremote\b/i.test(text) || /\banywhere in the (united states|u\.?s\.?a?)\b/i.test(text);
+}
+
 function matchesAllowedLocation(location, configuredLocation) {
   const text = String(location || '').trim();
   if (!text) return true; // Missing card location should not become a false negative.
@@ -200,9 +208,12 @@ function shouldApply(title, company, locationOrConfig, maybeConfig) {
 
   const locationFilter = config.search?.locationFilter;
   if (Array.isArray(locationFilter) && locationFilter.length > 0) {
+    const includeRemote = config.search?.includeRemote === true || config.search?.remoteOnly === true;
+    const remote = isRemoteLocation(location);
     const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
-    if (!matchedLocation) {
-      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
+    if (!matchedLocation && !(remote && includeRemote)) {
+      const reason = remote ? 'location_no_match_remote_disabled' : 'location_no_match_region';
+      return { apply: false, skipReason: `${reason}:${location || 'unknown'}` };
     }
   }
 
@@ -1411,6 +1422,7 @@ module.exports = {
   buildLinkedInSearchUrl,
   summarizeResultCard,
   shouldApply,
+  isRemoteLocation,
   hasLinkedInDailySubmissionLimitMessage,
   normalizeVisibleText,
   analyzeSearchPageState,
