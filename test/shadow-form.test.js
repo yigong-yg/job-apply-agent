@@ -22,7 +22,7 @@ const noopLogger = { debug() {}, info() {}, warn() {}, error() {} };
 const config = {
   user: {
     firstName: 'Sam',
-    city: 'Salt Lake City',
+    city: 'Springfield',
     workAuthorization: 'US Citizen',
     requiresSponsorship: false,
     veteranStatus: 'I am not a protected veteran',
@@ -32,7 +32,7 @@ const config = {
 const defaultAnswers = {
   'are you willing to relocate': 'Yes',
   'website': '[PORTFOLIO_URL]',
-  'city': 'Salt Lake City',
+  'city': 'Springfield',
 };
 
 function radioGroup(idPrefix, legend) {
@@ -158,7 +158,7 @@ const SHADOW_HTML = `
   });
 
   check('city text input fills from defaultAnswers', () => {
-    assert.strictEqual(domState.city, 'Salt Lake City');
+    assert.strictEqual(domState.city, 'Springfield');
   });
 
   // ── Output validation ──

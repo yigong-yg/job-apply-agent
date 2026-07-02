@@ -20,8 +20,8 @@ function test(name, fn) {
 const config = {
   user: {
     firstName: 'Sam',
-    city: 'Salt Lake City',
-    state: 'UT',
+    city: 'Springfield',
+    state: 'IL',
     zipCode: '12345',
     desiredSalary: '120000',
     startDate: 'Immediately',

@@ -132,15 +132,15 @@ test('rejects null answer', () => {
 });
 
 test('accepts a normal answer', () => {
-  const r = validateAnswer('Salt Lake City', { label: 'City' });
+  const r = validateAnswer('Springfield', { label: 'City' });
   assert.strictEqual(r.ok, true);
-  assert.strictEqual(r.answer, 'Salt Lake City');
+  assert.strictEqual(r.answer, 'Springfield');
 });
 
 test('trims surrounding whitespace on accept', () => {
-  const r = validateAnswer('  Salt Lake City  ', { label: 'City' });
+  const r = validateAnswer('  Springfield  ', { label: 'City' });
   assert.strictEqual(r.ok, true);
-  assert.strictEqual(r.answer, 'Salt Lake City');
+  assert.strictEqual(r.answer, 'Springfield');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

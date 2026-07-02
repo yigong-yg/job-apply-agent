@@ -21,8 +21,8 @@ Mandatory context for any agent working on this project. Full PRD archived at `.
 ## Environment
 
 - **Runtime:** Node.js 22.18.0 on Windows 11
-- **Python** (for native module compilation only): `C:\Users\gongy\anaconda3\python.exe` (3.11.7)
-- **npm install requires:** `PYTHON="/c/Users/gongy/anaconda3/python.exe" npm install`
+- **Python** (for native module compilation only): `%USERPROFILE%\anaconda3\python.exe` (3.11.7)
+- **npm install requires:** `PYTHON="$HOME/anaconda3/python.exe" npm install`
 - **Playwright Chromium:** `%LOCALAPPDATA%\ms-playwright\`
 - **Browser profiles:** `browser-data/<platform>/` (persistent login sessions, gitignored)
 
