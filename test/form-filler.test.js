@@ -47,29 +47,44 @@ test('preferred name does not trigger hear_about rule', () => {
   assert.strictEqual(result.answer, 'Sam');
 });
 
-test('graduation year gets a numeric answer', () => {
-  const currentYear = new Date().getUTCFullYear();
+test('graduation year is NOT invented by the rule tier (guard owns it)', () => {
+  // v2 spec R8: exact graduation year answers only from config.user.graduationYear
+  // via the answer-policy guard. Deriving it from years-of-experience produced
+  // three different graduation years across submitted applications.
   const result = inferByRules(
     normalizeLabel('Please provide your graduation Year for your highest completed degree.'),
     'Please provide your graduation Year for your highest completed degree.',
     'text',
     config
   );
-  assert(result);
-  assert.strictEqual(result.rule, 'rule:graduation_year');
-  assert.strictEqual(result.answer, String(currentYear - 3));
+  assert.strictEqual(result, null);
 });
 
-test('percentage questions get a decimal-safe numeric answer', () => {
+test('percentage questions are NOT answered with an invented number', () => {
+  // v2 spec R10: arbitrary numbers are a fabrication class, not a safe default.
   const result = inferByRules(
     normalizeLabel('What percentage of your development time is spent in AI tools?'),
     'What percentage of your development time is spent in AI tools?',
     'text',
     config
   );
+  assert.strictEqual(result, null);
+});
+
+test('commute question answers Yes via rule (stable preference)', () => {
+  // Highest-volume required radio ("Are you comfortable commuting to this
+  // job's location?"). The user's own defaultAnswers attest Yes to commute
+  // questions; the rule generalizes the phrasing so the radio never falls
+  // through to an unfilled required field.
+  const result = inferByRules(
+    normalizeLabel("Are you comfortable commuting to this job's location?"),
+    "Are you comfortable commuting to this job's location?",
+    'radio',
+    config
+  );
   assert(result);
-  assert.strictEqual(result.rule, 'rule:percentage_numeric');
-  assert.strictEqual(result.answer, '50.0');
+  assert.strictEqual(result.rule, 'rule:commute');
+  assert.strictEqual(result.answer, 'Yes');
 });
 
 test('hear about rule still matches an actual referral question', () => {
