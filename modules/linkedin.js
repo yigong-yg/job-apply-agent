@@ -389,13 +389,33 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
       }
     }
 
-    // ── Handle standalone checkboxes (agree/certify/confirm) ──
+    // ── Handle standalone checkboxes ──
+    // agree/certify/confirm/acknowledge: standard required checkboxes — check them.
+    // top-choice/mark-job: LinkedIn's optional Boost-style checkbox introduced
+    // 2026-05 — the form refuses to advance until it's been interacted with
+    // even when "leave it unchecked" is a valid answer. We toggle on then off
+    // so the user is NOT committed to boost while LinkedIn still sees the
+    // interaction. Without this, Easy Apply cycles infinitely at the step
+    // before Submit on the ~75% of jobs that now surface the boost prompt.
     for (const cb of sr.querySelectorAll('input[type="checkbox"]')) {
       if (cb.checked) continue;
       const labelText = getLabelText(cb) || '';
       const labelLower = labelText.toLowerCase();
       if (labelLower.includes('agree') || labelLower.includes('certify') ||
           labelLower.includes('confirm') || labelLower.includes('acknowledge')) {
+        cb.checked = true;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+        filled++;
+      } else if (labelLower.includes('top choice') ||
+                 (labelLower.includes('mark') && labelLower.includes('job'))) {
+        // LinkedIn's 2026-05 "Mark job as a top choice" boost checkbox
+        // refuses to advance the form when left unchecked. Toggling
+        // on-then-off was insufficient — LinkedIn's validation requires the
+        // checked state to persist. We check it. For non-Premium accounts
+        // this is a no-op UI flag; for Premium accounts it consumes a Top
+        // Choice credit per submission (~5/month). Trade-off: applications
+        // submit vs. infinite cycle on every job exposing this prompt.
+        cb.click();
         cb.checked = true;
         cb.dispatchEvent(new Event('change', { bubbles: true }));
         filled++;
