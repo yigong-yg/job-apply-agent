@@ -98,12 +98,27 @@ node index.js
 
 ### Windows Task Scheduler
 
+Use the native PowerShell launcher:
+
 1. Open Task Scheduler (`taskschd.msc`)
 2. Create task `Job Apply Agent`
-3. Trigger: weekdays at desired time
-4. Action: start program `C:\path\to\job-apply-agent\run_apply.bat`
-5. Enable "Run whether user is logged on or not"
-6. Enable "Run with highest privileges"
+3. Trigger: daily at the desired local time
+4. Optional second trigger: `At log on` for catch-up if the machine was off at the scheduled time
+5. Action: start program `powershell.exe`
+6. Arguments:
+
+   ```text
+   -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\job-apply-agent\run_apply.ps1"
+   ```
+
+7. Settings:
+   - Enable `Wake the computer to run this task`
+   - Enable `Run task as soon as possible after a scheduled start is missed`
+   - Set `If the task fails, restart every 15 minutes` (up to 3 times)
+   - Set `If the task is already running, do not start a new instance`
+8. Use `Run only when user is logged on` if you are relying on the proven headful browser profile flow
+
+`run_apply.ps1` stores launcher state and timestamps in UTC, while still enforcing the business rule in America/Denver so 6 PM Denver stays correct across DST changes.
 
 ### Linux/macOS Cron
 
