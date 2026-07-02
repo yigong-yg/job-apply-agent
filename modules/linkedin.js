@@ -1424,6 +1424,24 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           continue;
         }
 
+        // ── Step 5b: repost cooldown (spec R5) ──
+        // Repost farms mint new jobIds for the same listing daily — 22.8% of
+        // all historical submissions were normalized company+title repeats
+        // (ATC "Data Analyst" x71). jobId dedup cannot catch them.
+        const cooldownDays = config.search?.jobFilter?.repostCooldownDays ?? 30;
+        const companyCap = config.search?.jobFilter?.companyMonthlyCap ?? 5;
+        if (state.hasRecentCompanyTitleApplication({ platform: 'linkedin', company, jobTitle, days: cooldownDays })) {
+          logger.info({ platform: 'linkedin', jobId, jobTitle, company, reason: 'repost_cooldown' }, 'Skipping repost');
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `repost_cooldown:${cooldownDays}d`, source });
+          continue;
+        }
+        const recentToCompany = state.getCompanyRecentSubmissionCount({ platform: 'linkedin', company, days: cooldownDays });
+        if (recentToCompany >= companyCap) {
+          logger.info({ platform: 'linkedin', jobId, jobTitle, company, recentToCompany, reason: 'company_cap' }, 'Skipping — company cap reached');
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `company_cap:${recentToCompany}in${cooldownDays}d`, source });
+          continue;
+        }
+
         // Already applied per LinkedIn's detail panel
         if (detail.alreadyApplied) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'already_applied_linkedin' }, 'Skipping');
