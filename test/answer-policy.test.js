@@ -245,5 +245,17 @@ test('proceeds on empty label', () => {
   assert.strictEqual(r.action, 'proceed');
 });
 
+test('proceeds on preferred-name question (not a referral match)', () => {
+  // Live 2026-07-08 dry-run: "referred" matched inside "preferred" and the
+  // guard blocked a routine name field as employee_referral.
+  const r = guardAnswer('What is your preferred name?', ctx);
+  assert.strictEqual(r.action, 'proceed');
+});
+
+test('still blocks a real referral-name question', () => {
+  const r = guardAnswer('Were you referred by an employee? If so, provide their name.', ctx);
+  assert.strictEqual(r.action, 'block');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
