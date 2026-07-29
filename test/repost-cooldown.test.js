@@ -129,5 +129,57 @@ test('missing company never matches the cooldown', () => {
   assert.strictEqual(hit, false);
 });
 
+// ── Failure cooldown (2026-07-28 review) ──
+// Errors and guard-blocked abandonments were invisible to dedup: Kobie minted
+// 7 "AI Engineer" jobIds in one day and every clone burned a form attempt.
+
+state.recordApplication({
+  platform: 'linkedin', jobId: 'kobie-1', jobTitle: 'AI Engineer',
+  company: 'Kobie', jobUrl: 'https://x/k1', status: 'error',
+  errorMessage: 'Validation errors on step 3 — retry failed', runId,
+});
+state.recordApplication({
+  platform: 'linkedin', jobId: 'kobie-2', jobTitle: 'Sr. Data Engineer',
+  company: 'Kobie', jobUrl: 'https://x/k2', status: 'skipped',
+  skipReason: 'guarded_required_field:confirm I am completing this application', runId,
+});
+state.recordApplication({
+  platform: 'linkedin', jobId: 'kobie-3', jobTitle: 'Data Analyst',
+  company: 'Kobie', jobUrl: 'https://x/k3', status: 'skipped',
+  skipReason: 'location_no_match_region:Tampa, FL (On-site)', runId,
+});
+
+test('failure cooldown hits the exact jobId that errored', () => {
+  const hit = state.hasRecentFailure({ platform: 'linkedin', jobId: 'kobie-1', company: null, jobTitle: null, days: 14 });
+  assert.strictEqual(hit, true);
+});
+
+test('failure cooldown hits a clone posting (same company+title, new jobId)', () => {
+  const hit = state.hasRecentFailure({
+    platform: 'linkedin', jobId: 'kobie-99', company: 'Kobie Inc.', jobTitle: 'AI Engineer (Remote)', days: 14,
+  });
+  assert.strictEqual(hit, true);
+});
+
+test('guard-abandoned postings count as failures', () => {
+  const hit = state.hasRecentFailure({
+    platform: 'linkedin', jobId: 'kobie-98', company: 'Kobie', jobTitle: 'Sr. Data Engineer (Remote)', days: 14,
+  });
+  assert.strictEqual(hit, true);
+});
+
+test('ordinary skips are NOT failures', () => {
+  const hit = state.hasRecentFailure({
+    platform: 'linkedin', jobId: 'kobie-3', company: 'Kobie', jobTitle: 'Data Analyst', days: 14,
+  });
+  assert.strictEqual(hit, false);
+});
+
+test('attempt count includes submissions, errors, and guard abandonments', () => {
+  // Kobie: 1 error + 1 guarded skip; the location skip must not count.
+  const n = state.getCompanyRecentAttemptCount({ platform: 'linkedin', company: 'Kobie', days: 30 });
+  assert.strictEqual(n, 2);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

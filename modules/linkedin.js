@@ -1576,7 +1576,19 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `repost_cooldown:${cooldownDays}d`, source });
           continue;
         }
-        const recentToCompany = state.getCompanyRecentSubmissionCount({ platform: 'linkedin', company, days: cooldownDays });
+
+        // ── Step 5c: failure cooldown (2026-07-28 review) ──
+        // Errored / guard-abandoned forms fail identically on re-attempt, but
+        // failures were invisible to dedup: Kobie's 7 same-day "AI Engineer"
+        // clones each burned a full form attempt on the same attestation form.
+        const failureCooldownDays = config.search?.jobFilter?.failureCooldownDays ?? 14;
+        if (state.hasRecentFailure({ platform: 'linkedin', jobId, company, jobTitle, days: failureCooldownDays })) {
+          logger.info({ platform: 'linkedin', jobId, jobTitle, company, reason: 'failure_cooldown' }, 'Skipping — recently failed on this job or an identical posting');
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `failure_cooldown:${failureCooldownDays}d`, source });
+          continue;
+        }
+
+        const recentToCompany = state.getCompanyRecentAttemptCount({ platform: 'linkedin', company, days: cooldownDays });
         if (recentToCompany >= companyCap) {
           logger.info({ platform: 'linkedin', jobId, jobTitle, company, recentToCompany, reason: 'company_cap' }, 'Skipping — company cap reached');
           recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `company_cap:${recentToCompany}in${cooldownDays}d`, source });
