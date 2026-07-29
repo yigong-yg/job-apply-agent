@@ -87,6 +87,43 @@ test('commute question answers Yes via rule (stable preference)', () => {
   assert.strictEqual(result.answer, 'Yes');
 });
 
+test('residency-fact commute questions are NOT answered Yes', () => {
+  // Submitted fabrications from July: blanket commute-Yes claimed the user
+  // currently lives near Brea and Calabasas, CA. Residency facts must fall
+  // through to the LLM/cannot_fill, which answer from the real location.
+  const labels = [
+    'Please confirm you currently reside within a commutable distance to Brea, CA.',
+    'This role is fully on-site five days per week. Do you currently live within a commutable distance to Calabasas?',
+    'If you are not currently located within a reasonable commuting distance of the job location, are you willing to relocate at your own expense?',
+  ];
+  for (const label of labels) {
+    const result = inferByRules(normalizeLabel(label), label, 'radio', config);
+    assert(!result || result.rule !== 'rule:commute', `expected no commute-Yes for: ${label}`);
+  }
+});
+
+test('gpa is NOT invented by the rule tier (guard owns it)', () => {
+  const result = inferByRules(
+    normalizeLabel('What is your GPA?'), 'What is your GPA?', 'text', config
+  );
+  assert.strictEqual(result, null);
+});
+
+test('experience-with and able-to-work claims are NOT polarity-Yes', () => {
+  // 'experience with' / 'able to work' are fact claims: polarity Yes
+  // fabricated "3+ years LangChain/RAG" and NY-office availability.
+  const skill = inferByRules(
+    normalizeLabel('Do you have experience with Bloomberg tick data?'),
+    'Do you have experience with Bloomberg tick data?', 'radio', config
+  );
+  assert(!skill || skill.rule !== 'rule:polarity_yes');
+  const office = inferByRules(
+    normalizeLabel('Are you able to work in-person up to 3 days a week in our New York office?'),
+    'Are you able to work in-person up to 3 days a week in our New York office?', 'radio', config
+  );
+  assert(!office || office.rule !== 'rule:polarity_yes');
+});
+
 test('hear about rule still matches an actual referral question', () => {
   const result = inferByRules(
     normalizeLabel('How did you hear about us or were you referred?'),

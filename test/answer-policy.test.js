@@ -257,5 +257,27 @@ test('still blocks a real referral-name question', () => {
   assert.strictEqual(r.action, 'block');
 });
 
+// ── work_authorization scope (2026-07 regression) ──
+// "able to work <schedule/office>" routed to the work-auth guard and answered
+// Yes from config — fabricated office availability (Seekr, DriveWealth).
+
+test('office/schedule "able to work" questions are NOT work-authorization', () => {
+  const labels = [
+    'Are you able to work a hybrid working schedule, 3 days a week, out of one of our offices?',
+    'Are you able to work in-person up to 3 days a week in our New York office?',
+    'Are you open to working different shifts, including nights and weekends?',
+  ];
+  for (const label of labels) {
+    const c = classifyQuestion(label);
+    assert.notStrictEqual(c.questionClass, 'work_authorization', `misrouted: ${label}`);
+  }
+});
+
+test('jurisdiction "able to work" phrasings remain work-authorization', () => {
+  assert.strictEqual(classifyQuestion('Are you able to work in the United States?').questionClass, 'work_authorization');
+  assert.strictEqual(classifyQuestion('Are you able to lawfully work for this employer?').questionClass, 'work_authorization');
+  assert.strictEqual(classifyQuestion('Are you legally authorized to work in the US?').questionClass, 'work_authorization');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
