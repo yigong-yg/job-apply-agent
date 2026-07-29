@@ -1134,6 +1134,10 @@ async function collectApplyValidationErrors(page) {
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
+  // Per-step guard-refusal tracking: only the refusals on the step that
+  // ultimately blocks matter for classifying an abandonment.
+  if (options.guardBlockedLabels) options.guardBlockedLabels.clear();
+
   // ── Fill fields inside the apply form's shadow DOM ──
   const shadowFill = await fillShadowForm(page, defaultAnswers, logger, jobId, {
     config,
@@ -1146,6 +1150,13 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       shadowUnfilledCount: shadowFill.unfilled.length,
       shadowBlockedCount: (shadowFill.blocked || []).length,
     }, 'Shadow form pre-fill');
+  }
+  // Track guard refusals across steps so an eventual abandonment can be
+  // attributed to the guard (honest skip) instead of counted as breakage.
+  if (options.guardBlockedLabels) {
+    for (const b of shadowFill.blocked || []) {
+      if (b.label) options.guardBlockedLabels.add(b.label);
+    }
   }
 
   // ── Top-level form (resume upload, non-shadow controls) ──
@@ -1256,6 +1267,9 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
     }, 'Validation failure — field diagnostics');
 
     const retry = await retryInvalidFields(page, defaultAnswers, config, logger, 'linkedin', jobId, options).catch(() => ({ retryFilled: 0 }));
+    if (options.guardBlockedLabels) {
+      for (const l of retry.guardedInvalid || []) options.guardBlockedLabels.add(l);
+    }
     if (retry.retryFilled > 0) {
       await sleep(300, 600);
       await btn.evaluate(e => e.click());
@@ -1614,6 +1628,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           llmCache: llmCache || undefined,
           llmBudget,
           runId,
+          guardBlockedLabels: new Set(),
         };
 
         let stepCount = 0;
@@ -1664,16 +1679,26 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
               unfilledLabels: labels,
               topChoiceBlocked,
             }, 'Apply flow cycled — unfilled required fields (label diagnostic)');
-            throw new Error(topChoiceBlocked
+            const cycleErr = new Error(topChoiceBlocked
               ? 'top_choice_required_review — form blocked on boost checkbox, policy is never-spend'
               : 'Apply flow cycled — unfilled required fields');
+            if (fillOptions.guardBlockedLabels.size > 0) {
+              cycleErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
+            } else if (topChoiceBlocked) {
+              cycleErr.policyAbandonment = 'top_choice_required';
+            }
+            throw cycleErr;
           }
           if (fingerprint) seenFingerprints.add(fingerprint);
 
           const result = await handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount, fillOptions);
 
           if (result === 'retry_failed') {
-            throw new Error(`Validation errors on step ${stepCount} — retry failed`);
+            const valErr = new Error(`Validation errors on step ${stepCount} — retry failed`);
+            if (fillOptions.guardBlockedLabels.size > 0) {
+              valErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
+            }
+            throw valErr;
           } else if (result === 'submitted') {
             applyComplete = true;
 
@@ -1733,10 +1758,25 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         await sleep(1000, 2000);
 
-        logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
         if (jobId) failedJobIds.add(jobId);
-        await screenshotError(page, 'linkedin', jobId, config);
-        recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
+
+        // Honest abandonment is a skip, not breakage (spec: 'error' must mean
+        // the agent broke, not that it refused to fabricate an answer).
+        const guardedLabels = Array.isArray(err.guardedAbandonment) ? err.guardedAbandonment : null;
+        if (guardedLabels && guardedLabels.length > 0) {
+          const labelSummary = guardedLabels
+            .map(l => String(l).replace(/\s+/g, ' ').trim().substring(0, 40))
+            .slice(0, 3).join(' | ');
+          logger.info({ platform: 'linkedin', jobId, jobTitle, guardedFieldCount: guardedLabels.length, labels: labelSummary }, 'Abandoned honestly — required fields are guard-refused');
+          recordOutcome({ status: 'skipped', jobId: jobId || 'unknown', jobTitle, company, jobUrl, skipReason: `guarded_required_field:${labelSummary}`, source });
+        } else if (err.policyAbandonment === 'top_choice_required') {
+          logger.info({ platform: 'linkedin', jobId, jobTitle }, 'Abandoned — form requires Top Choice boost, policy is never-spend');
+          recordOutcome({ status: 'skipped', jobId: jobId || 'unknown', jobTitle, company, jobUrl, skipReason: 'top_choice_required', source });
+        } else {
+          logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
+          await screenshotError(page, 'linkedin', jobId, config);
+          recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
+        }
       }
 
     }
