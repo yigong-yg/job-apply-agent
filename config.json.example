@@ -1,7 +1,9 @@
 {
   "user": {
     "firstName": "[FIRST_NAME]",
+    "middleName": "[MIDDLE_NAME_OR_NA]",
     "lastName": "[LAST_NAME]",
+    "preferredName": "[PREFERRED_NAME]",
     "email": "[EMAIL]",
     "phone": "[PHONE]",
     "city": "[CITY]",
@@ -9,24 +11,33 @@
     "country": "[COUNTRY_CODE]",
     "zipCode": "[ZIP_CODE]",
     "linkedinUrl": "https://linkedin.com/in/[HANDLE]",
+    "githubUrl": "https://github.com/[HANDLE]",
+    "website": "https://[PORTFOLIO_OR_PERSONAL_SITE]",
     "workAuthorization": "[WORK_AUTHORIZATION]",
     "requiresSponsorship": false,
     "willingToRelocate": true,
     "yearsOfExperience": "[YEARS_OF_EXPERIENCE]",
+    "graduationYear": "[GRADUATION_YEAR]",
     "highestEducation": "[HIGHEST_EDUCATION]",
+    "currentEmployer": "[CURRENT_EMPLOYER_OR_NA]",
     "veteranStatus": "[VETERAN_STATUS]",
     "disabilityStatus": "[DISABILITY_STATUS]",
     "gender": "[GENDER]",
     "race": "[RACE_ETHNICITY]",
     "desiredSalary": "[DESIRED_SALARY]",
+    "defaultPercentageAnswer": "[DEFAULT_PERCENTAGE_ANSWER]",
     "startDate": "[START_DATE]",
     "resumePath": "./resumes/resume.pdf"
   },
 
   "search": {
     "keywords": ["data scientist", "machine learning engineer", "data analyst"],
+    "locationFilter": ["California", "New York", "Massachusetts"],
     "jobFilter": {
       "blockCompanies": [],
+      "blockLikelyRecruitingAgencies": true,
+      "blockCompanyKeywords": ["recruiting", "recruitment", "staffing", "executive search", "search group", "talent acquisition", "placement agency"],
+      "blockCompanyPatterns": ["\\bbeaconfire\\b", "\\bjobright\\.ai\\b"],
       "blockTitleKeywords": ["intern", "director", "VP", "recruiter"],
       "requireTitleKeywords": ["data scientist", "data analyst", "data engineer", "machine learning", "ML engineer", "AI engineer"]
     }

@@ -43,6 +43,7 @@ set PYTHON=C:\path\to\python.exe && npm install
 - Keep your real profile, session, resume, and runtime data only in those local files and folders. They are gitignored.
 - Replace all placeholder values like `[FIRST_NAME]`, `[LAST_NAME]`, `[EMAIL]`, `[PHONE]`, `[HANDLE]`, and `[DESIRED_SALARY]`.
 - Verify `platforms.<name>.enabled`, `maxApplicationsPerRun`, and `searchUrl`.
+- Tune `search.jobFilter` before production. `blockCompanies` is for exact known bad companies, while `blockCompanyKeywords` and `blockCompanyPatterns` catch recurring recruiting/staffing/search-firm signals. Set `blockLikelyRecruitingAgencies` to `false` only if you intentionally want agency-heavy volume.
 - Edit `defaultAnswers.json` to align with your real profile answers.
 
 ### 3) Place resume file
