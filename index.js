@@ -177,6 +177,7 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
   ];
 
   let totalApplied = 0;
+  let totalAlreadyApplied = 0;
   let totalSkipped = 0;
   let totalErrors = 0;
   const sessionStatus = [];
@@ -187,15 +188,16 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
       sessionStatus.push(`${platform} ✗ (expired)`);
       continue;
     }
-    const platformStats = dbStats[platform] || { applied: 0, skipped: 0, errors: 0, dry_run: 0 };
-    const { applied = 0, skipped = 0, errors = 0, dry_run = 0 } = platformStats;
+    const platformStats = dbStats[platform] || { applied: 0, skipped: 0, errors: 0, dry_run: 0, already_applied: 0 };
+    const { applied = 0, skipped = 0, errors = 0, dry_run = 0, already_applied = 0 } = platformStats;
     totalApplied += applied + dry_run;
+    totalAlreadyApplied += already_applied;
     totalSkipped += skipped;
     totalErrors += errors;
 
     const statusLine = dry_run > 0
-      ? `  ${platform.padEnd(10)}: ${dry_run} dry_run | ${skipped} skipped | ${errors} errors`
-      : `  ${platform.padEnd(10)}: ${applied} applied | ${skipped} skipped | ${errors} errors`;
+      ? `  ${platform.padEnd(10)}: ${dry_run} dry_run | ${already_applied} already_applied | ${skipped} skipped | ${errors} errors`
+      : `  ${platform.padEnd(10)}: ${applied} applied | ${already_applied} already_applied | ${skipped} skipped | ${errors} errors`;
     lines.push(statusLine);
     sessionStatus.push(`${platform} ✓`);
   }
@@ -214,8 +216,9 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
     else if (source === 'config') sourceCategories.defaultAnswers += count; // file uploads etc.
   }
 
+  const totalScanned = totalApplied + totalAlreadyApplied + totalSkipped + totalErrors;
   lines.push('─'.repeat(55));
-  lines.push(`  TOTAL:      ${totalApplied} applied | ${totalSkipped} skipped | ${totalErrors} errors`);
+  lines.push(`  TOTAL:      ${totalApplied} applied | ${totalAlreadyApplied} already_applied | ${totalSkipped} skipped | ${totalErrors} errors`);
   lines.push(`  Sessions:  ${sessionStatus.join(' | ')}`);
   lines.push(`  Fill Sources: ${sourceCategories.defaultAnswers} defaultAnswers | ${sourceCategories.rule} rule | ${sourceCategories.llm} llm | ${sourceCategories.safe_default} safe_default | ${sourceCategories.cannot_fill} cannot_fill`);
   lines.push(`  Unmatched Fields: ${unmatchedCount} new (see unfilled_fields table)`);
@@ -223,9 +226,27 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
 
   const report = lines.join('\n');
   console.log('\n' + report + '\n');
-  logger.info({ runId, totalApplied, totalSkipped, totalErrors }, 'Run complete');
+  logger.info({ runId, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned }, 'Run complete');
 
-  return { report, totalApplied, totalSkipped, totalErrors, durationMin: duration, sessions: sessionStatus };
+  return { report, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin: duration, sessions: sessionStatus };
+}
+
+/**
+ * Session expiry is silent death: the agent skipped 2026-07-17 → 07-24 while
+ * the launcher logged success every night. Alert loudly, but only once per
+ * Denver day — the launcher retries all evening and each retry lands here.
+ */
+async function alertSessionExpired(platform) {
+  const denverDay = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+  const marker = path.join(__dirname, 'logs', `.session-expiry-alerted-${denverDay}`);
+  if (fs.existsSync(marker)) return;
+  try { fs.writeFileSync(marker, new Date().toISOString()); } catch (_) {}
+  await sendDiscordMessage(
+    `🔑 **${platform} session expired** — no applications can be submitted. ` +
+    `Re-login with \`node setup.js --platform ${platform}\`. ` +
+    `The launcher keeps retrying tonight and picks up automatically after re-login.`,
+    logger
+  );
 }
 
 /**
@@ -322,6 +343,8 @@ async function main() {
 
   // Process each platform sequentially
   let stopSessionRequested = false;
+  const sessionExpiredPlatforms = [];
+  let platformCrashed = false;
   for (const platform of enabledPlatforms) {
     const platformLogger = logger.child({ platform });
     platformLogger.info('Processing platform');
@@ -347,6 +370,8 @@ async function main() {
           `Session expired for ${platform}. Skipping. Run: node setup.js --platform ${platform}`
         );
         runStats[platform] = null; // Mark as skipped due to session
+        sessionExpiredPlatforms.push(platform);
+        await alertSessionExpired(platform);
         continue;
       }
 
@@ -368,7 +393,12 @@ async function main() {
 
     } catch (err) {
       platformLogger.error({ error: err.message, stack: err.stack }, 'Unexpected platform error');
-      runStats[platform] = { applied: 0, skipped: 0, errors: 1 };
+      // Preserve DB-accurate partial progress: the old zeroed fallback made a
+      // run that submitted 23 applications before crashing report applied: 0
+      // to Discord (run 3c3ccbbf, 2026-07-28).
+      const dbCounts = state.getRunStats(runId)[platform] || { applied: 0, skipped: 0, errors: 0 };
+      runStats[platform] = { ...dbCounts, crashed: true, crashError: err.message };
+      platformCrashed = true;
 
     } finally {
       if (context) {
@@ -395,19 +425,19 @@ async function main() {
   }
 
   state.completeRun(runId, aggregatedStats);
-  const { report, totalApplied, totalSkipped, totalErrors, durationMin, sessions } =
+  const { report, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin, sessions } =
     await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
 
   // Flush any remaining per-app notifications
   await flushAppNotifications(logger);
 
   // Send session summary to Discord
-  const scanned = Object.values(runStats).filter(Boolean).reduce((s, p) => s + (p.applied || 0) + (p.skipped || 0) + (p.errors || 0), 0);
   await sendSessionSummary({
     sessionId,
     durationMin,
-    scanned,
+    scanned: totalScanned,
     applied: totalApplied,
+    alreadyApplied: totalAlreadyApplied,
     skipped: totalSkipped,
     failed: totalErrors,
     dsCalls: state.getLlmCallCount(runId),
@@ -423,9 +453,14 @@ async function main() {
     dryRun: runtime.dryRun,
     sessionId,
     applied: totalApplied,
-    scanned,
+    scanned: totalScanned,
   }, logger);
 
+  // Exit codes the launcher can act on: 3 = session expired (retry + human
+  // re-login needed), 1 = platform crashed mid-run (retry recovers budget;
+  // dedup prevents double submissions), 0 = clean run incl. daily-limit stop.
+  if (sessionExpiredPlatforms.length > 0) process.exit(3);
+  if (platformCrashed) process.exit(1);
   process.exit(0);
 }
 

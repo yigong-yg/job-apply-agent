@@ -76,7 +76,6 @@
     "location city": "[CITY]",
     "degree": "[DEGREE_NAME]",
     "graduation year": "[GRADUATION_YEAR]",
-    "percentage": "[DEFAULT_PERCENTAGE_ANSWER]",
     "discipline": "[FIELD_OF_STUDY]",
     "gpa": "[GPA]",
     "pronouns other": ""

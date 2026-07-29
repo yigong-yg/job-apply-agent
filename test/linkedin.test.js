@@ -213,25 +213,44 @@ test('allows configured state aliases in location filter', () => {
   assert(shouldApply('Data Scientist', 'Co', 'Boston, MA (Remote)', config).apply);
 });
 
-test('blocks out-of-state locations when location filter is configured', () => {
+test('blocks out-of-state locations with region skip reason', () => {
   const config = { search: { locationFilter: ['California', 'New York', 'Massachusetts'], jobFilter: {} } };
   const r = shouldApply('Data Scientist', 'Co', 'Seattle, WA (On-site)', config);
   assert(!r.apply);
-  assert(r.skipReason.startsWith('location_no_match:'));
-});
-
-test('applies location filter even without jobFilter configured', () => {
-  const config = { search: { locationFilter: ['California'] } };
-  assert(shouldApply('Data Scientist', 'Co', 'San Francisco, CA (Hybrid)', config).apply);
-
-  const r = shouldApply('Data Scientist', 'Co', 'Seattle, WA (On-site)', config);
-  assert(!r.apply);
-  assert(r.skipReason.startsWith('location_no_match:'));
+  assert(r.skipReason.startsWith('location_no_match_region:'));
 });
 
 test('does not block when card location is missing', () => {
   const config = { search: { locationFilter: ['California'], jobFilter: {} } };
   assert(shouldApply('Data Scientist', 'Co', '', config).apply);
+});
+
+// ── Remote location matching (spec R2) ──
+// 2,145 "United States (Remote)" jobs were skipped over 4 months despite
+// includeRemote: true — the single largest inventory bug found.
+
+test('passes US-remote job when includeRemote is true', () => {
+  const config = { search: { includeRemote: true, locationFilter: ['California', 'New York', 'Massachusetts'], jobFilter: {} } };
+  assert(shouldApply('Data Scientist', 'Co', 'United States (Remote)', config).apply);
+});
+
+test('passes remote location variants when includeRemote is true', () => {
+  const config = { search: { includeRemote: true, locationFilter: ['California'], jobFilter: {} } };
+  assert(shouldApply('Data Scientist', 'Co', 'Remote - United States', config).apply);
+  assert(shouldApply('Data Scientist', 'Co', 'Anywhere in the United States', config).apply);
+  assert(shouldApply('Data Scientist', 'Co', 'Texas, United States (Remote)', config).apply);
+});
+
+test('skips remote-only job with remote_disabled reason when includeRemote is false', () => {
+  const config = { search: { includeRemote: false, locationFilter: ['California'], jobFilter: {} } };
+  const r = shouldApply('Data Scientist', 'Co', 'United States (Remote)', config);
+  assert(!r.apply);
+  assert(r.skipReason.startsWith('location_no_match_remote_disabled:'));
+});
+
+test('allowlisted-state remote job passes via region even when includeRemote is false', () => {
+  const config = { search: { includeRemote: false, locationFilter: ['California'], jobFilter: {} } };
+  assert(shouldApply('Data Scientist', 'Co', 'San Francisco, CA (Remote)', config).apply);
 });
 
 // ── hasLinkedInDailySubmissionLimitMessage ──

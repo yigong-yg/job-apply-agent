@@ -24,8 +24,10 @@ const path = require('path');
 const fs = require('fs');
 const { sleep } = require('../lib/humanize');
 const { fillForm, retryInvalidFields } = require('../lib/form-filler');
-const { recordUnfilledField } = require('../lib/state');
+const { recordUnfilledField, recordFillAudit } = require('../lib/state');
 const { queueAppNotification } = require('../lib/notify');
+const { guardAnswer, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
+const { validateAnswer, VALIDATOR_PATTERN_SOURCES } = require('../lib/output-validator');
 
 const SELECTOR_TIMEOUT = 10000;
 
@@ -151,6 +153,14 @@ function analyzeSearchPageState(state) {
 
 // ── Job filter (pure, no network) ──
 
+// Remote-flavored location strings ("United States (Remote)", "Remote - US",
+// "Anywhere in the United States") never contain an allowlisted state, so
+// they must match semantically, not by state alias (spec R2).
+function isRemoteLocation(location) {
+  const text = String(location || '');
+  return /\bremote\b/i.test(text) || /\banywhere in the (united states|u\.?s\.?a?)\b/i.test(text);
+}
+
 function matchesAllowedLocation(location, configuredLocation) {
   const text = String(location || '').trim();
   if (!text) return true; // Missing card location should not become a false negative.
@@ -267,9 +277,12 @@ function shouldApply(title, company, locationOrConfig, maybeConfig) {
 
   const locationFilter = config.search?.locationFilter;
   if (Array.isArray(locationFilter) && locationFilter.length > 0) {
+    const includeRemote = config.search?.includeRemote === true || config.search?.remoteOnly === true;
+    const remote = isRemoteLocation(location);
     const matchedLocation = locationFilter.some(target => matchesAllowedLocation(location, target));
-    if (!matchedLocation) {
-      return { apply: false, skipReason: `location_no_match:${location || 'unknown'}` };
+    if (!matchedLocation && !(remote && includeRemote)) {
+      const reason = remote ? 'location_no_match_remote_disabled' : 'location_no_match_region';
+      return { apply: false, skipReason: `${reason}:${location || 'unknown'}` };
     }
   }
 
@@ -349,15 +362,53 @@ async function getApplyShadowRoot(page) {
  * and shadow roots don't have those methods, we use page.evaluate()
  * to fill fields directly inside the shadow root via defaultAnswers.
  */
-async function fillShadowForm(page, defaultAnswers, logger, jobId) {
-  const result = await page.evaluate((answers) => {
+const EMPTY_SHADOW_RESULT = () => ({
+  filled: 0, unfilled: [], blocked: [], guardedPending: [], fills: [],
+  topChoice: { present: false, checked: false },
+});
+
+async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
+  const config = opts.config || {};
+  const runId = opts.runId || null;
+  const flatAnswers = defaultAnswers.defaultAnswers || defaultAnswers;
+  // Spec R14: never consume platform boosts/credits unless explicitly allowed.
+  const topChoicePolicy = config.platformPolicy?.linkedin?.topChoice || 'never';
+
+  const result = await page.evaluate(({ answerMap, guardedSources, validatorPatterns, topChoicePolicy }) => {
     const interop = document.querySelector('#interop-outlet');
-    if (!interop || !interop.shadowRoot) return { filled: 0, unfilled: [] };
+    if (!interop || !interop.shadowRoot) {
+      return { filled: 0, unfilled: [], blocked: [], guardedPending: [], fills: [], topChoice: { present: false, checked: false } };
+    }
     const sr = interop.shadowRoot;
 
     let filled = 0;
     const unfilled = [];
-    const answerMap = answers.defaultAnswers || answers;
+    const blocked = [];
+    const guardedPending = [];
+    const fills = [];
+    const topChoice = { present: false, checked: false };
+
+    // Keep in sync with lib/answer-policy.js normalize() — evaluate() cannot import it.
+    function normalizeQ(s) {
+      return String(s || '').toLowerCase().replace(/[^a-z0-9+/\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    const guardedRes = guardedSources.map((src) => new RegExp(src));
+    function isGuarded(label) {
+      const n = normalizeQ(label);
+      return !!n && guardedRes.some((re) => re.test(n));
+    }
+    const rejectRes = validatorPatterns.map(([src, flags]) => new RegExp(src, flags));
+    function isRejectedValue(v) {
+      return rejectRes.some((re) => re.test(String(v)));
+    }
+
+    // Tag elements so the Node-side guarded pass can find them again.
+    let fieldSeq = 0;
+    function tagField(el) {
+      const tag = `agent-f${fieldSeq++}`;
+      el.setAttribute('data-agent-field', tag);
+      return tag;
+    }
 
     // Helper: find label text for a form element
     function getLabelText(el) {
@@ -371,6 +422,29 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
         const label = parent.querySelector('label, legend');
         if (label) return label.textContent.trim();
       }
+      return '';
+    }
+
+    // Group label: fieldset legend FIRST. Each radio option sits in its own
+    // <div>, so closest('fieldset, div, li') used to return the option
+    // wrapper and the question degraded to the option text ("Yes") — 418
+    // unfilled_fields rows with label "Yes" over 3 months.
+    function getGroupLabel(radio) {
+      const fieldset = radio.closest('fieldset');
+      if (fieldset) {
+        const legend = fieldset.querySelector('legend');
+        if (legend && legend.textContent.trim()) return legend.textContent.trim();
+      }
+      let p = radio.parentElement;
+      for (let i = 0; i < 6 && p && p !== sr; i++, p = p.parentElement) {
+        const legend = p.querySelector('legend');
+        if (legend && legend.textContent.trim()) return legend.textContent.trim();
+      }
+      // Last resort: a nearby label that is NOT an option label (option labels
+      // carry for= pointing at a radio input).
+      const parent = radio.closest('div, li');
+      const label = parent && parent.querySelector('label');
+      if (label && !label.htmlFor && label.textContent.trim()) return label.textContent.trim();
       return '';
     }
 
@@ -404,8 +478,23 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
       // Skip if already has a value
       if (el.value && el.value.trim()) { filled++; continue; }
 
+      const fieldType = el.tagName === 'SELECT' ? 'select'
+        : el.tagName === 'TEXTAREA' ? 'textarea'
+        : (el.type || 'text');
+
+      // Never-auto-answer guard (spec R8): guarded questions skip fuzzy
+      // matching entirely; the Node side answers from exact config or blocks.
+      if (labelText && isGuarded(labelText)) {
+        guardedPending.push({ label: labelText, type: fieldType, tag: tagField(el) });
+        continue;
+      }
+
       const match = fuzzyMatch(labelText);
       if (match) {
+        if (isRejectedValue(match)) {
+          blocked.push({ label: labelText, type: fieldType, reason: 'output_guard', answer: String(match).substring(0, 60) });
+          continue;
+        }
         if (el.tagName === 'SELECT') {
           for (const opt of el.options) {
             if (opt.text.toLowerCase().includes(match.toLowerCase()) ||
@@ -413,6 +502,7 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
               el.value = opt.value;
               el.dispatchEvent(new Event('change', { bubbles: true }));
               filled++;
+              fills.push({ label: labelText, type: fieldType, answer: opt.text, source: 'shadow_fuzzy', matchType: 'exact_key' });
               break;
             }
           }
@@ -421,9 +511,10 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
           filled++;
+          fills.push({ label: labelText, type: fieldType, answer: String(match).substring(0, 200), source: 'shadow_fuzzy', matchType: 'exact_key' });
         }
       } else if (labelText) {
-        unfilled.push({ label: labelText, type: el.type || el.tagName });
+        unfilled.push({ label: labelText, type: fieldType });
       }
     }
 
@@ -440,12 +531,16 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
       // Skip if already selected
       if (radios.some(r => r.checked)) { filled++; continue; }
 
-      // Find group label from parent fieldset/div
-      const parent = radios[0].closest('fieldset, div, li');
-      const groupLabel = parent ? (parent.querySelector('legend, label')?.textContent || '').trim() : '';
-      const match = fuzzyMatch(groupLabel);
+      const groupLabel = getGroupLabel(radios[0]);
 
-      if (match) {
+      if (groupLabel && isGuarded(groupLabel)) {
+        const container = radios[0].closest('fieldset') || radios[0].parentElement;
+        guardedPending.push({ label: groupLabel, type: 'radio', tag: tagField(container) });
+        continue;
+      }
+
+      const match = fuzzyMatch(groupLabel);
+      if (match && !isRejectedValue(match)) {
         // Click the radio whose label matches the answer
         const matchLower = match.toLowerCase();
         let clicked = false;
@@ -463,44 +558,97 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
             }
             filled++;
             clicked = true;
+            fills.push({ label: groupLabel, type: 'radio', answer: radioLabel, source: 'shadow_fuzzy', matchType: 'exact_key' });
             break;
           }
         }
-        // If no label matched, click "Yes" if available (safe default for binary questions)
-        if (!clicked) {
-          for (const radio of radios) {
-            const radioLabel = getLabelText(radio) || radio.value || '';
-            if (radioLabel.toLowerCase() === 'yes') {
-              radio.checked = true;
-              radio.dispatchEvent(new Event('change', { bubbles: true }));
-              filled++;
-              break;
-            }
-          }
-        }
+        // Spec R10: no Yes-default. An unmatched option set stays unfilled
+        // rather than guessing — wrong-polarity Yes answers were submitted
+        // to military/sanctions/non-compete questions under the old default.
+        if (!clicked) unfilled.push({ label: groupLabel, type: 'radio' });
       } else if (groupLabel) {
         unfilled.push({ label: groupLabel, type: 'radio' });
       }
     }
 
-    // ── Handle standalone checkboxes (agree/certify/confirm) ──
+    // ── Handle standalone checkboxes ──
     for (const cb of sr.querySelectorAll('input[type="checkbox"]')) {
-      if (cb.checked) continue;
       const labelText = getLabelText(cb) || '';
       const labelLower = labelText.toLowerCase();
+      const isTopChoice = labelLower.includes('top choice') ||
+        (labelLower.includes('mark') && labelLower.includes('job'));
+
+      if (isTopChoice) {
+        // LinkedIn's boost checkbox. Policy-driven (spec R14): default is
+        // 'never' — do not consume Top Choice credits. 'always' opts in.
+        topChoice.present = true;
+        if (topChoicePolicy === 'always' && !cb.checked) {
+          cb.click();
+          cb.checked = true;
+          cb.dispatchEvent(new Event('change', { bubbles: true }));
+          filled++;
+          fills.push({ label: labelText, type: 'checkbox', answer: 'checked', source: 'platform_policy:top_choice', matchType: 'policy_always' });
+        }
+        topChoice.checked = cb.checked;
+        continue;
+      }
+
+      if (cb.checked) continue;
       if (labelLower.includes('agree') || labelLower.includes('certify') ||
           labelLower.includes('confirm') || labelLower.includes('acknowledge')) {
         cb.checked = true;
         cb.dispatchEvent(new Event('change', { bubbles: true }));
         filled++;
+        fills.push({ label: labelText, type: 'checkbox', answer: 'checked', source: 'rule:consent_checkbox', matchType: 'consent' });
       }
     }
 
-    return { filled, unfilled };
-  }, defaultAnswers).catch(() => ({ filled: 0, unfilled: [] }));
+    return { filled, unfilled, blocked, guardedPending, fills, topChoice };
+  }, {
+    answerMap: flatAnswers,
+    guardedSources: GUARDED_PATTERN_SOURCES,
+    validatorPatterns: VALIDATOR_PATTERN_SOURCES,
+    topChoicePolicy,
+  }).catch(() => EMPTY_SHADOW_RESULT());
+
+  // ── Guarded pass: exact config answers or explicit blocks (spec R8) ──
+  for (const pending of result.guardedPending || []) {
+    const decision = guardAnswer(pending.label, { config, defaultAnswers: flatAnswers });
+    if (decision.action === 'answer') {
+      const v = validateAnswer(decision.answer, { label: pending.label, fieldType: pending.type });
+      if (v.ok) {
+        const applied = await applyGuardedShadowFill(page, pending, v.answer).catch(() => false);
+        if (applied) {
+          result.filled++;
+          result.fills.push({ label: pending.label, type: pending.type, answer: v.answer, source: decision.source, matchType: 'guard_config' });
+          continue;
+        }
+      }
+    }
+    result.blocked.push({ label: pending.label, type: pending.type, reason: decision.reason || 'guard_apply_failed', questionClass: decision.questionClass });
+  }
+
+  // ── Audit every decision (fill_audit had no shadow-path rows before) ──
+  const audit = (fieldLabel, fieldType, fillSource, answer, confidence) => {
+    try {
+      recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel, fieldType, inputType: null, fillSource, answer, confidence });
+    } catch (_) {}
+  };
+  for (const f of result.fills || []) audit(f.label, f.type, f.source, f.answer, f.matchType);
+  for (const b of result.blocked || []) audit(b.label, b.type, 'cannot_fill', '', b.reason);
+  if (result.topChoice && result.topChoice.present) {
+    audit('Mark job as a top choice', 'checkbox', 'platform_policy',
+      result.topChoice.checked ? 'checked' : 'left_unchecked', `top_choice:${topChoicePolicy}`);
+  }
 
   if (result.filled > 0) {
     logger.debug({ platform: 'linkedin', jobId, filled: result.filled }, 'Filled shadow DOM form fields');
+  }
+  if ((result.blocked || []).length > 0) {
+    logger.info({ platform: 'linkedin', jobId, blocked: result.blocked }, 'Guard blocked shadow form fields');
+    for (const field of result.blocked) {
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: field.label, fieldType: field.type });
+    }
   }
   if (result.unfilled.length > 0) {
     logger.debug({ platform: 'linkedin', jobId, unfilled: result.unfilled }, 'Unfilled shadow DOM form fields');
@@ -510,6 +658,60 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId) {
   }
 
   return result;
+}
+
+/**
+ * Apply a guard-approved answer to a shadow-form field tagged during
+ * collection (data-agent-field). Radios/selects match the option whose
+ * label equals or contains the configured answer; text inputs set the value.
+ *
+ * @returns {Promise<boolean>} true when a fill was applied
+ */
+async function applyGuardedShadowFill(page, pending, answer) {
+  return page.evaluate(({ tag, type, answer }) => {
+    const interop = document.querySelector('#interop-outlet');
+    const sr = interop?.shadowRoot;
+    if (!sr) return false;
+    const el = sr.querySelector(`[data-agent-field="${tag}"]`);
+    if (!el) return false;
+
+    const answerLower = String(answer).toLowerCase();
+    const optionMatches = (text) => {
+      const t = String(text || '').trim().toLowerCase();
+      if (!t) return false;
+      return t === answerLower || t.includes(answerLower) || (t.length >= 3 && answerLower.includes(t));
+    };
+
+    if (type === 'radio') {
+      for (const radio of el.querySelectorAll('input[type="radio"]')) {
+        const label = radio.id ? sr.querySelector(`label[for="${radio.id}"]`) : null;
+        const optText = (label && label.textContent.trim()) || radio.value || '';
+        if (optionMatches(optText)) {
+          radio.checked = true;
+          radio.dispatchEvent(new Event('change', { bubbles: true }));
+          if (label) label.click();
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (el.tagName === 'SELECT') {
+      for (const opt of el.options) {
+        if (opt.value !== '' && optionMatches(opt.text)) {
+          el.value = opt.value;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }
+      }
+      return false;
+    }
+
+    el.value = String(answer);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, { tag: pending.tag, type: pending.type, answer });
 }
 
 /**
@@ -593,19 +795,11 @@ async function countResultCards(page) {
   // goToNextPage only to confirm "the next page rendered something". Avoid
   // calling listResultCards here so we don't run the full multi-strategy
   // iteration just to verify page navigation worked.
+  const easy = await page.getByRole('button').filter({ hasText: 'Easy Apply' }).count().catch(() => 0);
+  if (easy > 0) return easy;
   const li = await page.locator('li[data-occludable-job-id]').count().catch(() => 0);
   if (li > 0) return li;
-  const dataId = await page.locator('[data-job-id]').count().catch(() => 0);
-  if (dataId > 0) return dataId;
-
-  return page.getByRole('button').evaluateAll((els) => {
-    return els.filter((el) => {
-      const text = (el.textContent || '').trim();
-      if (text.length < 30) return false;
-      if (!/\bApply\b/i.test(text)) return false;
-      return /\(Verified job\)|Be an early applicant|\bago\b|Promoted by hirer/i.test(text);
-    }).length;
-  }).catch(() => 0);
+  return page.getByRole('button').filter({ hasText: 'Apply' }).count().catch(() => 0);
 }
 
 /**
@@ -940,15 +1134,29 @@ async function collectApplyValidationErrors(page) {
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
+  // Per-step guard-refusal tracking: only the refusals on the step that
+  // ultimately blocks matter for classifying an abandonment.
+  if (options.guardBlockedLabels) options.guardBlockedLabels.clear();
+
   // ── Fill fields inside the apply form's shadow DOM ──
-  const shadowFill = await fillShadowForm(page, defaultAnswers, logger, jobId)
-    .catch(() => ({ filled: 0, unfilled: [] }));
-  if (shadowFill.filled > 0 || shadowFill.unfilled.length > 0) {
+  const shadowFill = await fillShadowForm(page, defaultAnswers, logger, jobId, {
+    config,
+    runId: options.runId || null,
+  }).catch(() => EMPTY_SHADOW_RESULT());
+  if (shadowFill.filled > 0 || shadowFill.unfilled.length > 0 || (shadowFill.blocked || []).length > 0) {
     logger.debug({
       jobId, stepNum,
       shadowFilled: shadowFill.filled,
       shadowUnfilledCount: shadowFill.unfilled.length,
+      shadowBlockedCount: (shadowFill.blocked || []).length,
     }, 'Shadow form pre-fill');
+  }
+  // Track guard refusals across steps so an eventual abandonment can be
+  // attributed to the guard (honest skip) instead of counted as breakage.
+  if (options.guardBlockedLabels) {
+    for (const b of shadowFill.blocked || []) {
+      if (b.label) options.guardBlockedLabels.add(b.label);
+    }
   }
 
   // ── Top-level form (resume upload, non-shadow controls) ──
@@ -1038,10 +1246,11 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
           inShadow: true,
         });
       }
-      // Also check radio groups
+      // Also check radio groups — fieldset first: closest('fieldset, div, li')
+      // returns the option's own wrapper div and degrades the label to "Yes"
       for (const radio of sr.querySelectorAll('input[type="radio"]')) {
-        const parent = radio.closest('fieldset, div, li');
-        const legend = parent?.querySelector('legend, label');
+        const parent = radio.closest('fieldset') || radio.closest('div, li');
+        const legend = parent?.querySelector('legend') || parent?.querySelector('label');
         const groupLabel = legend ? legend.textContent.trim().substring(0, 80) : '';
         if (groupLabel && !fields.some(f => f.label === groupLabel)) {
           fields.push({ tag: 'INPUT', type: 'radio', label: groupLabel, hasValue: radio.checked, valueLen: 0, hasError: false, inShadow: true });
@@ -1058,6 +1267,9 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
     }, 'Validation failure — field diagnostics');
 
     const retry = await retryInvalidFields(page, defaultAnswers, config, logger, 'linkedin', jobId, options).catch(() => ({ retryFilled: 0 }));
+    if (options.guardBlockedLabels) {
+      for (const l of retry.guardedInvalid || []) options.guardBlockedLabels.add(l);
+    }
     if (retry.retryFilled > 0) {
       await sleep(300, 600);
       await btn.evaluate(e => e.click());
@@ -1353,6 +1565,36 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           continue;
         }
 
+        // ── Step 5b: repost cooldown (spec R5) ──
+        // Repost farms mint new jobIds for the same listing daily — 22.8% of
+        // all historical submissions were normalized company+title repeats
+        // (ATC "Data Analyst" x71). jobId dedup cannot catch them.
+        const cooldownDays = config.search?.jobFilter?.repostCooldownDays ?? 30;
+        const companyCap = config.search?.jobFilter?.companyMonthlyCap ?? 5;
+        if (state.hasRecentCompanyTitleApplication({ platform: 'linkedin', company, jobTitle, days: cooldownDays })) {
+          logger.info({ platform: 'linkedin', jobId, jobTitle, company, reason: 'repost_cooldown' }, 'Skipping repost');
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `repost_cooldown:${cooldownDays}d`, source });
+          continue;
+        }
+
+        // ── Step 5c: failure cooldown (2026-07-28 review) ──
+        // Errored / guard-abandoned forms fail identically on re-attempt, but
+        // failures were invisible to dedup: Kobie's 7 same-day "AI Engineer"
+        // clones each burned a full form attempt on the same attestation form.
+        const failureCooldownDays = config.search?.jobFilter?.failureCooldownDays ?? 14;
+        if (state.hasRecentFailure({ platform: 'linkedin', jobId, company, jobTitle, days: failureCooldownDays })) {
+          logger.info({ platform: 'linkedin', jobId, jobTitle, company, reason: 'failure_cooldown' }, 'Skipping — recently failed on this job or an identical posting');
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `failure_cooldown:${failureCooldownDays}d`, source });
+          continue;
+        }
+
+        const recentToCompany = state.getCompanyRecentAttemptCount({ platform: 'linkedin', company, days: cooldownDays });
+        if (recentToCompany >= companyCap) {
+          logger.info({ platform: 'linkedin', jobId, jobTitle, company, recentToCompany, reason: 'company_cap' }, 'Skipping — company cap reached');
+          recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: `company_cap:${recentToCompany}in${cooldownDays}d`, source });
+          continue;
+        }
+
         // Already applied per LinkedIn's detail panel
         if (detail.alreadyApplied) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'already_applied_linkedin' }, 'Skipping');
@@ -1398,6 +1640,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           llmCache: llmCache || undefined,
           llmBudget,
           runId,
+          guardBlockedLabels: new Set(),
         };
 
         let stepCount = 0;
@@ -1425,19 +1668,49 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             // Surface the actual unfilled labels — pre-fix the throw gave us
             // no signal about which fields the agent couldn't resolve.
             const labels = fingerprint.split('||').filter(Boolean).slice(0, 12);
+
+            // Attribute the cycle: an unchecked Top Choice box under policy
+            // 'never' means the form is blocked by boost consent, not by an
+            // unanswerable question (spec R14 — user decides, see spec
+            // open question 4).
+            const topChoiceBlocked = await page.evaluate(() => {
+              const sr = document.querySelector('#interop-outlet')?.shadowRoot;
+              if (!sr) return false;
+              for (const cb of sr.querySelectorAll('input[type="checkbox"]')) {
+                if (cb.checked) continue;
+                const label = cb.id ? sr.querySelector(`label[for="${cb.id}"]`) : null;
+                const t = (label?.textContent || '').toLowerCase();
+                if (t.includes('top choice') || (t.includes('mark') && t.includes('job'))) return true;
+              }
+              return false;
+            }).catch(() => false);
+
             logger.warn({
               jobId, jobTitle, company,
               stepNum: stepCount,
               unfilledLabels: labels,
+              topChoiceBlocked,
             }, 'Apply flow cycled — unfilled required fields (label diagnostic)');
-            throw new Error('Apply flow cycled — unfilled required fields');
+            const cycleErr = new Error(topChoiceBlocked
+              ? 'top_choice_required_review — form blocked on boost checkbox, policy is never-spend'
+              : 'Apply flow cycled — unfilled required fields');
+            if (fillOptions.guardBlockedLabels.size > 0) {
+              cycleErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
+            } else if (topChoiceBlocked) {
+              cycleErr.policyAbandonment = 'top_choice_required';
+            }
+            throw cycleErr;
           }
           if (fingerprint) seenFingerprints.add(fingerprint);
 
           const result = await handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount, fillOptions);
 
           if (result === 'retry_failed') {
-            throw new Error(`Validation errors on step ${stepCount} — retry failed`);
+            const valErr = new Error(`Validation errors on step ${stepCount} — retry failed`);
+            if (fillOptions.guardBlockedLabels.size > 0) {
+              valErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
+            }
+            throw valErr;
           } else if (result === 'submitted') {
             applyComplete = true;
 
@@ -1497,10 +1770,25 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         await sleep(1000, 2000);
 
-        logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
         if (jobId) failedJobIds.add(jobId);
-        await screenshotError(page, 'linkedin', jobId, config);
-        recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
+
+        // Honest abandonment is a skip, not breakage (spec: 'error' must mean
+        // the agent broke, not that it refused to fabricate an answer).
+        const guardedLabels = Array.isArray(err.guardedAbandonment) ? err.guardedAbandonment : null;
+        if (guardedLabels && guardedLabels.length > 0) {
+          const labelSummary = guardedLabels
+            .map(l => String(l).replace(/\s+/g, ' ').trim().substring(0, 40))
+            .slice(0, 3).join(' | ');
+          logger.info({ platform: 'linkedin', jobId, jobTitle, guardedFieldCount: guardedLabels.length, labels: labelSummary }, 'Abandoned honestly — required fields are guard-refused');
+          recordOutcome({ status: 'skipped', jobId: jobId || 'unknown', jobTitle, company, jobUrl, skipReason: `guarded_required_field:${labelSummary}`, source });
+        } else if (err.policyAbandonment === 'top_choice_required') {
+          logger.info({ platform: 'linkedin', jobId, jobTitle }, 'Abandoned — form requires Top Choice boost, policy is never-spend');
+          recordOutcome({ status: 'skipped', jobId: jobId || 'unknown', jobTitle, company, jobUrl, skipReason: 'top_choice_required', source });
+        } else {
+          logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Application error');
+          await screenshotError(page, 'linkedin', jobId, config);
+          recordOutcome({ status: 'error', jobId: jobId || 'unknown', jobTitle, company, jobUrl, errorMessage: err.message, source });
+        }
       }
 
     }
@@ -1527,6 +1815,8 @@ module.exports = {
   buildLinkedInSearchUrl,
   summarizeResultCard,
   shouldApply,
+  isRemoteLocation,
+  fillShadowForm,
   hasLinkedInDailySubmissionLimitMessage,
   normalizeVisibleText,
   analyzeSearchPageState,

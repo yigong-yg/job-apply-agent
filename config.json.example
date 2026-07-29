@@ -25,7 +25,6 @@
     "gender": "[GENDER]",
     "race": "[RACE_ETHNICITY]",
     "desiredSalary": "[DESIRED_SALARY]",
-    "defaultPercentageAnswer": "[DEFAULT_PERCENTAGE_ANSWER]",
     "startDate": "[START_DATE]",
     "resumePath": "./resumes/resume.pdf"
   },
