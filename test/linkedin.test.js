@@ -517,6 +517,18 @@ test('buildApplyLinkSelector emits a comma-separated CSS selector covering all a
   assert(sel.split(',').length >= 2);
 });
 
+test('buildApplyLinkSelector matches the 2026-08-13 BUTTON variant of the apply control', () => {
+  // LinkedIn replaced the apply <a href=".../apply/..."> with
+  // <button aria-label="Easy Apply to this job">Easy Apply</button>
+  // (probe 2026-08-21). Anchor-only matching produced 9 days of
+  // no_easy_apply_button on every job (zero submissions 08-13 → 08-21).
+  const sel = buildApplyLinkSelector();
+  assert(sel.includes('button[aria-label="Easy Apply to this job"]'));
+  assert(sel.includes('button[aria-label="LinkedIn Apply to this job"]'));
+  // The external-apply control must never match.
+  assert(!sel.includes('Apply on company website'));
+});
+
 // ── Summary ──
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

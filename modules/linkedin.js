@@ -23,7 +23,8 @@
 const path = require('path');
 const fs = require('fs');
 const { sleep } = require('../lib/humanize');
-const { fillForm, retryInvalidFields } = require('../lib/form-filler');
+const { fillForm, retryInvalidFields, findAnswer, normalizeLabel, inferByRules } = require('../lib/form-filler');
+const { generateAnswer } = require('../lib/llm');
 const { recordUnfilledField, recordFillAudit } = require('../lib/state');
 const { queueAppNotification } = require('../lib/notify');
 const { guardAnswer, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
@@ -31,15 +32,17 @@ const { validateAnswer, VALIDATOR_PATTERN_SOURCES } = require('../lib/output-val
 
 const SELECTOR_TIMEOUT = 10000;
 
-// ── Apply-link aria-labels ──
+// ── Apply-control aria-labels ──
 //
-// LinkedIn renamed the apply-link aria-label from "Easy Apply to this job"
-// to "LinkedIn Apply to this job" as part of the same redesign that broke
-// card discovery (probe captured 2026-04-30 — the new link is an
-// <a aria-label="LinkedIn Apply to this job"
-//    href=".../jobs/view/{N}/apply/?openSDUIApplyFlow=true&...">). The
-// legacy label stays in the registry for a few weeks in case LinkedIn is
-// mid-rollout — neither matches a filter pill, so listing both is safe.
+// LinkedIn has churned this control twice:
+// - 2026-04-26: <a aria-label="Easy Apply to this job"> renamed to
+//   <a aria-label="LinkedIn Apply to this job" href=".../apply/?openSDUIApplyFlow=...">
+// - 2026-08-13: the anchor became a BUTTON with the legacy label restored —
+//   <button aria-label="Easy Apply to this job" type="button">Easy Apply</button>
+//   (probe captured 2026-08-21; no apply anchor exists anywhere on the page).
+//   Anchor-only matching produced 9 days of no_easy_apply_button on every job.
+// Match both tags for every known label. External-apply jobs render
+// <button aria-label="Apply on company website"> and must NOT match.
 const APPLY_LINK_ARIA_LABELS = [
   'LinkedIn Apply to this job',
   'Easy Apply to this job',
@@ -47,7 +50,7 @@ const APPLY_LINK_ARIA_LABELS = [
 
 function buildApplyLinkSelector() {
   return APPLY_LINK_ARIA_LABELS
-    .map(label => `a[aria-label="${label}"]`)
+    .map(label => `a[aria-label="${label}"], button[aria-label="${label}"]`)
     .join(', ');
 }
 
@@ -888,12 +891,16 @@ async function extractSelectedJobDetail(page) {
       }
     }
 
-    // Apply link — try both the new "LinkedIn Apply to this job" aria-label
-    // (2026-04-26+) and the legacy "Easy Apply to this job" for safety.
-    const easyApplyLink = document.querySelector(
-      'a[aria-label="LinkedIn Apply to this job"], a[aria-label="Easy Apply to this job"]'
+    // Apply control — since 2026-08-13 a <button aria-label="Easy Apply to
+    // this job"> with no href; before that an <a> with an /apply/ href.
+    // Match both tags and both known labels; expose a presence flag since
+    // the button variant carries no href.
+    const easyApplyControl = document.querySelector(
+      'a[aria-label="LinkedIn Apply to this job"], a[aria-label="Easy Apply to this job"], ' +
+      'button[aria-label="LinkedIn Apply to this job"], button[aria-label="Easy Apply to this job"]'
     );
-    const easyApplyHref = easyApplyLink ? easyApplyLink.href : null;
+    const easyApplyHref = (easyApplyControl && easyApplyControl.href) || null;
+    const hasEasyApply = !!easyApplyControl;
 
     // Extract job ID from Easy Apply href as fallback
     if (!jobId && easyApplyHref) {
@@ -934,7 +941,7 @@ async function extractSelectedJobDetail(page) {
 
     const jobUrl = jobId ? `https://www.linkedin.com/jobs/view/${jobId}` : null;
 
-    return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, description };
+    return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, hasEasyApply, description };
   }).catch(() => null);
 
   // Also try getting jobId from the top-level page URL (more reliable)
@@ -999,6 +1006,156 @@ async function enterEasyApply(page, logger) {
  * "Apply flow cycled — unfilled required fields" (regression observed
  * during the 2026-04-30 dry-run on kadence ML Researcher 4408212119).
  */
+// ── 2026-08 dialog UI: custom radio-group questions ──
+//
+// Screener questions render as a <p> question text followed by
+// <fieldset role="radiogroup"> holding div[role="radio"] options
+// (aria-label "Yes"/"No", aria-checked). The native input[type=radio]
+// inside each option is INVISIBLE, so fillForm's radio tier never sees
+// these — every questionnaire page jammed with "This field is required".
+// Answers resolve through the standard tiers (guard → defaultAnswers →
+// rules → budgeted LLM) and must match an option label to be clicked.
+
+const DEGREE_RANKS = [
+  [/high school|ged/, 0],
+  [/associate/, 1],
+  [/bachelor|b\.?s\.?\b|undergraduate/, 2],
+  [/master|m\.?s\.?\b|mba/, 3],
+  [/ph\.?d|doctor/, 4],
+];
+
+function degreeRank(text) {
+  const t = String(text || '').toLowerCase();
+  for (const [re, rank] of DEGREE_RANKS) {
+    if (re.test(t)) return rank;
+  }
+  return -1;
+}
+
+function isYesNoOptionSet(labels) {
+  const set = labels.map(l => l.trim().toLowerCase()).sort().join('|');
+  return set === 'no|yes';
+}
+
+async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options = {}) {
+  const flatAnswers = defaultAnswers.defaultAnswers || defaultAnswers;
+  const runId = options.runId || null;
+
+  // Phase A (in-page): collect unanswered groups, tag options for clicking.
+  const groups = await page.evaluate(() => {
+    const found = [];
+    let gi = 0;
+    for (const dlg of document.querySelectorAll('dialog')) {
+      if (!/pages/.test(dlg.innerText || '')) continue;
+      for (const grp of dlg.querySelectorAll('[role="radiogroup"]')) {
+        const opts = [...grp.querySelectorAll('[role="radio"]')];
+        if (opts.length === 0) continue;
+        if (opts.some(o => o.getAttribute('aria-checked') === 'true')) continue;
+        // Question text: nearest non-empty preceding sibling of the group
+        let q = grp.previousElementSibling;
+        while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
+        const question = q ? q.textContent.trim() : (grp.getAttribute('aria-label') || '');
+        const optionInfos = opts.map((o, oi) => {
+          const tag = `agent-radio-${gi}-${oi}`;
+          o.setAttribute('data-agent-radio', tag);
+          return { tag, label: (o.getAttribute('aria-label') || o.innerText || '').trim() };
+        });
+        found.push({ question, options: optionInfos });
+        gi++;
+      }
+    }
+    return found;
+  }).catch(() => []);
+
+  let filled = 0;
+  for (const group of groups) {
+    if (!group.question || group.options.length === 0) continue;
+    const optionLabels = group.options.map(o => o.label);
+    const label = group.question.substring(0, 200);
+
+    let answer = null;
+    let source = null;
+    let confidence = null;
+
+    const guard = guardAnswer(group.question, { config, defaultAnswers: flatAnswers });
+    if (guard.action === 'block') {
+      logger.info({ platform: 'linkedin', jobId, question: label.substring(0, 80), questionClass: guard.questionClass }, 'Guard blocked dialog radio group');
+      recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: 'cannot_fill', answer: '', confidence: `guard:${guard.reason}` });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+      continue;
+    }
+    if (guard.action === 'answer') {
+      answer = guard.answer;
+      source = guard.source;
+      confidence = 'guard_config';
+      // "Have you completed <degree>?" answers from config highestEducation,
+      // but the options are Yes/No. Map honestly by degree ordering.
+      if (isYesNoOptionSet(optionLabels) && !/^(yes|no)$/i.test(String(answer).trim())) {
+        const asked = degreeRank(group.question);
+        const have = degreeRank(answer);
+        if (guard.questionClass === 'education_facts' && asked >= 0 && have >= 0) {
+          answer = have >= asked ? 'Yes' : 'No';
+        }
+      }
+    }
+
+    const normalLabel = normalizeLabel(group.question);
+    const matchOption = (value) => {
+      if (value === null || value === undefined) return null;
+      const v = String(value).trim().toLowerCase();
+      if (!v) return null;
+      return group.options.find(o => o.label.toLowerCase() === v)
+        || group.options.find(o => o.label.toLowerCase().includes(v) || v.includes(o.label.toLowerCase()))
+        || null;
+    };
+
+    let chosen = matchOption(answer);
+
+    // Unguarded fallthrough: first tier whose answer maps onto an option.
+    if (!chosen && guard.action !== 'answer') {
+      const fuzzy = findAnswer(normalLabel, flatAnswers);
+      chosen = matchOption(fuzzy);
+      if (chosen) { source = 'defaultAnswers'; confidence = 'fuzzy'; }
+      if (!chosen) {
+        const rule = inferByRules(normalLabel, group.question, 'radio', config);
+        chosen = rule ? matchOption(rule.answer) : null;
+        if (chosen) { source = rule.rule; confidence = 'rule'; }
+      }
+      if (!chosen && options.llmCache && options.llmBudget && options.llmBudget.callsRemaining > 0) {
+        const prompt = `${group.question}\n\n[Answer by choosing EXACTLY ONE option. Reply with only the option text: ${optionLabels.join(' | ')}]`;
+        const t0 = Date.now();
+        const llmAnswer = await generateAnswer(prompt, options.jobContext || {}, options.llmCache, logger, 'short');
+        options.llmBudget.callsRemaining--;
+        options.llmBudget.msRemaining -= Date.now() - t0;
+        if (llmAnswer && validateAnswer(llmAnswer, { label: group.question, fieldType: 'radio' }).ok) {
+          chosen = matchOption(llmAnswer);
+          if (chosen) { source = 'llm:radio'; confidence = 'llm'; }
+        }
+      }
+    }
+
+    if (!chosen) {
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), answer: answer ? String(answer).substring(0, 40) : null, options: optionLabels }, 'No matching option for dialog radio group');
+      continue;
+    }
+
+    const clicked = await page.locator(`dialog [data-agent-radio="${chosen.tag}"]`).first()
+      .evaluate(el => { el.click(); return true; }).catch(() => false);
+    if (clicked) {
+      filled++;
+      recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: source || 'unknown', answer: chosen.label, confidence });
+      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), answer: chosen.label, source }, 'Filled dialog radio group');
+      await sleep(300, 700);
+    }
+  }
+
+  if (groups.length > 0) {
+    logger.info({ platform: 'linkedin', jobId, groups: groups.length, filled }, 'Dialog radio groups processed');
+  }
+  return { groups: groups.length, filled };
+}
+
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
@@ -1021,15 +1178,36 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
     await fillForm(page, defaultAnswers, config, logger, 'linkedin', jobId, options);
   } catch (_) {}
 
+  // ── Custom radio-group questions (2026-08 dialog UI) ──
+  // Invisible native inputs make these unreachable for fillForm.
+  try {
+    await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options);
+  } catch (_) {}
+
   await sleep(500, 1000);
 
-  // ── Find and click the action button inside shadow DOM ──
+  // ── Find and click the action button ──
   // Playwright's locator() pierces shadow DOM automatically.
+  // 2026-08-13 redesign: the apply flow moved out of the interop shadow into
+  // a page-level <dialog> whose action buttons carry NO aria-label — just
+  // text ("Next", "Review", "Submit application"). The results pagination
+  // also has a "Next" button, so text matches MUST be dialog-scoped.
+  // Plain 'dialog' scope, deliberately NOT 'dialog:visible': the :visible
+  // variant made every flow stall on Next in the 2026-08-21 dry-run (clicks
+  // resolved against a different node than the working plain-scoped locator),
+  // while buttonSpecs' own isVisible() check already rejects hidden matches.
+  const dialog = page.locator('dialog');
   const buttonSpecs = [
     { locator: page.locator('button[aria-label="Submit application"]'), action: 'submit' },
     { locator: page.locator('#interop-outlet button:has-text("Submit application")'), action: 'submit' },
+    { locator: dialog.getByRole('button', { name: 'Submit application', exact: true }), action: 'submit' },
+    { locator: dialog.getByRole('button', { name: 'Submit', exact: true }), action: 'submit' },
     { locator: page.locator('button[aria-label="Review your application"]'), action: 'next' },
     { locator: page.locator('button[aria-label="Continue to next step"]'), action: 'next' },
+    { locator: dialog.getByRole('button', { name: 'Review your application', exact: true }), action: 'next' },
+    { locator: dialog.getByRole('button', { name: 'Review', exact: true }), action: 'next' },
+    { locator: dialog.getByRole('button', { name: 'Next', exact: true }), action: 'next' },
+    { locator: dialog.getByRole('button', { name: 'Continue', exact: true }), action: 'next' },
     { locator: page.locator('#interop-outlet button:has-text("Next")'), action: 'next' },
     { locator: page.locator('#interop-outlet button:has-text("Review")'), action: 'next' },
     { locator: page.locator('#interop-outlet button:has-text("Continue")'), action: 'next' },
@@ -1077,29 +1255,35 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   await btn.evaluate(e => e.click());
   await sleep(1000, 1500);
 
-  // Check for validation errors inside shadow DOM
+  // Check for validation errors — the form lives in the interop shadow root
+  // (pre-2026-08-13) or a page-level <dialog> (post-redesign).
   const postClickErrors = await page.evaluate(() => {
+    const roots = [];
     const interop = document.querySelector('#interop-outlet');
-    if (!interop || !interop.shadowRoot) return [];
-    const sr = interop.shadowRoot;
+    if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
+    for (const dlg of document.querySelectorAll('dialog')) roots.push(dlg);
     const errs = [];
-    for (const el of sr.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
-      const t = (el.textContent || '').trim();
-      if (t && t.length > 3 && !t.includes('Required')) errs.push(t.substring(0, 100));
+    for (const root of roots) {
+      for (const el of root.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
+        const t = (el.textContent || '').trim();
+        if (t && t.length > 3 && !t.includes('Required')) errs.push(t.substring(0, 100));
+      }
+      // Also check for "Please enter a valid answer" pattern
+      const allText = root.textContent || '';
+      if (allText.includes('Please enter a valid answer')) errs.push('Please enter a valid answer');
     }
-    // Also check for "Please enter a valid answer" pattern
-    const allText = sr.textContent || '';
-    if (allText.includes('Please enter a valid answer')) errs.push('Please enter a valid answer');
     return errs;
   }).catch(() => []);
 
   if (postClickErrors.length > 0) {
     // ── Structured diagnostics for validation failures ──
     const fieldDiag = await page.evaluate(() => {
+      const roots = [];
       const interop = document.querySelector('#interop-outlet');
-      if (!interop || !interop.shadowRoot) return [];
-      const sr = interop.shadowRoot;
+      if (interop && interop.shadowRoot) roots.push({ root: interop.shadowRoot, inShadow: true });
+      for (const dlg of document.querySelectorAll('dialog')) roots.push({ root: dlg, inShadow: false });
       const fields = [];
+      for (const { root: sr, inShadow } of roots) {
       for (const el of sr.querySelectorAll('input, select, textarea')) {
         const rect = el.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
@@ -1113,7 +1297,7 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
           hasValue: !!(el.value && el.value.trim()),
           valueLen: (el.value || '').length,
           hasError: !!hasError,
-          inShadow: true,
+          inShadow,
         });
       }
       // Also check radio groups — fieldset first: closest('fieldset, div, li')
@@ -1123,8 +1307,9 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
         const legend = parent?.querySelector('legend') || parent?.querySelector('label');
         const groupLabel = legend ? legend.textContent.trim().substring(0, 80) : '';
         if (groupLabel && !fields.some(f => f.label === groupLabel)) {
-          fields.push({ tag: 'INPUT', type: 'radio', label: groupLabel, hasValue: radio.checked, valueLen: 0, hasError: false, inShadow: true });
+          fields.push({ tag: 'INPUT', type: 'radio', label: groupLabel, hasValue: radio.checked, valueLen: 0, hasError: false, inShadow });
         }
+      }
       }
       return fields;
     }).catch(() => []);
@@ -1143,8 +1328,10 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       await sleep(1000, 1500);
       const stillErrors = await page.evaluate(() => {
         const interop = document.querySelector('#interop-outlet');
-        if (!interop || !interop.shadowRoot) return false;
-        return interop.shadowRoot.textContent.includes('Please enter a valid answer');
+        if (interop && interop.shadowRoot &&
+            interop.shadowRoot.textContent.includes('Please enter a valid answer')) return true;
+        for (const dlg of document.querySelectorAll('dialog')) { if ((dlg.textContent || '').includes('Please enter a valid answer')) return true; }
+        return false;
       }).catch(() => false);
       if (stillErrors) return 'retry_failed';
       return 'next';
@@ -1450,7 +1637,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         }
 
         // ── Step 6: Enter Easy Apply ──
-        if (!detail.easyApplyHref) {
+        // hasEasyApply covers the 2026-08-13 button variant (no href).
+        if (!detail.easyApplyHref && !detail.hasEasyApply) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'no_easy_apply_button' }, 'Skipping');
           recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
           continue;
@@ -1497,15 +1685,19 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         while (!applyComplete && stepCount < MAX_STEPS) {
           stepCount++;
 
-          // Fingerprint step by labels in the shadow DOM apply form
+          // Fingerprint step by labels in the apply form (interop shadow
+          // pre-2026-08-13, page-level <dialog> after the redesign).
           const fingerprint = await page.evaluate(() => {
-            const interop = document.querySelector('#interop-outlet');
-            const sr = interop?.shadowRoot;
-            if (!sr) return '';
+            const roots = [];
+            const sr = document.querySelector('#interop-outlet')?.shadowRoot;
+            if (sr) roots.push(sr);
+            for (const dlg of document.querySelectorAll('dialog')) roots.push(dlg);
             const labels = [];
-            for (const lbl of sr.querySelectorAll('label, legend')) {
-              const t = (lbl.textContent || '').trim().substring(0, 60);
-              if (t) labels.push(t);
+            for (const root of roots) {
+              for (const lbl of root.querySelectorAll('label, legend')) {
+                const t = (lbl.textContent || '').trim().substring(0, 60);
+                if (t) labels.push(t);
+              }
             }
             return labels.sort().join('||');
           }).catch(() => '');
@@ -1520,13 +1712,17 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             // unanswerable question (spec R14 — user decides, see spec
             // open question 4).
             const topChoiceBlocked = await page.evaluate(() => {
+              const roots = [];
               const sr = document.querySelector('#interop-outlet')?.shadowRoot;
-              if (!sr) return false;
-              for (const cb of sr.querySelectorAll('input[type="checkbox"]')) {
-                if (cb.checked) continue;
-                const label = cb.id ? sr.querySelector(`label[for="${cb.id}"]`) : null;
-                const t = (label?.textContent || '').toLowerCase();
-                if (t.includes('top choice') || (t.includes('mark') && t.includes('job'))) return true;
+              if (sr) roots.push(sr);
+              for (const dlg of document.querySelectorAll('dialog')) roots.push(dlg);
+              for (const root of roots) {
+                for (const cb of root.querySelectorAll('input[type="checkbox"]')) {
+                  if (cb.checked) continue;
+                  const label = cb.id ? root.querySelector(`label[for="${cb.id}"]`) : null;
+                  const t = (label?.textContent || '').toLowerCase();
+                  if (t.includes('top choice') || (t.includes('mark') && t.includes('job'))) return true;
+                }
               }
               return false;
             }).catch(() => false);
