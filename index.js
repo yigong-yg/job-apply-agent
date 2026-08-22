@@ -232,6 +232,24 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
 }
 
 /**
+ * Session expiry is silent death: the agent skipped 2026-07-17 → 07-24 while
+ * the launcher logged success every night. Alert loudly, but only once per
+ * Denver day — the launcher retries all evening and each retry lands here.
+ */
+async function alertSessionExpired(platform) {
+  const denverDay = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Denver' });
+  const marker = path.join(__dirname, 'logs', `.session-expiry-alerted-${denverDay}`);
+  if (fs.existsSync(marker)) return;
+  try { fs.writeFileSync(marker, new Date().toISOString()); } catch (_) {}
+  await sendDiscordMessage(
+    `🔑 **${platform} session expired** — no applications can be submitted. ` +
+    `Re-login with \`node setup.js --platform ${platform}\`. ` +
+    `The launcher keeps retrying tonight and picks up automatically after re-login.`,
+    logger
+  );
+}
+
+/**
  * Ensure all required directories exist.
  */
 function ensureDirectories() {
@@ -325,6 +343,8 @@ async function main() {
 
   // Process each platform sequentially
   let stopSessionRequested = false;
+  const sessionExpiredPlatforms = [];
+  let platformCrashed = false;
   for (const platform of enabledPlatforms) {
     const platformLogger = logger.child({ platform });
     platformLogger.info('Processing platform');
@@ -350,6 +370,8 @@ async function main() {
           `Session expired for ${platform}. Skipping. Run: node setup.js --platform ${platform}`
         );
         runStats[platform] = null; // Mark as skipped due to session
+        sessionExpiredPlatforms.push(platform);
+        await alertSessionExpired(platform);
         continue;
       }
 
@@ -371,7 +393,12 @@ async function main() {
 
     } catch (err) {
       platformLogger.error({ error: err.message, stack: err.stack }, 'Unexpected platform error');
-      runStats[platform] = { applied: 0, skipped: 0, errors: 1 };
+      // Preserve DB-accurate partial progress: the old zeroed fallback made a
+      // run that submitted 23 applications before crashing report applied: 0
+      // to Discord (run 3c3ccbbf, 2026-07-28).
+      const dbCounts = state.getRunStats(runId)[platform] || { applied: 0, skipped: 0, errors: 0 };
+      runStats[platform] = { ...dbCounts, crashed: true, crashError: err.message };
+      platformCrashed = true;
 
     } finally {
       if (context) {
@@ -429,6 +456,11 @@ async function main() {
     scanned: totalScanned,
   }, logger);
 
+  // Exit codes the launcher can act on: 3 = session expired (retry + human
+  // re-login needed), 1 = platform crashed mid-run (retry recovers budget;
+  // dedup prevents double submissions), 0 = clean run incl. daily-limit stop.
+  if (sessionExpiredPlatforms.length > 0) process.exit(3);
+  if (platformCrashed) process.exit(1);
   process.exit(0);
 }
 

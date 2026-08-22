@@ -143,5 +143,23 @@ test('trims surrounding whitespace on accept', () => {
   assert.strictEqual(r.answer, 'Springfield');
 });
 
+// ── Refusal sentinel ──
+// "Address Line 1" → "CANNOT_ANSWER" was audited as a fill on 2026-07-10:
+// the sentinel is an instruction to leave the field empty, never a value.
+
+test('rejects the CANNOT_ANSWER refusal sentinel', () => {
+  const r = validateAnswer('CANNOT_ANSWER', { label: 'Address Line 1' });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'refusal_sentinel');
+});
+
+test('rejects refusal sentinel case-insensitively with trailing text', () => {
+  assert.strictEqual(validateAnswer('cannot_answer: no data', { label: 'County' }).ok, false);
+});
+
+test('does not reject prose that merely contains cannot', () => {
+  assert.strictEqual(validateAnswer('I cannot start before June', { label: 'Start date notes' }).ok, true);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

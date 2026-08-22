@@ -183,10 +183,15 @@ try {
 }
 
 if ($UseAutorunState) {
+  # exitCode 3 = platform session expired (index.js). Never 'success': later
+  # triggers must keep retrying so the run recovers once the user re-logs in.
+  $result = 'failure'
+  if ($exitCode -eq 0) { $result = 'success' }
+  elseif ($exitCode -eq 3) { $result = 'session_expired' }
   $finalState = @{
     lastScheduledDateDenver = $scheduledDateDenver
     lastLaunchUtc = $startState.lastLaunchUtc
-    lastResult = if ($exitCode -eq 0) { 'success' } else { 'failure' }
+    lastResult = $result
     lastExitCode = $exitCode
   }
   Write-AutorunState -State $finalState
@@ -194,6 +199,8 @@ if ($UseAutorunState) {
 
 if ($exitCode -eq 0) {
   Write-LauncherLog ("Launcher completed successfully with exitCode={0}" -f $exitCode) 'INFO'
+} elseif ($exitCode -eq 3) {
+  Write-LauncherLog "Platform session expired (exitCode=3); re-login required. Retries continue until re-login or window end." 'WARN'
 } else {
   Write-LauncherLog ("Launcher failed with exitCode={0}" -f $exitCode) 'ERROR'
 }
