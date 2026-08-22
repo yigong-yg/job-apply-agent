@@ -12,6 +12,8 @@ const {
   isJobCardText,
   APPLY_LINK_ARIA_LABELS,
   buildApplyLinkSelector,
+  mapEducationAnswerToYesNo,
+  matchDialogRadioOption,
 } = require('../modules/linkedin');
 
 let passed = 0;
@@ -562,6 +564,28 @@ test('buildApplyLinkSelector matches the 2026-08-13 BUTTON variant of the apply 
   assert(sel.includes('button[aria-label="LinkedIn Apply to this job"]'));
   // The external-apply control must never match.
   assert(!sel.includes('Apply on company website'));
+});
+
+test('education rank maps only explicit thresholds to Yes', () => {
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have at least a bachelor degree?', "Master's Degree"),
+    'Yes'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Is an associate degree your highest education level?', "Master's Degree"),
+    'No'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have a bachelor degree?', "Master's Degree"),
+    null
+  );
+});
+
+test('dialog option matching does not confuse short numeric choices', () => {
+  const options = ['0', '1', '2', '10+'].map((label) => ({ label }));
+  assert.strictEqual(matchDialogRadioOption(options, '10'), null);
+  assert.strictEqual(matchDialogRadioOption(options, '1').label, '1');
+  assert.strictEqual(matchDialogRadioOption(options, '10+').label, '10+');
 });
 
 // ── Summary ──

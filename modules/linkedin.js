@@ -1172,6 +1172,44 @@ function isYesNoOptionSet(labels) {
   return set === 'no|yes';
 }
 
+function mapEducationAnswerToYesNo(question, configuredEducation) {
+  const asked = degreeRank(question);
+  const have = degreeRank(configuredEducation);
+  if (asked < 0 || have < 0) return null;
+
+  const q = String(question || '').toLowerCase();
+  const isThreshold = /\b(?:at least|or higher|or above|minimum(?:\s+(?:of|required|requirement))?)\b/.test(q);
+  if (isThreshold) return have >= asked ? 'Yes' : 'No';
+
+  // "Highest education" is an exact-level question, not a threshold.
+  if (/\bhighest\b/.test(q)) return have === asked ? 'Yes' : 'No';
+
+  // Exact matches and a configured highest level below the requested level
+  // are safe. A higher rank does not prove that every intermediate degree
+  // was separately awarded, so leave that case unanswered.
+  if (have === asked) return 'Yes';
+  if (have < asked) return 'No';
+  return null;
+}
+
+function matchDialogRadioOption(options, value) {
+  if (value === null || value === undefined) return null;
+  const v = String(value).trim().toLowerCase();
+  if (!v) return null;
+
+  const exact = options.find(o => String(o.label || '').trim().toLowerCase() === v);
+  if (exact) return exact;
+
+  // Substring matching is unsafe for numeric/short choices: answer "10"
+  // otherwise matches option "0" or "1" before an exact/range choice.
+  if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(v) || v.length < 3) return null;
+  return options.find((o) => {
+    const label = String(o.label || '').trim().toLowerCase();
+    if (label.length < 3 || /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(label)) return false;
+    return label.includes(v) || v.includes(label);
+  }) || null;
+}
+
 async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options = {}) {
   const flatAnswers = defaultAnswers.defaultAnswers || defaultAnswers;
   const runId = options.runId || null;
@@ -1180,6 +1218,12 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
   const groups = await page.evaluate(() => {
     const found = [];
     let gi = 0;
+    // The dialog retains completed/hidden page templates. Remove tags from
+    // prior passes so a reused agent-radio-0-* marker cannot resolve to an
+    // already-answered field from an earlier step.
+    for (const stale of document.querySelectorAll('dialog [data-agent-radio]')) {
+      stale.removeAttribute('data-agent-radio');
+    }
     for (const dlg of document.querySelectorAll('dialog')) {
       if (!/pages/.test(dlg.innerText || '')) continue;
       for (const grp of dlg.querySelectorAll('[role="radiogroup"]')) {
@@ -1214,6 +1258,7 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
 
     const guard = guardAnswer(group.question, { config, defaultAnswers: flatAnswers });
     if (guard.action === 'block') {
+      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
       logger.info({ platform: 'linkedin', jobId, question: label.substring(0, 80), questionClass: guard.questionClass }, 'Guard blocked dialog radio group');
       recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: 'cannot_fill', answer: '', confidence: `guard:${guard.reason}` });
       recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
@@ -1223,26 +1268,18 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
       answer = guard.answer;
       source = guard.source;
       confidence = 'guard_config';
-      // "Have you completed <degree>?" answers from config highestEducation,
-      // but the options are Yes/No. Map honestly by degree ordering.
+      // Education config stores the highest level as text, while some forms
+      // expose Yes/No. Only use rank ordering for explicit threshold wording;
+      // a higher degree does not prove every intermediate degree was awarded.
       if (isYesNoOptionSet(optionLabels) && !/^(yes|no)$/i.test(String(answer).trim())) {
-        const asked = degreeRank(group.question);
-        const have = degreeRank(answer);
-        if (guard.questionClass === 'education_facts' && asked >= 0 && have >= 0) {
-          answer = have >= asked ? 'Yes' : 'No';
+        if (guard.questionClass === 'education_facts') {
+          answer = mapEducationAnswerToYesNo(group.question, answer);
         }
       }
     }
 
     const normalLabel = normalizeLabel(group.question);
-    const matchOption = (value) => {
-      if (value === null || value === undefined) return null;
-      const v = String(value).trim().toLowerCase();
-      if (!v) return null;
-      return group.options.find(o => o.label.toLowerCase() === v)
-        || group.options.find(o => o.label.toLowerCase().includes(v) || v.includes(o.label.toLowerCase()))
-        || null;
-    };
+    const matchOption = (value) => matchDialogRadioOption(group.options, value);
 
     let chosen = matchOption(answer);
 
@@ -1837,19 +1874,39 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         while (!applyComplete && stepCount < MAX_STEPS) {
           stepCount++;
 
-          // Fingerprint step by labels in the apply form (interop shadow
-          // pre-2026-08-13, page-level <dialog> after the redesign).
+          // Fingerprint the active form step. The dialog UI puts radio
+          // questions in a preceding <p>, not in label/legend, and retains
+          // hidden templates; include visible question/progress text only.
           const fingerprint = await page.evaluate(() => {
             const roots = [];
-            const sr = document.querySelector('#interop-outlet')?.shadowRoot;
-            if (sr) roots.push(sr);
-            for (const dlg of document.querySelectorAll('dialog')) roots.push(dlg);
+            const dialogs = [...document.querySelectorAll('dialog')];
+            const activeDialog = dialogs.find(d => d.hasAttribute('open')) || dialogs.find((d) => {
+              const rect = d.getBoundingClientRect();
+              const style = getComputedStyle(d);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            });
+            if (activeDialog) {
+              roots.push(activeDialog);
+            } else {
+              const sr = document.querySelector('#interop-outlet')?.shadowRoot;
+              if (sr) roots.push(sr);
+            }
             const labels = [];
             for (const root of roots) {
               for (const lbl of root.querySelectorAll('label, legend')) {
+                if (lbl.getClientRects().length === 0) continue;
                 const t = (lbl.textContent || '').trim().substring(0, 60);
                 if (t) labels.push(t);
               }
+              for (const group of root.querySelectorAll('[role="radiogroup"]')) {
+                if (group.getClientRects().length === 0) continue;
+                let q = group.previousElementSibling;
+                while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
+                const t = (q?.textContent || group.getAttribute('aria-label') || '').trim().substring(0, 120);
+                if (t) labels.push(t);
+              }
+              const progress = (root.innerText || '').match(/\b\d+\s*(?:\/|of)\s*\d+\s*pages?\b/i)?.[0];
+              if (progress) labels.push(progress);
             }
             return labels.sort().join('||');
           }).catch(() => '');
@@ -2011,6 +2068,9 @@ module.exports = {
   shouldApply,
   isRemoteLocation,
   fillShadowForm,
+  fillDialogRadioGroups,
+  mapEducationAnswerToYesNo,
+  matchDialogRadioOption,
   hasLinkedInDailySubmissionLimitMessage,
   normalizeVisibleText,
   analyzeSearchPageState,

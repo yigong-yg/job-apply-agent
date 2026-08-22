@@ -15,7 +15,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'job-agent-shadow-test-'));
 process.env.STATE_DB_PATH = path.join(tmpDir, 'test.db');
 
 const { chromium } = require('playwright');
-const { fillShadowForm } = require('../modules/linkedin');
+const { fillShadowForm, fillDialogRadioGroups } = require('../modules/linkedin');
 
 const noopLogger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -187,6 +187,60 @@ const SHADOW_HTML = `
   // ── Consent checkboxes still work ──
   check('agree/consent checkbox is checked', () => {
     assert.strictEqual(domState.agree, true);
+  });
+
+  // ── 2026-08 dialog radio groups ──
+  const dialogRadioGroup = (id, question) => `
+    <p>${question}</p>
+    <fieldset id="${id}" role="radiogroup">
+      <div role="radio" aria-label="Yes" aria-checked="false"
+           onclick="this.setAttribute('aria-checked', 'true')">Yes</div>
+      <div role="radio" aria-label="No" aria-checked="false"
+           onclick="this.setAttribute('aria-checked', 'true')">No</div>
+    </fieldset>`;
+
+  await page.setContent(`
+    <dialog open>
+      <div>1/2 pages</div>
+      ${dialogRadioGroup('dialog-relocate', 'Are you willing to relocate?')}
+    </dialog>`);
+  await fillDialogRadioGroups(page, defaultAnswers, config, noopLogger, 'dialog-job', {
+    runId: 'fixture-run',
+    guardBlockedLabels: new Set(),
+  });
+  await page.locator('dialog').evaluate((dialog, html) => {
+    dialog.insertAdjacentHTML('beforeend', html);
+  }, dialogRadioGroup('dialog-commute', 'Are you able to commute?'));
+  await fillDialogRadioGroups(page, defaultAnswers, config, noopLogger, 'dialog-job', {
+    runId: 'fixture-run',
+    guardBlockedLabels: new Set(),
+  });
+
+  const dialogCommuteChecked = await page.locator('#dialog-commute [role="radio"][aria-label="Yes"]')
+    .getAttribute('aria-checked');
+  check('dialog radio markers do not collide across retained form steps', () => {
+    assert.strictEqual(dialogCommuteChecked, 'true');
+  });
+
+  await page.setContent(`
+    <dialog open>
+      <div>1/1 pages</div>
+      ${dialogRadioGroup('dialog-military', 'Have you ever served in the military?')}
+    </dialog>`);
+  const guardBlockedLabels = new Set();
+  await fillDialogRadioGroups(page, defaultAnswers, { user: {} }, noopLogger, 'dialog-guard-job', {
+    runId: 'fixture-run',
+    guardBlockedLabels,
+  });
+
+  const guardedDialogSelected = await page.locator('#dialog-military [role="radio"][aria-checked="true"]').count();
+  check('guarded dialog radio is left unanswered', () => {
+    assert.strictEqual(guardedDialogSelected, 0);
+  });
+
+  check('guarded dialog radio is propagated for honest-skip classification', () => {
+    assert([...guardBlockedLabels].some((label) => label.includes('served in the military')),
+      `expected guarded question label, got: ${JSON.stringify([...guardBlockedLabels])}`);
   });
 
   await browser.close();
