@@ -23,7 +23,7 @@
 const path = require('path');
 const fs = require('fs');
 const { sleep } = require('../lib/humanize');
-const { fillForm, retryInvalidFields } = require('../lib/form-filler');
+const { fillForm, retryInvalidFields, normalizeLabel } = require('../lib/form-filler');
 const { recordUnfilledField, recordFillAudit } = require('../lib/state');
 const { queueAppNotification } = require('../lib/notify');
 const { guardAnswer, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
@@ -31,15 +31,17 @@ const { validateAnswer, VALIDATOR_PATTERN_SOURCES } = require('../lib/output-val
 
 const SELECTOR_TIMEOUT = 10000;
 
-// ── Apply-link aria-labels ──
+// ── Apply-control aria-labels ──
 //
-// LinkedIn renamed the apply-link aria-label from "Easy Apply to this job"
-// to "LinkedIn Apply to this job" as part of the same redesign that broke
-// card discovery (probe captured 2026-04-30 — the new link is an
-// <a aria-label="LinkedIn Apply to this job"
-//    href=".../jobs/view/{N}/apply/?openSDUIApplyFlow=true&...">). The
-// legacy label stays in the registry for a few weeks in case LinkedIn is
-// mid-rollout — neither matches a filter pill, so listing both is safe.
+// LinkedIn has churned this control twice:
+// - 2026-04-26: <a aria-label="Easy Apply to this job"> renamed to
+//   <a aria-label="LinkedIn Apply to this job" href=".../apply/?openSDUIApplyFlow=...">
+// - 2026-08-13: the anchor became a BUTTON with the legacy label restored —
+//   <button aria-label="Easy Apply to this job" type="button">Easy Apply</button>
+//   (probe captured 2026-08-21; no apply anchor exists anywhere on the page).
+//   Anchor-only matching produced 9 days of no_easy_apply_button on every job.
+// Match both tags for every known label. External-apply jobs render
+// <button aria-label="Apply on company website"> and must NOT match.
 const APPLY_LINK_ARIA_LABELS = [
   'LinkedIn Apply to this job',
   'Easy Apply to this job',
@@ -47,7 +49,7 @@ const APPLY_LINK_ARIA_LABELS = [
 
 function buildApplyLinkSelector() {
   return APPLY_LINK_ARIA_LABELS
-    .map(label => `a[aria-label="${label}"]`)
+    .map(label => `a[aria-label="${label}"], button[aria-label="${label}"]`)
     .join(', ');
 }
 
@@ -364,7 +366,7 @@ async function getApplyShadowRoot(page) {
  */
 const EMPTY_SHADOW_RESULT = () => ({
   filled: 0, unfilled: [], blocked: [], guardedPending: [], fills: [],
-  topChoice: { present: false, checked: false },
+  topChoice: { present: false, checked: false, policyBlocked: false },
 });
 
 async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
@@ -377,7 +379,7 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
   const result = await page.evaluate(({ answerMap, guardedSources, validatorPatterns, topChoicePolicy }) => {
     const interop = document.querySelector('#interop-outlet');
     if (!interop || !interop.shadowRoot) {
-      return { filled: 0, unfilled: [], blocked: [], guardedPending: [], fills: [], topChoice: { present: false, checked: false } };
+      return { filled: 0, unfilled: [], blocked: [], guardedPending: [], fills: [], topChoice: { present: false, checked: false, policyBlocked: false } };
     }
     const sr = interop.shadowRoot;
 
@@ -386,7 +388,7 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
     const blocked = [];
     const guardedPending = [];
     const fills = [];
-    const topChoice = { present: false, checked: false };
+    const topChoice = { present: false, checked: false, policyBlocked: false };
 
     // Keep in sync with lib/answer-policy.js normalize() — evaluate() cannot import it.
     function normalizeQ(s) {
@@ -412,6 +414,19 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
 
     // Helper: find label text for a form element
     function getLabelText(el) {
+      const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+      if (ariaLabel) return ariaLabel;
+      const labelledBy = String(el.getAttribute('aria-labelledby') || '').trim();
+      if (labelledBy) {
+        const parts = [];
+        for (const refId of labelledBy.split(/\s+/)) {
+          const ref = [...sr.querySelectorAll('[id]')]
+            .find((candidate) => candidate.getAttribute('id') === refId);
+          const text = (ref?.textContent || '').trim();
+          if (text) parts.push(text);
+        }
+        if (parts.length > 0) return parts.join(' ');
+      }
       const id = el.id;
       if (id) {
         const label = sr.querySelector(`label[for="${id}"]`);
@@ -575,19 +590,32 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
     for (const cb of sr.querySelectorAll('input[type="checkbox"]')) {
       const labelText = getLabelText(cb) || '';
       const labelLower = labelText.toLowerCase();
-      const isTopChoice = labelLower.includes('top choice') ||
-        (labelLower.includes('mark') && labelLower.includes('job'));
+      const isTopChoice = /\btop choice\b/.test(labelLower);
 
       if (isTopChoice) {
         // LinkedIn's boost checkbox. Policy-driven (spec R14): default is
         // 'never' — do not consume Top Choice credits. 'always' opts in.
         topChoice.present = true;
-        if (topChoicePolicy === 'always' && !cb.checked) {
+        if (topChoicePolicy === 'always') {
+          if (!cb.checked) {
+            cb.click();
+            if (cb.checked) {
+              filled++;
+              fills.push({ label: labelText, type: 'checkbox', answer: 'checked', source: 'platform_policy:top_choice', matchType: 'policy_always' });
+            } else {
+              topChoice.policyBlocked = true;
+            }
+          }
+        } else if (cb.checked) {
+          // LinkedIn may preselect a boost. `never` is an active prohibition,
+          // so clear it and refuse to continue if the controlled UI rejects
+          // the change.
           cb.click();
-          cb.checked = true;
-          cb.dispatchEvent(new Event('change', { bubbles: true }));
-          filled++;
-          fills.push({ label: labelText, type: 'checkbox', answer: 'checked', source: 'platform_policy:top_choice', matchType: 'policy_always' });
+          if (cb.checked) {
+            topChoice.policyBlocked = true;
+          } else {
+            fills.push({ label: labelText, type: 'checkbox', answer: 'unchecked', source: 'platform_policy:top_choice', matchType: 'policy_never_correction' });
+          }
         }
         topChoice.checked = cb.checked;
         continue;
@@ -982,12 +1010,29 @@ async function extractSelectedJobDetail(page) {
       }
     }
 
-    // Apply link — try both the new "LinkedIn Apply to this job" aria-label
-    // (2026-04-26+) and the legacy "Easy Apply to this job" for safety.
-    const easyApplyLink = document.querySelector(
-      'a[aria-label="LinkedIn Apply to this job"], a[aria-label="Easy Apply to this job"]'
-    );
-    const easyApplyHref = easyApplyLink ? easyApplyLink.href : null;
+    // Apply control — since 2026-08-13 a <button aria-label="Easy Apply to
+    // this job"> with no href; before that an <a> with an /apply/ href.
+    // Match both tags and both known labels; expose a presence flag since
+    // the button variant carries no href.
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0 ||
+          rect.left >= innerWidth || rect.top >= innerHeight) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    const easyApplyControl = [...document.querySelectorAll(
+      'a[aria-label="LinkedIn Apply to this job"], a[aria-label="Easy Apply to this job"], ' +
+      'button[aria-label="LinkedIn Apply to this job"], button[aria-label="Easy Apply to this job"]'
+    )].find(isVisible) || null;
+    const easyApplyHref = (easyApplyControl && easyApplyControl.href) || null;
+    const hasEasyApply = !!easyApplyControl;
 
     // Extract job ID from Easy Apply href as fallback
     if (!jobId && easyApplyHref) {
@@ -1028,7 +1073,7 @@ async function extractSelectedJobDetail(page) {
 
     const jobUrl = jobId ? `https://www.linkedin.com/jobs/view/${jobId}` : null;
 
-    return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, description };
+    return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, hasEasyApply, description };
   }).catch(() => null);
 
   // Also try getting jobId from the top-level page URL (more reliable)
@@ -1052,17 +1097,16 @@ async function extractSelectedJobDetail(page) {
 async function enterEasyApply(page, logger) {
   // Try the Apply link. Post-2026-04-26 the aria-label is "LinkedIn Apply
   // to this job"; pre-2026-04-26 it was "Easy Apply to this job".
-  // Use .first() — LinkedIn can render duplicate links for the same job.
-  const easyApplyLink = page.locator(buildApplyLinkSelector()).first();
-  if (await easyApplyLink.count() > 0) {
+  const easyApplyLink = await firstVisibleLocator(page.locator(buildApplyLinkSelector()));
+  if (easyApplyLink) {
     await easyApplyLink.click({ force: true });
     await sleep(2000, 3000);
     return 'entered';
   }
 
   // Fallback: try button-based Easy Apply (old UI or A/B variant)
-  const easyApplyBtn = page.locator('button:has-text("Easy Apply")').first();
-  if (await easyApplyBtn.count() > 0) {
+  const easyApplyBtn = await firstVisibleLocator(page.locator('button:has-text("Easy Apply")'));
+  if (easyApplyBtn) {
     const text = await easyApplyBtn.innerText().catch(() => '');
     if (text.toLowerCase().includes('applied')) return 'already_applied';
     await easyApplyBtn.click({ force: true });
@@ -1074,10 +1118,25 @@ async function enterEasyApply(page, logger) {
 }
 
 async function collectApplyValidationErrors(page) {
+  await markActiveApplyDialog(page);
   return page.evaluate(() => {
+    const roots = [];
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    const activeDialog = document.querySelector('dialog[data-agent-active-apply="true"]');
     const interop = document.querySelector('#interop-outlet');
-    if (!interop || !interop.shadowRoot) return [];
-    const sr = interop.shadowRoot;
+    if (activeDialog) roots.push(activeDialog);
+    else if (interop && interop.shadowRoot) roots.push(interop.shadowRoot);
     const errors = [];
 
     function add(text) {
@@ -1087,14 +1146,6 @@ async function collectApplyValidationErrors(page) {
       }
     }
 
-    for (const el of sr.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
-      add(el.textContent || '');
-    }
-
-    const asciiText = (sr.textContent || '')
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .toLowerCase();
     const validationSignals = [
       'please enter a valid answer',
       'please make a selection',
@@ -1103,12 +1154,238 @@ async function collectApplyValidationErrors(page) {
       'veuillez saisir une reponse valable',
       'effectuez une selection',
     ];
-    for (const signal of validationSignals) {
-      if (asciiText.includes(signal)) add(signal);
+    for (const root of roots) {
+      for (const el of root.querySelectorAll('[class*="error"], [role="alert"], [class*="invalid"]')) {
+        if (!isVisible(el)) continue;
+        add(el.textContent || '');
+      }
+
+      const exposedText = [];
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.parentElement && isVisible(node.parentElement)) exposedText.push(node.textContent || '');
+      }
+      const rootText = exposedText.join(' ');
+      const asciiText = (rootText || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
+      for (const signal of validationSignals) {
+        if (asciiText.includes(signal)) add(signal);
+      }
     }
 
     return [...new Set(errors)];
   }).catch(() => []);
+}
+
+async function detectTopChoiceBlocked(page) {
+  await markActiveApplyDialog(page);
+  return page.evaluate(() => {
+    const roots = [];
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    const activeDialog = document.querySelector('dialog[data-agent-active-apply="true"]');
+    const sr = document.querySelector('#interop-outlet')?.shadowRoot;
+    if (activeDialog) roots.push(activeDialog);
+    else if (sr) roots.push(sr);
+
+    const accessibleName = (root, cb) => {
+      const treeDistance = (a, b) => {
+        const ancestors = new Map();
+        let current = a;
+        let distance = 0;
+        while (current) { ancestors.set(current, distance++); current = current.parentNode || current.host; }
+        current = b;
+        distance = 0;
+        while (current) {
+          if (ancestors.has(current)) return ancestors.get(current) + distance;
+          distance++;
+          current = current.parentNode || current.host;
+        }
+        return Number.MAX_SAFE_INTEGER;
+      };
+      const closestVisible = (candidates) => candidates
+        .filter(isVisible)
+        .sort((a, b) => treeDistance(cb, a) - treeDistance(cb, b))[0] || null;
+      const labels = cb.id
+        ? [...root.querySelectorAll('label[for]')]
+          .filter((candidate) => candidate.getAttribute('for') === cb.id)
+        : [];
+      const label = closestVisible(labels) || cb.closest('label');
+      const ariaParts = [];
+      for (const refId of String(cb.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)) {
+        const ref = closestVisible(
+          [...root.querySelectorAll('[id]')]
+            .filter((candidate) => candidate.getAttribute('id') === refId)
+        );
+        if (ref?.textContent?.trim()) ariaParts.push(ref.textContent.trim());
+      }
+      return {
+        text: [cb.getAttribute('aria-label'), ariaParts.join(' '), label?.textContent]
+          .filter(Boolean).join(' ').toLowerCase(),
+        exposed: isVisible(cb) || !!(label && isVisible(label)) || ariaParts.length > 0,
+      };
+    };
+
+    for (const root of roots) {
+      for (const cb of root.querySelectorAll('input[type="checkbox"]')) {
+        if (cb.checked) continue;
+        const name = accessibleName(root, cb);
+        if (!name.exposed) continue;
+        const t = name.text;
+        const isTopChoice = /\btop choice\b/.test(t);
+        if (!isTopChoice) continue;
+        const explicitlyRequired = cb.required || cb.getAttribute('aria-required') === 'true' ||
+          cb.getAttribute('aria-invalid') === 'true' || cb.matches(':invalid');
+        if (explicitlyRequired) return true;
+      }
+    }
+    return false;
+  }).catch(() => false);
+}
+
+async function inspectTopChoiceState(page) {
+  await markActiveApplyDialog(page);
+  return page.evaluate(() => {
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    const activeDialog = document.querySelector('dialog[data-agent-active-apply="true"]');
+    const root = activeDialog || document.querySelector('#interop-outlet')?.shadowRoot;
+    if (!root) return { present: false, checked: false };
+
+    const accessibleName = (cb) => {
+      const treeDistance = (a, b) => {
+        const ancestors = new Map();
+        let current = a;
+        let distance = 0;
+        while (current) { ancestors.set(current, distance++); current = current.parentNode || current.host; }
+        current = b;
+        distance = 0;
+        while (current) {
+          if (ancestors.has(current)) return ancestors.get(current) + distance;
+          distance++;
+          current = current.parentNode || current.host;
+        }
+        return Number.MAX_SAFE_INTEGER;
+      };
+      const closestVisible = (candidates) => candidates
+        .filter(isVisible)
+        .sort((a, b) => treeDistance(cb, a) - treeDistance(cb, b))[0] || null;
+      const labels = cb.id
+        ? [...root.querySelectorAll('label[for]')]
+          .filter((candidate) => candidate.getAttribute('for') === cb.id)
+        : [];
+      const label = closestVisible(labels) || cb.closest('label');
+      const ariaParts = [];
+      for (const refId of String(cb.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)) {
+        const ref = closestVisible(
+          [...root.querySelectorAll('[id]')]
+            .filter((candidate) => candidate.getAttribute('id') === refId)
+        );
+        if (ref?.textContent?.trim()) ariaParts.push(ref.textContent.trim());
+      }
+      return {
+        text: [cb.getAttribute('aria-label'), ariaParts.join(' '), label?.textContent]
+          .filter(Boolean).join(' ').toLowerCase(),
+        exposed: isVisible(cb) || !!(label && isVisible(label)) || ariaParts.length > 0,
+      };
+    };
+
+    let present = false;
+    let checked = false;
+    for (const cb of root.querySelectorAll('input[type="checkbox"]')) {
+      const name = accessibleName(cb);
+      if (!name.exposed) continue;
+      const text = name.text;
+      if (!/\btop choice\b/.test(text)) continue;
+      present = true;
+      if (cb.checked) checked = true;
+    }
+    return { present, checked };
+  }).catch(() => ({ present: false, checked: false }));
+}
+
+async function detectTopChoiceSelected(page) {
+  return (await inspectTopChoiceState(page)).checked;
+}
+
+async function markActiveApplyDialog(page) {
+  return page.evaluate(() => {
+    const marker = 'data-agent-active-apply';
+    const dialogs = [...document.querySelectorAll('dialog')].reverse();
+    for (const dialog of dialogs) dialog.removeAttribute(marker);
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || rect.right <= 0 || rect.bottom <= 0 ||
+          rect.left >= innerWidth || rect.top >= innerHeight) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            style.pointerEvents === 'none' || current.hidden || current.inert ||
+            current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    const visibleDialogs = dialogs.filter(isVisible);
+    const focusedDialog = document.activeElement?.closest?.('dialog');
+    const pointDialogFor = (element) => {
+      if (!(element instanceof Element)) return null;
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      return document.elementFromPoint(
+        Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2)),
+        Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2))
+      )?.closest?.('dialog') || null;
+    };
+    const focusedHitDialog = visibleDialogs.includes(focusedDialog)
+      ? (pointDialogFor(document.activeElement) || pointDialogFor(focusedDialog))
+      : null;
+    const hitDialog = visibleDialogs.map((dialog) => {
+      const rect = dialog.getBoundingClientRect();
+      return document.elementFromPoint(
+        Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2)),
+        Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2))
+      )?.closest?.('dialog');
+    }).find((dialog) => visibleDialogs.includes(dialog));
+    const focusedModal = visibleDialogs.includes(focusedDialog) &&
+      focusedDialog.matches?.(':modal') ? focusedDialog : null;
+    // A focused control can remain in a visually covered non-modal dialog.
+    // Prefer the actual hit-tested layer unless focus belongs to the browser's
+    // native modal top layer.
+    const focusedOwner = visibleDialogs.includes(focusedDialog) &&
+      focusedHitDialog === focusedDialog ? focusedDialog : null;
+    const focusedCover = visibleDialogs.includes(focusedHitDialog) &&
+      focusedHitDialog !== focusedDialog ? focusedHitDialog : null;
+    const active = focusedModal || focusedCover || focusedOwner || hitDialog ||
+      (visibleDialogs.includes(focusedDialog) && focusedDialog) ||
+      visibleDialogs.find(d => d.hasAttribute('open')) || visibleDialogs[0];
+    if (!active) return false;
+    active.setAttribute(marker, 'true');
+    return true;
+  }).catch(() => false);
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1131,6 +1408,1018 @@ async function collectApplyValidationErrors(page) {
  * "Apply flow cycled — unfilled required fields" (regression observed
  * during the 2026-04-30 dry-run on kadence ML Researcher 4408212119).
  */
+// ── 2026-08 dialog UI: custom radio-group questions ──
+//
+// Screener questions render as a <p> question text followed by
+// <fieldset role="radiogroup"> holding div[role="radio"] options
+// (aria-label "Yes"/"No", aria-checked). The native input[type=radio]
+// inside each option is INVISIBLE, so fillForm's radio tier never sees
+// these — every questionnaire page jammed with "This field is required".
+// Answers resolve through the standard tiers (guard → defaultAnswers →
+// rules → budgeted LLM) and must match an option label to be clicked.
+
+const DEGREE_RANKS = [
+  [/high school|ged/, 0],
+  [/associate/, 1],
+  [/\b(?:bachelor|undergraduate)\b/, 2],
+  [/\b(?:master|m\.?\s*b\.?\s*a\.?)\b/, 3],
+  [/\b(?:ph\.?\s*d\.?|doctor)\b/, 4],
+];
+
+function degreeRank(text) {
+  return degreeRanks(text)[0] ?? -1;
+}
+
+function degreeRanks(text) {
+  const t = String(text || '').toLowerCase();
+  const ranks = new Set();
+  for (const [re, rank] of DEGREE_RANKS) {
+    if (re.test(t)) ranks.add(rank);
+  }
+  const normal = normalizeLabel(t);
+  const abbreviationContext = /\b(?:degree|education|highest|earned|completed|obtained|required|requirement|minimum|at least|have (?:a|an))\b/.test(normal);
+  const onlyAbbreviation = /^(?:b s|b a|m s|m a)$/.test(normal);
+  const dottedBachelor = /\bb\.\s*[sa]\.?(?:\s|$)/.test(t);
+  const dottedMaster = /\bm\.\s*[sa]\.?(?:\s|$)/.test(t);
+  if (dottedBachelor || ((abbreviationContext || onlyAbbreviation) && /\b(?:b s|b a)\b/.test(normal))) ranks.add(2);
+  if (dottedMaster || ((abbreviationContext || onlyAbbreviation) && /\b(?:m s|m a)\b/.test(normal))) ranks.add(3);
+  return [...ranks];
+}
+
+function canonicalDegreePhrase(text) {
+  return normalizeLabel(String(text || ''))
+    .replace(/\b(associate|bachelor|master|doctor) s\b/g, '$1')
+    .replace(/\b(associates|bachelors|masters|doctors)\b/g, (word) => word.slice(0, -1))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function degreeQuestionSubject(question) {
+  const q = canonicalDegreePhrase(question)
+    .replace(/\s+or (?:higher|above)$/, '')
+    .trim();
+  const patterns = [
+    // "the following level of education: X" is LinkedIn's standard education
+    // screener boilerplate — strip the filler so the subject is the degree
+    // itself, not the wrapper phrase.
+    /^(?:do you (?:have|hold|possess)|have you (?:earned|completed|obtained|received|attained|graduated with)|did you (?:earn|complete|obtain|receive|attain|graduate with)) (?:at least )?(?:a |an |the )?(?:following (?:minimum )?(?:level of education|education level|degree) )?(?:a |an |the )?(.+)$/,
+    /^is (?:a |an |the )?(.+?) your highest (?:degree|education level|level of education)$/,
+    /^is your highest (?:degree|education level|level of education) (?:a |an |the )?(.+)$/,
+  ];
+  for (const pattern of patterns) {
+    const match = q.match(pattern);
+    if (match) return match[1].trim();
+  }
+  return q;
+}
+
+function isGenericDegreeSubject(subject) {
+  return /^(?:high school(?: diploma)?|ged|associate(?: degree)?|bachelor(?: degree)?|undergraduate(?: degree)?|master(?: degree)?|doctorate(?: degree)?|doctoral degree|ph d|doctor of philosophy)$/.test(subject);
+}
+
+function isYesNoOptionSet(labels) {
+  const set = labels.map(l => l.trim().toLowerCase()).sort().join('|');
+  return set === 'no|yes';
+}
+
+function hasUnsafeDialogNegation(text) {
+  return /\b(?:not|no|never|without|unable|unwilling|unauthori[sz]ed|cannot|can t|do not|don t|does not|doesn t|will not|won t|have not|haven t|has not|hasn t|lack|lacking)\b/i
+    .test(normalizeLabel(String(text || '')));
+}
+
+function isIncidentalSensitiveDisclosure(question, questionClass) {
+  if (questionClass !== 'sensitive_identity') return false;
+  const raw = String(question || '');
+  const normal = normalizeLabel(raw);
+  const hasDisclosureMarker = /\b(?:voluntary self identification|self identification of disability|you are not required to disclose|form cc 305)\b/
+    .test(normal);
+  if (!hasDisclosureMarker) return false;
+  const directPrompts = raw.split(/[.!?]+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => {
+      const text = normalizeLabel(sentence);
+      return /^(?:which|what|are|do|does|did|is|have|has|will|would|can|could)\b/.test(text) ||
+        /\b(?:which|what)\b.{0,80}\byou\b/.test(text) ||
+        /^(?:please )?(?:select|choose|indicate|identify)\b/.test(text) ||
+        /\b(?:select|choose|indicate|identify)\b.{0,120}\b(?:you|your)\b/.test(text) ||
+        /\byou\b.{0,120}\b(?:select|choose|indicate|identify)\b/.test(text);
+    });
+  // Disclosure prose may contain incidental "not/no/or" boilerplate. It may
+  // not override an inverse or compound interrogative directed at the user.
+  return !directPrompts.some((prompt) =>
+    dialogQuestionRequiresExactAnswer(prompt, questionClass)
+  );
+}
+
+function dialogQuestionRequiresExactAnswer(question, questionClass = '') {
+  const normal = normalizeLabel(String(question || ''));
+  if (hasUnsafeDialogNegation(normal)) return 'negated_question';
+  const recognizedSponsorshipAlternative = /\b(?:a )?work visa or employment authori[sz]ation\b/.test(normal) ||
+    /\bvisa sponsorship or (?:a )?visa transfer\b/.test(normal) ||
+    /\bh 1b or other employment based immigration (?:case|support)\b/.test(normal);
+  const compoundProbe = normal
+    .replace(/\bnow or in the future\b/g, '')
+    .replace(/\b(?:a )?work visa or employment authori[sz]ation\b/g, 'immigration support')
+    .replace(/\bvisa sponsorship or (?:a )?visa transfer\b/g, 'visa sponsorship')
+    .replace(/\bh 1b or other employment based immigration (?:case|support)\b/g, 'immigration support')
+    .replace(/\bor (?:higher|above|older)\b/g, '');
+  if (/\b(?:and|or)\b/.test(compoundProbe)) return 'compound_question';
+  if (!recognizedSponsorshipAlternative &&
+      /\b(?:authori[sz](?:ed|ation)|eligible)\b/.test(normal) && /\bsponsor/.test(normal)) {
+    return 'combined_authorization_sponsorship';
+  }
+  return null;
+}
+
+function mapEducationAnswerToYesNo(question, configuredEducation) {
+  if (hasUnsafeDialogNegation(question)) return null;
+  const askedRanks = degreeRanks(question);
+  const configuredRanks = degreeRanks(configuredEducation);
+  if (askedRanks.length !== 1 || configuredRanks.length !== 1) return null;
+  const asked = askedRanks[0];
+  const have = configuredRanks[0];
+
+  const q = canonicalDegreePhrase(question);
+  const askedSubject = degreeQuestionSubject(question);
+  const configuredSubject = canonicalDegreePhrase(configuredEducation);
+  // Only generic level wording may use rank inference. Any discipline,
+  // concentration, named credential, or extra phrase must match the complete
+  // configured credential literally after punctuation/possessive cleanup.
+  if (!isGenericDegreeSubject(askedSubject) && askedSubject !== configuredSubject) return null;
+  const isThreshold = /\b(?:at least|or higher|or above|minimum(?:\s+(?:of|required|requirement))?)\b/.test(q);
+  if (isThreshold) return have >= asked ? 'Yes' : 'No';
+
+  // "Highest education" is an exact-level question, not a threshold.
+  if (/\bhighest\b/.test(q)) return have === asked ? 'Yes' : 'No';
+
+  // Exact matches and a configured highest level below the requested level
+  // are safe. A higher rank does not prove that every intermediate degree
+  // was separately awarded, so leave that case unanswered.
+  if (have === asked) return 'Yes';
+  if (have < asked) return 'No';
+  return null;
+}
+
+function isDeclineToAnswer(text) {
+  const normal = normalizeLabel(String(text || ''));
+  return /^(?:i )?(?:(?:do not|don t) (?:wish|want) to (?:answer|say|specify|self identify)|prefer not to (?:answer|say|specify|self identify)|decline(?: to)? (?:answer|self identify)|choose not to (?:answer|say|specify|self identify))$/
+    .test(normal);
+}
+
+function matchDialogRadioOption(options, value) {
+  if (value === null || value === undefined) return null;
+  const v = String(value).trim().toLowerCase();
+  if (!v) return null;
+
+  const rawExact = options.filter((option) =>
+    String(option.label || '').trim().toLowerCase() === v
+  );
+  if (rawExact.length === 1) return rawExact[0];
+  if (rawExact.length > 1) return null;
+  // Punctuation can change numeric semantics (10 vs 10+), so numeric values
+  // require literal equality and never use punctuation-normalized matching.
+  if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(v)) return null;
+
+  const normalizedValue = normalizeLabel(v);
+  const normalizedExact = options.filter((option) =>
+    normalizeLabel(String(option.label || '')) === normalizedValue
+  );
+  if (normalizedExact.length === 1) return normalizedExact[0];
+  if (normalizedExact.length > 1) return null;
+
+  // LinkedIn's standard EEO forms vary the wording of the same explicit
+  // opt-out. Keep this equivalence deliberately narrow; it must not reopen
+  // general fuzzy matching for submitted demographic or eligibility facts.
+  if (isDeclineToAnswer(v)) {
+    const optOutOptions = options.filter((option) => isDeclineToAnswer(option.label));
+    if (optOutOptions.length === 1) return optOutOptions[0];
+  }
+
+  // Substring matching is unsafe for numeric/short choices: answer "10"
+  // otherwise matches option "0" or "1" before an exact/range choice.
+  if (v.length < 3) return null;
+  const candidates = options.filter((o) => {
+    const label = String(o.label || '').trim().toLowerCase();
+    if (label.length < 3 || /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(label)) return false;
+    // Only accept a complete option phrase contained in a more-specific
+    // configured answer. Expanding a generic fact such as "Veteran" or
+    // "Woman" into a more-qualified option would invent information.
+    const normalizedValue = normalizeLabel(v);
+    const normalizedOption = normalizeLabel(label);
+    if (!normalizedOption) return false;
+    const escapedOption = normalizedOption.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|\\s)${escapedOption}(?:\\s|$)`).test(normalizedValue);
+  });
+  const hasNegativePolarity = (text) => /\b(?:no|not|never|without|cannot|can't|unable|unwilling|ineligible|unauthorized|do not|does not|did not|don't|doesn't|didn't|have not|has not|haven't|hasn't|non[-\s]\w+)\b/i.test(text);
+  const valueIsNegative = hasNegativePolarity(v);
+  const polarityMatches = candidates.filter((o) =>
+    hasNegativePolarity(String(o.label || '').toLowerCase()) === valueIsNegative
+  );
+  // A single polarity-compatible phrase is safe. Multiple remaining phrases
+  // can encode facts absent from the answer (for example US vs Canada work
+  // authorization), so ambiguity must stay unfilled.
+  return polarityMatches.length === 1 ? polarityMatches[0] : null;
+}
+
+function exactDialogDefaultAnswer(normalQuestion, answers) {
+  for (const [key, value] of Object.entries(answers || {})) {
+    if (normalizeLabel(String(key)) === normalQuestion) return value;
+  }
+  return null;
+}
+
+function configuredBooleanChoice(value) {
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (/^(?:yes|true)$/i.test(String(value || '').trim())) return 'Yes';
+  if (/^(?:no|false)$/i.test(String(value || '').trim())) return 'No';
+  return null;
+}
+
+function groundedDialogPreference(normalQuestion, config) {
+  const user = config.user || {};
+  const compoundProbe = normalQuestion.replace(/\bor older\b/g, '');
+  if (hasUnsafeDialogNegation(normalQuestion) || /\b(?:and|or)\b/.test(compoundProbe)) return null;
+  const mappings = [
+    {
+      matches: /^(?:are|would) you (?:be )?willing to relocate$/.test(normalQuestion),
+      value: user.willingToRelocate,
+      source: 'config:user.willingToRelocate',
+    },
+    {
+      matches: /^(?:are|would) you (?:be )?willing to travel$/.test(normalQuestion),
+      value: user.willingToTravel,
+      source: 'config:user.willingToTravel',
+    },
+    {
+      matches: /^are you (?:able|willing) to commute$/.test(normalQuestion),
+      value: user.willingToCommute,
+      source: 'config:user.willingToCommute',
+    },
+    {
+      matches: /^(?:are you (?:(?:at least|over) )?18(?: years?(?: old| of age)?)?(?: or older)?|are you over the age of 18)$/.test(normalQuestion),
+      value: user.over18,
+      source: 'config:user.over18',
+    },
+    {
+      matches: /^(?:do you have|have you got) (?:a )?(?:valid )?driver s licen[cs]e$/.test(normalQuestion),
+      value: user.hasDriversLicense,
+      source: 'config:user.hasDriversLicense',
+    },
+  ];
+  for (const mapping of mappings) {
+    if (!mapping.matches) continue;
+    const answer = configuredBooleanChoice(mapping.value);
+    if (answer) return { answer, source: mapping.source };
+  }
+  return null;
+}
+
+function configuredSensitiveOptionSetAnswer(question, optionLabels, config) {
+  const user = config.user || {};
+  const questionText = normalizeLabel(String(question || ''));
+  const optionSetText = normalizeLabel((optionLabels || []).join(' '));
+  const raceContextText = `${questionText} ${optionSetText}`;
+  const optionSetRaceSignals = [
+    /\bhispanic or latino\b/,
+    /\basian\b/,
+    /\bblack or african american\b/,
+    /\bwhite\b/,
+    /\bamerican indian or alaska native\b/,
+    /\bnative hawaiian or other pacific islander\b/,
+  ].filter((pattern) => pattern.test(raceContextText)).length;
+  const raceSignals = [
+    /\bhispanic or latino\b/,
+    /\basian\b/,
+    /\bblack or african american\b/,
+    /\bwhite\b/,
+    /\bamerican indian or alaska native\b/,
+    /\bnative hawaiian or other pacific islander\b/,
+  ].filter((pattern) => pattern.test(questionText)).length;
+  const configuredRaceIsOptOut = isDeclineToAnswer(user.race);
+  const optOutOptionCount = (optionLabels || []).filter(isDeclineToAnswer).length;
+  const positivelyIdentifiedRaceContext = /\b(?:race|ethnicity)\b/.test(questionText) ||
+    (optionSetRaceSignals >= 3 && /\bhispanic or latino\b/.test(raceContextText));
+  if (user.race && configuredRaceIsOptOut && optOutOptionCount === 1 &&
+      positivelyIdentifiedRaceContext) {
+    return { answer: user.race, source: 'config:user.race', safeUnderExactOnly: true };
+  }
+  // Some LinkedIn EEO pages expose only the category definitions, without a
+  // standalone "race" label, so the generic guard classifies them unguarded.
+  // A multi-category EEO signature plus the explicit user race config is
+  // sufficient to choose only that configured option/opt-out.
+  const hasDefinitionProse = /\b(?:a person having origins|a person of cuban|original peoples)\b/
+    .test(questionText);
+  if (user.race && hasDefinitionProse && raceSignals >= 3 &&
+      /\bhispanic or latino\b/.test(questionText)) {
+    return { answer: user.race, source: 'config:user.race', safeUnderExactOnly: false };
+  }
+  return null;
+}
+
+async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options = {}) {
+  const flatAnswers = defaultAnswers.defaultAnswers || defaultAnswers;
+  const runId = options.runId || null;
+
+  // Phase A (in-page): collect unanswered groups, tag options for clicking.
+  await markActiveApplyDialog(page);
+  const groups = await page.evaluate(() => {
+    const found = [];
+    let gi = 0;
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    // The dialog retains completed/hidden page templates. Remove tags from
+    // prior passes so a reused agent-radio-0-* marker cannot resolve to an
+    // already-answered field from an earlier step.
+    for (const stale of document.querySelectorAll('dialog [data-agent-radio]')) {
+      stale.removeAttribute('data-agent-radio');
+    }
+    const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+    if (!dlg || !/pages/i.test(dlg.innerText || '')) return found;
+    for (const grp of dlg.querySelectorAll('[role="radiogroup"]')) {
+        if (!isVisible(grp)) continue;
+        const opts = [...grp.querySelectorAll('[role="radio"]')].filter(isVisible);
+        if (opts.length === 0) continue;
+        if (opts.some(o => o.getAttribute('aria-checked') === 'true')) continue;
+        // Question text: nearest non-empty preceding sibling of the group
+        let q = grp.previousElementSibling;
+        while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
+        const question = q && isVisible(q) ? q.textContent.trim() : (grp.getAttribute('aria-label') || '');
+        const optionInfos = opts.map((o, oi) => {
+          const tag = `agent-radio-${gi}-${oi}`;
+          o.setAttribute('data-agent-radio', tag);
+          return { tag, label: (o.getAttribute('aria-label') || o.innerText || '').trim() };
+        });
+        found.push({ question, options: optionInfos });
+        gi++;
+    }
+    return found;
+  }).catch(() => []);
+
+  let filled = 0;
+  for (const group of groups) {
+    if (!group.question || group.options.length === 0) continue;
+    const optionLabels = group.options.map(o => o.label);
+    const label = group.question.substring(0, 200);
+
+    const normalLabel = normalizeLabel(group.question);
+    const explicitDefault = exactDialogDefaultAnswer(normalLabel, flatAnswers);
+    const sensitiveOptionSetAnswer = configuredSensitiveOptionSetAnswer(
+      group.question, optionLabels, config
+    );
+    let answer = sensitiveOptionSetAnswer?.answer || null;
+    let source = sensitiveOptionSetAnswer?.source || null;
+    let confidence = sensitiveOptionSetAnswer ? 'config_option_set' : null;
+
+    const guard = guardAnswer(group.question, { config, defaultAnswers: flatAnswers });
+    const exactOnlyReason = dialogQuestionRequiresExactAnswer(group.question, guard.questionClass);
+    if (exactOnlyReason) {
+      const exactChoice = matchDialogRadioOption(group.options, explicitDefault);
+      const guardedChoice = guard.action === 'answer'
+        ? matchDialogRadioOption(group.options, guard.answer)
+        : null;
+      const guardedOptOut = guardedChoice && isDeclineToAnswer(guard.answer) &&
+        isDeclineToAnswer(guardedChoice.label);
+      const guardedCategoricalChoice = !isYesNoOptionSet(optionLabels) && guardedChoice &&
+        (guardedOptOut || isIncidentalSensitiveDisclosure(group.question, guard.questionClass));
+      const sensitiveOptionSetChoice = sensitiveOptionSetAnswer?.safeUnderExactOnly
+        ? matchDialogRadioOption(group.options, sensitiveOptionSetAnswer.answer)
+        : null;
+      if (!exactChoice && !guardedCategoricalChoice && !sensitiveOptionSetChoice) {
+        if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+        recordFillAudit({
+          platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
+          inputType: null, fillSource: 'cannot_fill', answer: '', confidence: `guard:${exactOnlyReason}`,
+        });
+        recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+        logger.info({
+          platform: 'linkedin', jobId, question: label.substring(0, 80), reason: exactOnlyReason,
+        }, 'Dialog radio group requires an exact question-specific answer');
+        continue;
+      }
+      if (exactChoice) {
+        answer = explicitDefault;
+        source = 'defaultAnswers';
+        confidence = 'exact_question';
+      }
+    }
+
+    let hasGuardedAnswer = !!answer;
+    if (!answer && guard.action === 'block') {
+      const configuredEducation = config.user?.highestEducation;
+      const mappedEducation = guard.questionClass === 'education_facts' &&
+        configuredEducation && isYesNoOptionSet(optionLabels)
+        ? mapEducationAnswerToYesNo(group.question, configuredEducation)
+        : null;
+      if (mappedEducation) {
+        answer = mappedEducation;
+        source = 'config:user.highestEducation';
+        confidence = 'guard_config_mapped';
+        hasGuardedAnswer = true;
+      } else {
+        if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+        logger.info({ platform: 'linkedin', jobId, question: label.substring(0, 80), questionClass: guard.questionClass }, 'Guard blocked dialog radio group');
+        recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: 'cannot_fill', answer: '', confidence: `guard:${guard.reason}` });
+        recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+        continue;
+      }
+    }
+    if (!answer && guard.action === 'answer') {
+      hasGuardedAnswer = true;
+      answer = guard.answer;
+      source = guard.source;
+      confidence = 'guard_config';
+      // Education config stores the highest level as text, while some forms
+      // expose Yes/No. Only use rank ordering for explicit threshold wording;
+      // a higher degree does not prove every intermediate degree was awarded.
+      if (isYesNoOptionSet(optionLabels) && !/^(yes|no)$/i.test(String(answer).trim())) {
+        if (guard.questionClass === 'education_facts') {
+          answer = mapEducationAnswerToYesNo(group.question, answer);
+        }
+      }
+    }
+
+    const matchOption = (value) => matchDialogRadioOption(group.options, value);
+
+    let chosen = matchOption(answer);
+
+    // Unguarded radio answers must be explicitly question-specific. Generic
+    // fuzzy defaults (for example total experience) cannot establish a named
+    // skill's tenure, and generic polarity rules cannot establish facts.
+    if (!chosen && !hasGuardedAnswer) {
+      chosen = matchOption(explicitDefault);
+      if (chosen) { source = 'defaultAnswers'; confidence = 'exact_question'; }
+      if (!chosen) {
+        const preference = groundedDialogPreference(normalLabel, config);
+        chosen = preference ? matchOption(preference.answer) : null;
+        if (chosen) { source = preference.source; confidence = 'config'; }
+      }
+    }
+
+    if (!chosen) {
+      // Radio answers are submitted facts. An LLM cannot know whether the
+      // candidate has a licence, visa/status, or specific experience. Only an
+      // explicit/default or config-backed rule may select an option; otherwise
+      // classify the refusal as an honest, grounded-answer skip.
+      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+      const reason = hasGuardedAnswer
+        ? 'configured_answer_does_not_match_options'
+        : 'no_grounded_radio_answer';
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
+        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: `guard:${reason}`,
+      });
+      logger.info({
+        platform: 'linkedin', jobId, question: label.substring(0, 80),
+        questionClass: guard.questionClass, reason,
+      }, 'Dialog radio group left unanswered without grounded evidence');
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), answerLength: answer ? String(answer).length : 0, options: optionLabels }, 'No matching option for dialog radio group');
+      continue;
+    }
+
+    await markActiveApplyDialog(page);
+    const radio = page.locator(`dialog[data-agent-active-apply="true"] [data-agent-radio="${chosen.tag}"]`).first();
+    const snapshotStillMatches = await radio.evaluate((el, snapshot) => {
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let current = element; current instanceof Element;) {
+          const style = getComputedStyle(current);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+              current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+          current = current.parentElement || current.getRootNode()?.host || null;
+        }
+        return true;
+      };
+      const group = el.closest('[role="radiogroup"]');
+      if (!group || !isVisible(group) || !isVisible(el)) return false;
+      let questionNode = group.previousElementSibling;
+      while (questionNode && !(questionNode.textContent || '').trim()) {
+        questionNode = questionNode.previousElementSibling;
+      }
+      const currentQuestion = questionNode && isVisible(questionNode)
+        ? questionNode.textContent.trim()
+        : (group.getAttribute('aria-label') || '');
+      const currentLabel = (el.getAttribute('aria-label') || el.innerText || '').trim();
+      return currentQuestion === snapshot.question && currentLabel === snapshot.optionLabel &&
+        el.getAttribute('aria-checked') !== 'true';
+    }, { question: group.question, optionLabel: chosen.label }).catch(() => false);
+    if (!snapshotStillMatches) {
+      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+      logger.info({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio group changed before selection; recollecting safely');
+      continue;
+    }
+    const clicked = await radio.evaluate((el) => {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      el.click();
+      return true;
+    }).catch(() => false);
+    if (clicked) await sleep(100, 200);
+    const selected = clicked && await radio.evaluate((el) =>
+      el.getAttribute('aria-checked') === 'true' || !!el.querySelector('input[type="radio"]')?.checked
+    ).catch(() => false);
+    if (selected) {
+      filled++;
+      recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: source || 'unknown', answer: chosen.label, confidence });
+      // The chosen option stays out of logs (self-ID answers are sensitive);
+      // fill_audit in the gitignored DB keeps the full value for forensics.
+      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), source }, 'Filled dialog radio group');
+      if ((options._dialogRadioDepth || 0) < 8) {
+        const nested = await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, {
+          ...options,
+          _dialogRadioDepth: (options._dialogRadioDepth || 0) + 1,
+        });
+        filled += nested.filled;
+      }
+      await sleep(200, 500);
+    } else {
+      // Fail closed: an unselected group is an unfilled field. Recording it
+      // as guard-blocked routes a later validation bounce into the honest
+      // guarded-abandon classification instead of submitting incomplete.
+      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
+        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'guard:radio_click_failed',
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+      logger.warn({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio click did not select the option');
+    }
+  }
+
+  if (groups.length > 0) {
+    logger.info({ platform: 'linkedin', jobId, groups: groups.length, filled }, 'Dialog radio groups processed');
+  }
+  return { groups: groups.length, filled };
+}
+
+// Fingerprint the active form step. The dialog UI puts radio questions in a
+// preceding <p>, not in label/legend, and retains hidden templates; include
+// visible question/progress text only.
+async function captureApplyStepFingerprint(page) {
+  return page.evaluate(() => {
+    const roots = [];
+    const isVisible = (d) => {
+      const rect = d.getBoundingClientRect();
+      const style = getComputedStyle(d);
+      return rect.width > 0 && rect.height > 0 &&
+        style.display !== 'none' && style.visibility !== 'hidden' &&
+        !d.hidden && d.getAttribute('aria-hidden') !== 'true';
+    };
+    const activeDialog = document.querySelector('dialog[data-agent-active-apply="true"]');
+    if (activeDialog) {
+      roots.push(activeDialog);
+    } else {
+      const sr = document.querySelector('#interop-outlet')?.shadowRoot;
+      if (sr) roots.push(sr);
+    }
+    const labels = [];
+    for (const root of roots) {
+      for (const lbl of root.querySelectorAll('label, legend')) {
+        if (lbl.getClientRects().length === 0) continue;
+        const t = (lbl.textContent || '').trim().substring(0, 60);
+        if (t) labels.push(t);
+      }
+      for (const group of root.querySelectorAll('[role="radiogroup"]')) {
+        if (group.getClientRects().length === 0) continue;
+        let q = group.previousElementSibling;
+        while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
+        const t = (q?.textContent || group.getAttribute('aria-label') || '').trim().substring(0, 120);
+        if (t) labels.push(t);
+      }
+      const progress = (root.innerText || '').match(/\b\d+\s*(?:\/|of)\s*\d+\s*pages?\b/i)?.[0];
+      if (progress) labels.push(progress);
+    }
+    return labels.sort().join('||');
+  }).catch(() => '');
+}
+
+async function waitForSubmissionConfirmation(page, options = {}) {
+  const timeout = typeof options === 'number' ? options : (options.timeout ?? 10000);
+  const baselineEvidence = typeof options === 'object' ? options.baselineEvidence : null;
+  const expectedJobId = typeof options === 'object'
+    ? (options.expectedJobId || baselineEvidence?.expectedJobId || null)
+    : null;
+  const baseline = baselineEvidence || {
+    globalCount: 0,
+    dialogCounts: {},
+    shadowCount: 0,
+    liveCount: 0,
+    activeDialogId: null,
+    hasShadowRoot: false,
+  };
+  const deadline = Date.now() + timeout;
+
+  try {
+    do {
+      const current = await captureSubmissionConfirmationEvidence(page, {
+        baselineToken: baseline.baselineToken || null,
+        baselineSignatures: baseline.baselineSignatures || [],
+        expectedJobId,
+      });
+      const activeDialogAdvanced = current.activeDialogNovelCount > 0;
+      const shadowAdvanced = current.shadowNovelCount > 0;
+      const liveAdvanced = current.liveNovelCount > 0;
+      const activeBaselineCount = current.activeDialogId
+        ? (baseline.dialogCounts?.[current.activeDialogId] || 0)
+        : 0;
+      const activeRawAdvanced = current.activeDialogCount > activeBaselineCount;
+      const shadowRawAdvanced = current.shadowCount > (baseline.shadowCount || 0);
+      const liveRawAdvanced = current.liveCount > (baseline.liveCount || 0);
+      // LinkedIn's August 2026 UI closes the apply dialog and renders plain
+      // (non-live-region) text in the selected job detail panel:
+      //   Application status / Application submitted / now
+      // This is authoritative only when it is new relative to the pre-click
+      // baseline and the URL still identifies the job whose Submit was clicked.
+      const selectedDetailAdvanced = !!expectedJobId &&
+        current.selectedJobMatches === true &&
+        current.selectedDetailSubmitted === true &&
+        baseline.selectedDetailSubmitted !== true;
+      let confirmed;
+      if (!baselineEvidence) {
+        // Direct helper use has no known originating flow.
+        confirmed = activeDialogAdvanced || shadowAdvanced || liveAdvanced;
+      } else if (baseline.activeDialogId) {
+        // A dialog may confirm in-place, transition to a new confirmation
+        // dialog, or close and emit a new global live-region toast. The latter
+        // is valid only after the originating dialog has actually disappeared.
+        confirmed = (activeDialogAdvanced && activeRawAdvanced) ||
+          (!current.baselineOwnerVisible && liveAdvanced && liveRawAdvanced) ||
+          selectedDetailAdvanced;
+      } else if (baseline.hasShadowRoot) {
+        confirmed = shadowAdvanced && shadowRawAdvanced;
+      } else {
+        confirmed = liveAdvanced && liveRawAdvanced;
+      }
+
+      // Scope-local raw growth binds evidence to a real transition without an
+      // unrelated result-card rerender masking a legitimate confirmation.
+      if (confirmed) return true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await page.waitForTimeout(Math.min(150, remaining)).catch(() => {});
+    } while (Date.now() <= deadline);
+
+    return false;
+  } finally {
+    if (baseline.baselineToken) {
+      await clearSubmissionConfirmationBaseline(page, baseline.baselineToken);
+    }
+  }
+}
+
+async function clearSubmissionConfirmationBaseline(page, baselineToken) {
+  if (!baselineToken) return;
+  await page.evaluate((token) => {
+    const attributes = ['data-agent-confirmation-baseline', 'data-agent-confirmation-owner'];
+    const clearRoot = (root) => {
+      for (const attribute of attributes) {
+        for (const element of root.querySelectorAll(`[${attribute}]`)) {
+          if (element.getAttribute(attribute) === token) element.removeAttribute(attribute);
+        }
+      }
+    };
+    clearRoot(document);
+    const shadowRoot = document.querySelector('#interop-outlet')?.shadowRoot;
+    if (shadowRoot) clearRoot(shadowRoot);
+  }, baselineToken).catch(() => {});
+}
+
+async function captureSubmissionConfirmationEvidence(page, options = {}) {
+  await markActiveApplyDialog(page);
+  const markBaseline = options.markBaseline === true;
+  const baselineToken = options.baselineToken || (markBaseline
+    ? `confirmation-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    : null);
+  const baselineSignatures = Array.isArray(options.baselineSignatures)
+    ? options.baselineSignatures
+    : [];
+  const expectedJobId = options.expectedJobId ? String(options.expectedJobId) : null;
+  return page.evaluate(({ markBaseline, baselineToken, baselineSignatures, expectedJobId }) => {
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    const successPattern = /application submitted|your application was (?:sent|submitted)/i;
+    // Containers that belong to OTHER jobs (result cards, list items): text
+    // inside them must never confirm the current submission.
+    const unrelatedResultSelector = [
+      'article',
+      '[role="article"]',
+      '[data-job-id]',
+      '[data-occludable-job-id]',
+      '[role="listitem"]',
+      'li.scaffold-layout__list-item',
+      '[class*="job-card-job-posting-card-wrapper"]',
+      '[class*="job-card-container"]',
+      '[class*="job-card-list"]',
+      '[class*="jobs-search-results__list-item"]',
+      'div[data-view-name="job-card"]',
+      'a[data-control-name*="job_card"]',
+      '[role="link"][href*="/jobs/view/"]',
+    ].join(', ');
+    const dialogIdAttribute = 'data-agent-confirmation-dialog';
+    const evidenceAttribute = 'data-agent-confirmation-baseline';
+    const ownerAttribute = 'data-agent-confirmation-owner';
+    const exposedText = (element) => {
+      const parts = [];
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.parentElement && isVisible(node.parentElement)) parts.push(node.textContent || '');
+      }
+      return parts.join(' ').replace(/\s+/g, ' ').trim();
+    };
+    const signature = (element) => exposedText(element).toLowerCase();
+    const baselineSignatureSet = new Set(baselineSignatures);
+    let nextDialogId = Number(document.documentElement.getAttribute('data-agent-confirmation-seq') || 0);
+    const usedDialogIds = new Set();
+    for (const dialog of document.querySelectorAll('dialog')) {
+      let dialogId = dialog.getAttribute(dialogIdAttribute);
+      if (!dialogId || usedDialogIds.has(dialogId)) {
+        dialogId = `dialog-${++nextDialogId}`;
+        dialog.setAttribute(dialogIdAttribute, dialogId);
+      }
+      usedDialogIds.add(dialogId);
+    }
+    document.documentElement.setAttribute('data-agent-confirmation-seq', String(nextDialogId));
+
+    const successLeaves = (root) => [...root.querySelectorAll('*')].filter((el) => {
+      if (!isVisible(el) || !successPattern.test(exposedText(el))) return false;
+      return ![...el.children].some((child) =>
+        isVisible(child) && successPattern.test(exposedText(child))
+      );
+    });
+
+    const documentEvidence = successLeaves(document);
+    const sr = document.querySelector('#interop-outlet')?.shadowRoot;
+    const shadowEvidence = sr ? successLeaves(sr) : [];
+    const activeDialog = document.querySelector('dialog[data-agent-active-apply="true"]');
+    if (markBaseline && baselineToken) {
+      for (const element of [...documentEvidence, ...shadowEvidence]) {
+        element.setAttribute(evidenceAttribute, baselineToken);
+      }
+      if (activeDialog) activeDialog.setAttribute(ownerAttribute, baselineToken);
+    }
+    const capturedSignatures = [...new Set(
+      [...documentEvidence, ...shadowEvidence].map(signature).filter(Boolean)
+    )];
+    const isNovel = (element) => !baselineToken || (
+      element.getAttribute(evidenceAttribute) !== baselineToken &&
+      !baselineSignatureSet.has(signature(element))
+    );
+    const shadowCount = shadowEvidence.length;
+    const shadowNovelCount = shadowEvidence.filter(isNovel).length;
+    const dialogCounts = {};
+    const dialogNovelCounts = {};
+    let liveCount = 0;
+    let liveNovelCount = 0;
+    for (const el of documentEvidence) {
+      const dialog = el.closest?.('dialog');
+      if (dialog) {
+        const dialogId = dialog.getAttribute(dialogIdAttribute);
+        if (dialogId) dialogCounts[dialogId] = (dialogCounts[dialogId] || 0) + 1;
+        if (dialogId && isNovel(el)) {
+          dialogNovelCounts[dialogId] = (dialogNovelCounts[dialogId] || 0) + 1;
+        }
+        continue;
+      }
+      const liveRegion = el.closest?.('[role="status"], [role="alert"], [aria-live]');
+      const inUnrelatedResult = !!el.closest?.(unrelatedResultSelector);
+      if (liveRegion && !inUnrelatedResult) {
+        liveCount++;
+        if (isNovel(el)) liveNovelCount++;
+      }
+    }
+    const activeDialogId = activeDialog?.getAttribute(dialogIdAttribute) || null;
+    let selectedJobId = null;
+    try {
+      const url = new URL(window.location.href);
+      selectedJobId = url.searchParams.get('currentJobId');
+      if (!selectedJobId) {
+        const pathMatch = url.pathname.match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)\/?$/);
+        if (pathMatch) selectedJobId = pathMatch[1];
+      }
+    } catch (_) {}
+    const selectedJobMatches = !!expectedJobId && selectedJobId === expectedJobId;
+    // Detail-panel evidence must come from the selected job's own status
+    // block: a main-wide text search let an unrelated component (another
+    // card's applied badge, a stray status module) confirm the submission.
+    const detailStatusPattern = /\bApplication status\s+Application submitted\b/i;
+    const main = document.querySelector('main');
+    let selectedDetailSubmitted = false;
+    if (selectedJobMatches && main) {
+      const statusLeaves = [...main.querySelectorAll('*')].filter((el) => {
+        if (!isVisible(el) || !detailStatusPattern.test(exposedText(el))) return false;
+        return ![...el.children].some((child) =>
+          isVisible(child) && detailStatusPattern.test(exposedText(child))
+        );
+      });
+      selectedDetailSubmitted = statusLeaves.some((el) =>
+        !el.closest('dialog') && !el.closest(unrelatedResultSelector));
+    }
+    const baselineOwner = baselineToken
+      ? [...document.querySelectorAll(`[${ownerAttribute}]`)]
+        .find((element) => element.getAttribute(ownerAttribute) === baselineToken)
+      : null;
+    return {
+      globalCount: documentEvidence.length + shadowCount,
+      dialogCounts,
+      dialogNovelCounts,
+      activeDialogId,
+      activeDialogCount: activeDialogId ? (dialogCounts[activeDialogId] || 0) : 0,
+      activeDialogNovelCount: activeDialogId ? (dialogNovelCounts[activeDialogId] || 0) : 0,
+      shadowCount,
+      shadowNovelCount,
+      liveCount,
+      liveNovelCount,
+      hasShadowRoot: !!sr,
+      baselineOwnerVisible: !!baselineOwner && isVisible(baselineOwner),
+      expectedJobId,
+      selectedJobId,
+      selectedJobMatches,
+      selectedDetailSubmitted,
+      baselineToken: markBaseline ? baselineToken : null,
+      baselineSignatures: markBaseline ? capturedSignatures : baselineSignatures,
+    };
+  }, { markBaseline, baselineToken, baselineSignatures, expectedJobId }).catch(() => ({
+    globalCount: 0,
+    dialogCounts: {},
+    dialogNovelCounts: {},
+    activeDialogId: null,
+    activeDialogCount: 0,
+    activeDialogNovelCount: 0,
+    shadowCount: 0,
+    shadowNovelCount: 0,
+    liveCount: 0,
+    liveNovelCount: 0,
+    hasShadowRoot: false,
+    baselineOwnerVisible: false,
+    expectedJobId,
+    selectedJobId: null,
+    selectedJobMatches: false,
+    selectedDetailSubmitted: false,
+    baselineToken: markBaseline ? baselineToken : null,
+    baselineSignatures: markBaseline ? [] : baselineSignatures,
+  }));
+}
+
+async function firstVisibleLocator(locator) {
+  const count = await locator.count().catch(() => 0);
+  for (let i = 0; i < count; i++) {
+    const candidate = locator.nth(i);
+    const actionable = await candidate.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            style.pointerEvents === 'none' || current.hidden || current.inert ||
+            current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    }).catch(() => false);
+    if (actionable) return candidate;
+  }
+  return null;
+}
+
+async function firstVisibleApplyControl(page, selector) {
+  const hasActiveDialog = await markActiveApplyDialog(page);
+  if (hasActiveDialog) {
+    const dialog = page.locator('dialog[data-agent-active-apply="true"]').first();
+    // The topmost modal owns interaction. Never reach through it to a stale
+    // apply dialog just because this selector is absent from the modal.
+    return firstVisibleLocator(dialog.locator(selector));
+  }
+
+  // Legacy apply UI lives only in this shadow host. A page-wide fallback can
+  // click unrelated job-card controls such as Dismiss/Done/Not now.
+  return firstVisibleLocator(page.locator(`#interop-outlet ${selector}`));
+}
+
+async function firstVisibleApplyButton(page, name, exact = true, allowGlobal = false) {
+  const hasActiveDialog = await markActiveApplyDialog(page);
+  if (hasActiveDialog) {
+    const dialog = page.locator('dialog[data-agent-active-apply="true"]').first();
+    // Only the topmost visible dialog is actionable. Falling through to an
+    // older dialog can click the apply form behind a confirmation modal.
+    return firstVisibleLocator(dialog.getByRole('button', { name, exact }));
+  }
+
+  const shadowButton = await firstVisibleLocator(
+    page.locator('#interop-outlet').getByRole('button', { name, exact })
+  );
+  if (shadowButton) return shadowButton;
+  // Generic global "Next"/"Continue" controls include results pagination.
+  // Limit top-level fallback to the distinctive aria/accessibility names.
+  if (!allowGlobal) return null;
+  return firstVisibleLocator(page.getByRole('button', { name, exact }));
+}
+
+async function dismissActiveApplyUi(page) {
+  const token = `cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await markActiveApplyDialog(page);
+  const baseline = await page.evaluate((cleanupToken) => {
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    for (const dialog of document.querySelectorAll('dialog')) {
+      if (isVisible(dialog)) dialog.setAttribute('data-agent-cleanup-existing', cleanupToken);
+    }
+    const active = document.querySelector('dialog[data-agent-active-apply="true"]');
+    if (active) active.setAttribute('data-agent-cleanup-root', cleanupToken);
+    return { hadDialog: !!active };
+  }, token).catch(() => ({ hadDialog: false }));
+
+  try {
+    // Recovery can begin with the discard confirmation already active.
+    const alreadyOpenDiscard = await firstVisibleApplyControl(page, 'button:has-text("Discard")');
+    if (alreadyOpenDiscard) {
+      await alreadyOpenDiscard.evaluate((element) => element.click());
+      await sleep(500, 1000);
+      return true;
+    }
+
+    const dismissBtn = await firstVisibleApplyControl(page, 'button[aria-label="Dismiss"]');
+    if (!dismissBtn) return false;
+    await dismissBtn.evaluate((element) => element.click());
+    await sleep(500, 1000);
+
+    await markActiveApplyDialog(page);
+    const safeDialogTransition = await page.evaluate((cleanupToken) => {
+      const active = document.querySelector('dialog[data-agent-active-apply="true"]');
+      if (!active) return false;
+      return active.getAttribute('data-agent-cleanup-root') === cleanupToken ||
+        active.getAttribute('data-agent-cleanup-existing') !== cleanupToken;
+    }, token).catch(() => false);
+
+    let discardBtn = null;
+    if (safeDialogTransition) {
+      const active = page.locator('dialog[data-agent-active-apply="true"]').first();
+      discardBtn = await firstVisibleLocator(active.locator('button:has-text("Discard")'));
+    } else if (!baseline.hadDialog) {
+      // Legacy shadow flow: the same host may transition to its discard view.
+      discardBtn = await firstVisibleLocator(
+        page.locator('#interop-outlet button:has-text("Discard")')
+      );
+    }
+    if (!discardBtn) return true;
+    await discardBtn.evaluate((element) => element.click());
+    await sleep(500, 1000);
+    return true;
+  } finally {
+    await page.evaluate((cleanupToken) => {
+      for (const dialog of document.querySelectorAll(
+        '[data-agent-cleanup-existing], [data-agent-cleanup-root]'
+      )) {
+        if (dialog.getAttribute('data-agent-cleanup-existing') === cleanupToken) {
+          dialog.removeAttribute('data-agent-cleanup-existing');
+        }
+        if (dialog.getAttribute('data-agent-cleanup-root') === cleanupToken) {
+          dialog.removeAttribute('data-agent-cleanup-root');
+        }
+      }
+    }, token).catch(() => {});
+  }
+}
+
+async function classifyApplyBlockage(page, config) {
+  const topChoicePolicy = config.platformPolicy?.linkedin?.topChoice || 'never';
+  if (topChoicePolicy !== 'always' && await detectTopChoiceBlocked(page)) {
+    return 'top_choice_required';
+  }
+  return 'retry_failed';
+}
+
 async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepNum, options = {}) {
   await sleep(800, 1500);
 
@@ -1138,11 +2427,21 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   // ultimately blocks matter for classifying an abandonment.
   if (options.guardBlockedLabels) options.guardBlockedLabels.clear();
 
-  // ── Fill fields inside the apply form's shadow DOM ──
-  const shadowFill = await fillShadowForm(page, defaultAnswers, logger, jobId, {
-    config,
-    runId: options.runId || null,
-  }).catch(() => EMPTY_SHADOW_RESULT());
+  // The August dialog and the legacy shadow form can coexist because LinkedIn
+  // retains old templates. Select one active root before filling so stale
+  // shadow controls cannot be mutated or audited alongside the dialog.
+  const hasDialogScope = await markActiveApplyDialog(page);
+  const shadowFill = hasDialogScope
+    ? EMPTY_SHADOW_RESULT()
+    : await fillShadowForm(page, defaultAnswers, logger, jobId, {
+      config,
+      runId: options.runId || null,
+    }).catch(() => EMPTY_SHADOW_RESULT());
+  const configuredTopChoicePolicy = config.platformPolicy?.linkedin?.topChoice || 'never';
+  if (shadowFill.topChoice?.policyBlocked) {
+    logger.warn({ platform: 'linkedin', jobId, stepNum }, 'Could not enforce LinkedIn Top Choice policy in shadow form');
+    return configuredTopChoicePolicy === 'always' ? 'retry_failed' : 'top_choice_required';
+  }
   if (shadowFill.filled > 0 || shadowFill.unfilled.length > 0 || (shadowFill.blocked || []).length > 0) {
     logger.debug({
       jobId, stepNum,
@@ -1160,32 +2459,61 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   }
 
   // ── Top-level form (resume upload, non-shadow controls) ──
+  const scopedFillOptions = hasDialogScope
+    ? { ...options, scopeSelector: 'dialog[data-agent-active-apply="true"]' }
+    : options;
   try {
-    await fillForm(page, defaultAnswers, config, logger, 'linkedin', jobId, options);
+    await fillForm(page, defaultAnswers, config, logger, 'linkedin', jobId, scopedFillOptions);
+  } catch (error) {
+    if (error?.code === 'TOP_CHOICE_POLICY_VIOLATION') {
+      logger.warn({ platform: 'linkedin', jobId, stepNum }, 'Could not enforce LinkedIn Top Choice policy in dialog form');
+      return configuredTopChoicePolicy === 'always' ? 'retry_failed' : 'top_choice_required';
+    }
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum, error: error?.message || String(error),
+    }, 'LinkedIn dialog form fill failed; refusing to advance or submit');
+    return 'retry_failed';
+  }
+
+  // ── Custom radio-group questions (2026-08 dialog UI) ──
+  // Invisible native inputs make these unreachable for fillForm.
+  try {
+    await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options);
   } catch (_) {}
 
   await sleep(500, 1000);
 
-  // ── Find and click the action button inside shadow DOM ──
+  // ── Find and click the action button ──
   // Playwright's locator() pierces shadow DOM automatically.
+  // 2026-08-13 redesign: the apply flow moved out of the interop shadow into
+  // a page-level <dialog> whose action buttons carry NO aria-label — just
+  // text ("Next", "Review", "Submit application"). The results pagination
+  // also has a "Next" button, so text matches MUST be dialog-scoped.
+  // Plain 'dialog' scope, deliberately NOT 'dialog:visible': the :visible
+  // variant made every flow stall on Next in the 2026-08-21 dry-run (clicks
+  // resolved against a different node than the working plain-scoped locator),
+  // while buttonSpecs' own isVisible() check already rejects hidden matches.
   const buttonSpecs = [
-    { locator: page.locator('button[aria-label="Submit application"]'), action: 'submit' },
-    { locator: page.locator('#interop-outlet button:has-text("Submit application")'), action: 'submit' },
-    { locator: page.locator('button[aria-label="Review your application"]'), action: 'next' },
-    { locator: page.locator('button[aria-label="Continue to next step"]'), action: 'next' },
-    { locator: page.locator('#interop-outlet button:has-text("Next")'), action: 'next' },
-    { locator: page.locator('#interop-outlet button:has-text("Review")'), action: 'next' },
-    { locator: page.locator('#interop-outlet button:has-text("Continue")'), action: 'next' },
+    { name: 'Submit application', action: 'submit', allowGlobal: true },
+    { name: 'Submit', action: 'submit' },
+    { name: 'Review your application', action: 'next', allowGlobal: true },
+    { name: 'Continue to next step', action: 'next', allowGlobal: true },
+    { name: 'Review', action: 'next' },
+    { name: 'Next', action: 'next' },
+    { name: 'Continue', action: 'next' },
+    // Legacy shadow buttons sometimes append step/progress text to the name.
+    // Anchor the prefix so "Review" cannot match an unrelated "Preview".
+    { name: /^Next(?:\s+(?:step\s+)?\d+\s*(?:\/|of)\s*\d+(?:\s*pages?)?)?$/i, action: 'next' },
+    { name: /^Review(?: your)? application(?:\s+\d+\s*(?:\/|of)\s*\d+\s*pages?)?$/i, action: 'next' },
+    { name: /^Continue(?:\s+(?:to\s+)?(?:step\s+)?\d+\s*(?:\/|of)\s*\d+(?:\s*pages?)?)?$/i, action: 'next' },
   ];
 
   let btn = null;
   let btnAction = null;
-  for (const { locator, action } of buttonSpecs) {
-    if (await locator.count() > 0 && await locator.first().isVisible()) {
-      btn = locator.first();
-      btnAction = action;
-      break;
-    }
+  for (const { name, action, exact = true, allowGlobal = false } of buttonSpecs) {
+    btn = await firstVisibleApplyButton(page, name, exact, allowGlobal);
+    if (btn) btnAction = action;
+    if (btn) break;
   }
 
   if (!btn) {
@@ -1196,23 +2524,61 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   const btnText = await btn.innerText().catch(() => '?');
   logger.debug({ platform: 'linkedin', jobId, btnText: btnText.trim(), action: btnAction, stepNum }, 'Clicking apply button');
 
+  const isEnabled = await btn.isEnabled().catch(() => false);
+  const ariaDisabled = await btn.getAttribute('aria-disabled').catch(() => null);
+  if (!isEnabled || ariaDisabled === 'true') {
+    logger.warn({ platform: 'linkedin', jobId, stepNum, action: btnAction }, 'Apply action button is disabled; refusing to advance');
+    return classifyApplyBlockage(page, config);
+  }
+
   if (btnAction === 'submit') {
+    // Controlled inputs can be asynchronously reselected after the fill pass.
+    // Re-check immediately before Submit so never-spend is an invariant, not
+    // merely a best-effort fill action.
+    const topChoiceState = await inspectTopChoiceState(page);
+    if (configuredTopChoicePolicy === 'always' && topChoiceState.present && !topChoiceState.checked) {
+      logger.warn({ platform: 'linkedin', jobId, stepNum }, 'Top Choice is unchecked under always-use policy; refusing to submit');
+      return 'retry_failed';
+    }
+    if (configuredTopChoicePolicy !== 'always' && topChoiceState.checked) {
+      logger.warn({ platform: 'linkedin', jobId, stepNum }, 'Top Choice is selected under never-spend policy; refusing to submit');
+      return 'top_choice_required';
+    }
     if (dryRun) {
       await screenshotError(page, 'linkedin', `dryrun-${jobId}`, config);
       logger.info({ jobId }, '[DRY RUN] Would submit — taking screenshot instead');
       // Dismiss the form
-      const dismissBtn = page.locator('button[aria-label="Dismiss"]').first();
       try {
-        if (await dismissBtn.count() > 0) {
-          await dismissBtn.evaluate(e => e.click());
-          await sleep(500, 1000);
-          const discardBtn = page.locator('button:has-text("Discard")').first();
-          if (await discardBtn.count() > 0) { await discardBtn.evaluate(e => e.click()); await sleep(500, 1000); }
-        }
+        await dismissActiveApplyUi(page);
       } catch (_) {}
       return 'submitted';
     }
-    await btn.evaluate(e => e.click());
+    const confirmationBaseline = await captureSubmissionConfirmationEvidence(page, {
+      markBaseline: true,
+      expectedJobId: jobId,
+    });
+    const clicked = await btn.evaluate((e) => {
+      if (e.disabled || e.getAttribute('aria-disabled') === 'true') return false;
+      e.click();
+      return true;
+    }).catch(() => false);
+    if (!clicked) {
+      await clearSubmissionConfirmationBaseline(page, confirmationBaseline.baselineToken);
+      logger.warn({ platform: 'linkedin', jobId, stepNum }, 'Submit click failed; application not submitted');
+      return 'retry_failed';
+    }
+    const confirmed = await waitForSubmissionConfirmation(page, {
+      // The current detail-panel confirmation regularly appears just after
+      // the old 10-second deadline. Screenshots from 13 real submissions on
+      // 2026-08-25..29 showed it 2-3 seconds after that timeout fired.
+      timeout: options.submissionConfirmationTimeout ?? 20000,
+      baselineEvidence: confirmationBaseline,
+      expectedJobId: jobId,
+    });
+    if (!confirmed) {
+      logger.warn({ platform: 'linkedin', jobId, stepNum }, 'Submit click was not confirmed; application not recorded as submitted');
+      return 'submit_unconfirmed';
+    }
     return 'submitted';
   }
 
@@ -1220,16 +2586,28 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
   await btn.evaluate(e => e.click());
   await sleep(1000, 1500);
 
-  // Check for validation errors inside shadow DOM
+  // Check for validation errors in both the legacy shadow root and the
+  // page-level dialog introduced by LinkedIn's 2026-08 redesign.
   const postClickErrors = await collectApplyValidationErrors(page);
 
   if (postClickErrors.length > 0) {
     // ── Structured diagnostics for validation failures ──
+    await markActiveApplyDialog(page);
     const fieldDiag = await page.evaluate(() => {
+      const roots = [];
+      const isVisible = (el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+          style.display !== 'none' && style.visibility !== 'hidden' &&
+          !el.hidden && el.getAttribute('aria-hidden') !== 'true';
+      };
+      const activeDialog = document.querySelector('dialog[data-agent-active-apply="true"]');
       const interop = document.querySelector('#interop-outlet');
-      if (!interop || !interop.shadowRoot) return [];
-      const sr = interop.shadowRoot;
+      if (activeDialog) roots.push({ root: activeDialog, inShadow: false });
+      else if (interop && interop.shadowRoot) roots.push({ root: interop.shadowRoot, inShadow: true });
       const fields = [];
+      for (const { root: sr, inShadow } of roots) {
       for (const el of sr.querySelectorAll('input, select, textarea')) {
         const rect = el.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
@@ -1243,7 +2621,7 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
           hasValue: !!(el.value && el.value.trim()),
           valueLen: (el.value || '').length,
           hasError: !!hasError,
-          inShadow: true,
+          inShadow,
         });
       }
       // Also check radio groups — fieldset first: closest('fieldset, div, li')
@@ -1253,8 +2631,9 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
         const legend = parent?.querySelector('legend') || parent?.querySelector('label');
         const groupLabel = legend ? legend.textContent.trim().substring(0, 80) : '';
         if (groupLabel && !fields.some(f => f.label === groupLabel)) {
-          fields.push({ tag: 'INPUT', type: 'radio', label: groupLabel, hasValue: radio.checked, valueLen: 0, hasError: false, inShadow: true });
+          fields.push({ tag: 'INPUT', type: 'radio', label: groupLabel, hasValue: radio.checked, valueLen: 0, hasError: false, inShadow });
         }
+      }
       }
       return fields;
     }).catch(() => []);
@@ -1266,7 +2645,19 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       btnText: btnText.trim(),
     }, 'Validation failure — field diagnostics');
 
-    const retry = await retryInvalidFields(page, defaultAnswers, config, logger, 'linkedin', jobId, options).catch(() => ({ retryFilled: 0 }));
+    const retryHasDialogScope = await markActiveApplyDialog(page);
+    const retryOptions = retryHasDialogScope
+      ? { ...options, scopeSelector: 'dialog[data-agent-active-apply="true"]' }
+      : options;
+    let retry;
+    try {
+      retry = await retryInvalidFields(page, defaultAnswers, config, logger, 'linkedin', jobId, retryOptions);
+    } catch (error) {
+      if (error?.code === 'TOP_CHOICE_POLICY_VIOLATION') {
+        return configuredTopChoicePolicy === 'always' ? 'retry_failed' : 'top_choice_required';
+      }
+      retry = { retryFilled: 0 };
+    }
     if (options.guardBlockedLabels) {
       for (const l of retry.guardedInvalid || []) options.guardBlockedLabels.add(l);
     }
@@ -1277,11 +2668,11 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       const stillErrors = await collectApplyValidationErrors(page);
       if (stillErrors.length > 0) {
         logger.warn({ platform: 'linkedin', jobId, stepNum, errors: stillErrors }, 'Validation still failing after retry');
-        return 'retry_failed';
+        return classifyApplyBlockage(page, config);
       }
       return 'next';
     }
-    return 'retry_failed';
+    return classifyApplyBlockage(page, config);
   }
   return 'next';
 }
@@ -1386,7 +2777,15 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   let currentPage = 1;
   let cardsSinceReload = 0;
   let abortPlatformRun = false;
+  let noResultsPageOne = false;
   const RELOAD_EVERY_CARDS = config.behavior?.linkedinReloadEveryCards || 5;
+  // Within-run dedup of the result carousel. LinkedIn re-serves the same
+  // promoted block after every reload, and a reload restarts the card loop
+  // from index 0 — without these sets, five consecutive post-click skips
+  // livelock the whole run re-recording the same cards (2,277 duplicate
+  // skip rows in the 2026-08-28 nightly run).
+  const seenRunCardKeys = new Set();
+  const seenRunJobIds = new Set();
 
   while (applied < maxApplications && currentPage <= maxPages) {
     // ── List result cards on current page (top-level page) ──
@@ -1395,6 +2794,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       cards = await listResultCards(page);
     } catch (_) {
       logger.warn({ platform: 'linkedin', page: currentPage }, 'Could not find result cards — may have reached end');
+      if (currentPage === 1) noResultsPageOne = true;
       break;
     }
 
@@ -1429,6 +2829,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       } else {
         logger.warn({ platform: 'linkedin', page: currentPage }, 'No result cards and could not capture page state');
       }
+      if (currentPage === 1) noResultsPageOne = true;
       break;
     }
 
@@ -1469,6 +2870,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           abortPlatformRun = true;
           break;
         }
+        // Restart scanning the re-listed cards. seenRunCardKeys makes cards
+        // that were already handled this run free (no click, no DB row), so
+        // restarting cannot livelock the loop.
         i = -1;
         continue;
       }
@@ -1493,6 +2897,16 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
         jobTitle = summary.title;
         company = summary.company;
+
+        // Within-run card dedup: the carousel re-serves the same promoted
+        // cards after reloads and across pages. First encounter decides and
+        // records the outcome; repeats are free.
+        const cardKey = [jobTitle, company, summary.location || ''].join('|').toLowerCase();
+        if (seenRunCardKeys.has(cardKey)) {
+          internalSkipped++;
+          continue;
+        }
+        seenRunCardKeys.add(cardKey);
 
         // Early-skip: card shows "Applied" badge
         if (summary.hasAppliedBadge) {
@@ -1524,6 +2938,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         jobId = detail.jobId;
         jobUrl = detail.jobUrl;
         source = detail.isPromoted ? 'promoted' : 'organic';
+
+        // Within-run jobId dedup for cards whose text differed between
+        // encounters (card badges/insight lines rotate between renders).
+        if (seenRunJobIds.has(jobId)) {
+          internalSkipped++;
+          continue;
+        }
+        seenRunJobIds.add(jobId);
 
         // Prefer detail-level title/company if available
         if (detail.title) jobTitle = detail.title;
@@ -1603,7 +3025,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         }
 
         // ── Step 6: Enter Easy Apply ──
-        if (!detail.easyApplyHref) {
+        // hasEasyApply covers the 2026-08-13 button variant (no href).
+        if (!detail.easyApplyHref && !detail.hasEasyApply) {
           logger.debug({ platform: 'linkedin', jobId, jobTitle, reason: 'no_easy_apply_button' }, 'Skipping');
           recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'no_easy_apply_button', source });
           continue;
@@ -1651,18 +3074,18 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         while (!applyComplete && stepCount < MAX_STEPS) {
           stepCount++;
 
-          // Fingerprint step by labels in the shadow DOM apply form
-          const fingerprint = await page.evaluate(() => {
-            const interop = document.querySelector('#interop-outlet');
-            const sr = interop?.shadowRoot;
-            if (!sr) return '';
-            const labels = [];
-            for (const lbl of sr.querySelectorAll('label, legend')) {
-              const t = (lbl.textContent || '').trim().substring(0, 60);
-              if (t) labels.push(t);
-            }
-            return labels.sort().join('||');
-          }).catch(() => '');
+          await markActiveApplyDialog(page);
+          let fingerprint = await captureApplyStepFingerprint(page);
+
+          if (fingerprint && seenFingerprints.has(fingerprint)) {
+            // The renderer may not have painted the next step yet: production
+            // sessions declared a cycle ~1.3s after a Next click. Allow one
+            // settle window and re-fingerprint before treating the repeat as
+            // a real cycle.
+            await sleep(2000, 3000);
+            await markActiveApplyDialog(page);
+            fingerprint = await captureApplyStepFingerprint(page);
+          }
 
           if (fingerprint && seenFingerprints.has(fingerprint)) {
             // Surface the actual unfilled labels — pre-fix the throw gave us
@@ -1673,22 +3096,14 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             // 'never' means the form is blocked by boost consent, not by an
             // unanswerable question (spec R14 — user decides, see spec
             // open question 4).
-            const topChoiceBlocked = await page.evaluate(() => {
-              const sr = document.querySelector('#interop-outlet')?.shadowRoot;
-              if (!sr) return false;
-              for (const cb of sr.querySelectorAll('input[type="checkbox"]')) {
-                if (cb.checked) continue;
-                const label = cb.id ? sr.querySelector(`label[for="${cb.id}"]`) : null;
-                const t = (label?.textContent || '').toLowerCase();
-                if (t.includes('top choice') || (t.includes('mark') && t.includes('job'))) return true;
-              }
-              return false;
-            }).catch(() => false);
+            const topChoicePolicy = config.platformPolicy?.linkedin?.topChoice || 'never';
+            const topChoiceBlocked = topChoicePolicy !== 'always' && await detectTopChoiceBlocked(page);
 
             logger.warn({
               jobId, jobTitle, company,
               stepNum: stepCount,
               unfilledLabels: labels,
+              topChoicePolicy,
               topChoiceBlocked,
             }, 'Apply flow cycled — unfilled required fields (label diagnostic)');
             const cycleErr = new Error(topChoiceBlocked
@@ -1705,22 +3120,26 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
           const result = await handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount, fillOptions);
 
-          if (result === 'retry_failed') {
-            const valErr = new Error(`Validation errors on step ${stepCount} — retry failed`);
-            if (fillOptions.guardBlockedLabels.size > 0) {
+          if (result === 'retry_failed' || result === 'top_choice_required' || result === 'submit_unconfirmed') {
+            // 'submit_unconfirmed' gets its own message: the 2026-08-25..29
+            // runs recorded 13 real submissions as "Validation errors" because
+            // an unconfirmed submit was indistinguishable from a form bounce.
+            const valErr = new Error(result === 'top_choice_required'
+              ? 'top_choice_required_review — form blocked on boost checkbox, policy is never-spend'
+              : result === 'submit_unconfirmed'
+                ? `Submit clicked on step ${stepCount} but no confirmation observed — outcome unverified`
+                : `Validation errors on step ${stepCount} — retry failed`);
+            // An unconfirmed submit is an unknown outcome and must surface as
+            // an error: guard metadata would downgrade it to a routine skip
+            // and hide it from run health and forensics.
+            if (result !== 'submit_unconfirmed' && fillOptions.guardBlockedLabels.size > 0) {
               valErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
+            } else if (result === 'top_choice_required') {
+              valErr.policyAbandonment = 'top_choice_required';
             }
             throw valErr;
           } else if (result === 'submitted') {
             applyComplete = true;
-
-            if (!dryRun) {
-              // Wait for success confirmation
-              await page.waitForSelector(
-                'text="Application submitted", text="Your application was sent"',
-                { timeout: 10000 }
-              ).catch(() => null);
-            }
 
             logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Application submitted');
             recordOutcome({ status: dryRun ? 'dry_run' : 'submitted', jobId, jobTitle, company, jobUrl, steps: stepCount, source });
@@ -1729,8 +3148,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             await sleep(1000, 2000);
             for (const sel of ['button[aria-label="Dismiss"]', 'button:has-text("Done")', 'button:has-text("Not now")']) {
               try {
-                const loc = page.locator(sel).first();
-                if (await loc.count() > 0 && await loc.isVisible()) {
+                const loc = await firstVisibleApplyControl(page, sel);
+                if (loc) {
                   await loc.evaluate(e => e.click());
                   await sleep(500, 1000);
                   break;
@@ -1755,17 +3174,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Try to recover — dismiss any open apply UI
         try { await page.evaluate(() => document.activeElement?.blur()).catch(() => {}); } catch (_) {}
         try {
-          // Try dismissing in both the apply frame and the top-level page
-          for (const ctx of [page]) {
-            const dismissBtn = await ctx.$('button[aria-label="Dismiss"]');
-            if (dismissBtn) {
-              await dismissBtn.evaluate(e => e.click());
-              await sleep(500, 1000);
-              const discardBtn = await ctx.$('button:has-text("Discard")');
-              if (discardBtn) { await discardBtn.evaluate(e => e.click()); await sleep(500, 1000); }
-              break;
-            }
-          }
+          await dismissActiveApplyUi(page);
         } catch (_) {}
 
         await sleep(1000, 2000);
@@ -1806,7 +3215,10 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     }
   }
 
-  return { applied, skipped, errors, alreadyApplied, internalSkipped };
+  // aborted/noResults let the orchestrator distinguish an incomplete scan
+  // (reload failure, empty page 1 = challenge/DOM break/login bounce) from a
+  // genuinely exhausted healthy run.
+  return { applied, skipped, errors, alreadyApplied, internalSkipped, aborted: abortPlatformRun, noResults: noResultsPageOne };
 }
 
 module.exports = {
@@ -1817,6 +3229,18 @@ module.exports = {
   shouldApply,
   isRemoteLocation,
   fillShadowForm,
+  fillDialogRadioGroups,
+  handleInlineApplyStep,
+  collectApplyValidationErrors,
+  detectTopChoiceBlocked,
+  markActiveApplyDialog,
+  mapEducationAnswerToYesNo,
+  matchDialogRadioOption,
+  waitForSubmissionConfirmation,
+  captureSubmissionConfirmationEvidence,
+  firstVisibleLocator,
+  firstVisibleApplyControl,
+  dismissActiveApplyUi,
   hasLinkedInDailySubmissionLimitMessage,
   normalizeVisibleText,
   analyzeSearchPageState,
