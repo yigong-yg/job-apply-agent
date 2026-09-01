@@ -61,6 +61,16 @@ node index.js --platform linkedin    # Production run (uses .env MAX_APPLICATION
 node index.js                        # Full run, all enabled platforms
 ```
 
+## Scheduling & Budgets
+
+- `run_apply.ps1` runs one slot per Denver day each: morning (<12h), midday (<18h), evening.
+  Triggers opt into slots with `-Slots morning` etc.; the default is evening-only so the
+  legacy daily-18:00 and user-logon triggers cannot start daytime production runs.
+- `DAILY_MAX_APPLICATIONS` (env, default 30) is a cumulative Denver-day submission ceiling:
+  every production run subtracts today's submitted count before applying its per-run max.
+- Dry runs are recorded with `runs.mode = 'dry_run'`; their rows never feed production
+  failure cooldowns or company caps.
+
 ## LinkedIn-Specific Knowledge
 
 ### Search URL (`buildLinkedInSearchUrl()` in `modules/linkedin.js`)
@@ -70,13 +80,18 @@ node index.js                        # Full run, all enabled platforms
 - Keywords from `config.search.keywords`, space-joined (not OR-joined)
 - Location filtering is via `geoId` + `distance` in the URL — there is no runtime "All filters" dialog interaction
 
-### DOM Architecture (verified 2026-04-10)
+### DOM Architecture (verified 2026-08-21, re-verified 2026-08-28; redesign landed ~2026-08-13)
 - **Job cards + detail panel:** top-level page, NOT inside any iframe
 - **Cards:** `<div role="button">` elements found via `page.getByRole('button').filter({hasText: 'Easy Apply'})`
-- **Easy Apply entry:** `<a aria-label="Easy Apply to this job">` in the detail panel, clicked to open the form
-- **Apply form:** renders inside `#interop-outlet` → `shadowRoot` (shadow DOM). Standard `page.$()` and `fillForm()` cannot see into it — must use `page.evaluate()` to access the shadow root directly
-- **`interop-outlet` overlay:** intercepts pointer events on ALL elements. All clicks must use `el.evaluate(e => e.click())` (JS click) or `{ force: true }`, not regular Playwright `.click()`
+- **Easy Apply entry:** `<button aria-label="Easy Apply to this job">Easy Apply</button>` in the detail panel (was an `<a>` with an `/apply/` href pre-08-13 — anchor-only matching caused 9 days of `no_easy_apply_button` on every job). External jobs render `<button aria-label="Apply on company website">` and must not match.
+- **Apply form:** renders in a page-level native `<dialog>` ("N/M pages" step indicator) — NO LONGER in the `#interop-outlet` shadow root (which now holds only styles). `fillShadowForm` is a no-op on this UI; page-level `fillForm` + `fillDialogRadioGroups` do the work.
+- **Form action buttons:** `<button>` with text only ("Next", "Review", "Submit application") and NO aria-label. The results pagination also has a "Next" button — action-button locators must be scoped to `dialog`.
+- **Screener radios:** `<p>question</p>` followed by `<fieldset role="radiogroup">` of `div[role="radio"]` (aria-label = option, aria-checked = state). The native `input[type=radio]` inside is INVISIBLE — visibility-filtered fill code never sees it; click the `div[role="radio"]`.
+- **Text inputs:** interact via the ELEMENT HANDLE (`handle.fill()`/`handle.type()`), never a re-resolved `#id`/`[name=]` selector — the dialog UI reuses ids/names on hidden template nodes and typing lands elsewhere.
+- **Overlay:** pointer events are still intercepted. All clicks must use `el.evaluate(e => e.click())` (JS click) or `{ force: true }`, not regular Playwright `.click()`
 - **Promoted detection:** "Promoted by hirer" text in the detail panel (not in card text)
+- **Post-submit confirmation:** the dialog CLOSES on submit and the detail panel renders plain text "Application status / Application submitted" — NOT a modal, NOT a live region, and often 2-3s after 10s have passed. `waitForSubmissionConfirmation` accepts it only when the URL still identifies the submitted job and the status is new vs the pre-click baseline (20s wait). 13 real submissions on 2026-08-25..29 were logged as "Validation errors" before this evidence existed.
+- **Result-list carousel:** LinkedIn re-serves the same promoted card block at the top after every reload, and the scan loop restarts at index 0 after its every-5-clicked-cards reload. The within-run seen-sets (`seenRunCardKeys`/`seenRunJobIds` in `applyLinkedIn`) are what prevent an infinite reload livelock — do not remove them. Pre-fix, runs spent ~2h re-recording the same 5 cards (2,277 duplicate skip rows on 2026-08-28, applied:0).
 
 ### Rate Limits
 - Daily Easy Apply limit: ~35 applications
