@@ -12,6 +12,8 @@ const {
   isJobCardText,
   APPLY_LINK_ARIA_LABELS,
   buildApplyLinkSelector,
+  mapEducationAnswerToYesNo,
+  matchDialogRadioOption,
 } = require('../modules/linkedin');
 
 let passed = 0;
@@ -550,6 +552,181 @@ test('buildApplyLinkSelector emits a comma-separated CSS selector covering all a
   assert(sel.includes('a[aria-label="Easy Apply to this job"]'));
   // Should be a valid multi-selector
   assert(sel.split(',').length >= 2);
+});
+
+test('buildApplyLinkSelector matches the 2026-08-13 BUTTON variant of the apply control', () => {
+  // LinkedIn replaced the apply <a href=".../apply/..."> with
+  // <button aria-label="Easy Apply to this job">Easy Apply</button>
+  // (probe 2026-08-21). Anchor-only matching produced 9 days of
+  // no_easy_apply_button on every job (zero submissions 08-13 → 08-21).
+  const sel = buildApplyLinkSelector();
+  assert(sel.includes('button[aria-label="Easy Apply to this job"]'));
+  assert(sel.includes('button[aria-label="LinkedIn Apply to this job"]'));
+  // The external-apply control must never match.
+  assert(!sel.includes('Apply on company website'));
+});
+
+test('education rank maps only explicit thresholds to Yes', () => {
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have at least a bachelor degree?', "Master's Degree"),
+    'Yes'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Is an associate degree your highest education level?', "Master's Degree"),
+    'No'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have a bachelor degree?', "Master's Degree"),
+    null
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Is an MBA your highest degree?', "Master's Degree"),
+    null
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Is an MBA your highest degree?', 'MBA'),
+    'Yes'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have a degree in computer science?', "Master's Degree"),
+    null
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo("Do you have a computer science bachelor's degree?", 'Bachelor of Science'),
+    null
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo(
+      "Do you have a computer science bachelor's degree?",
+      "Computer Science Bachelor's Degree"
+    ),
+    'Yes'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have a B.S. in Computer Science?', 'B.S. in Chemistry'),
+    null
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Do you have a B.S. in Computer Science?', 'B.S. in Computer Science'),
+    'Yes'
+  );
+  for (const question of [
+    'Is a Master of Engineering your highest degree?',
+    'Is a Master of Public Health your highest degree?',
+    'Is your highest degree a Masters in computer science?',
+  ]) {
+    assert.strictEqual(mapEducationAnswerToYesNo(question, "Master's Degree"), null, question);
+  }
+  assert.strictEqual(
+    mapEducationAnswerToYesNo('Is a Master of Engineering your highest degree?', 'Master of Engineering'),
+    'Yes'
+  );
+  // LinkedIn's standard screener boilerplate wraps the level in "the
+  // following level of education:" — the wrapper must not defeat the
+  // generic-subject check (the 2026-08-30/31 production runs lost several
+  // applications to this phrasing).
+  assert.strictEqual(
+    mapEducationAnswerToYesNo(
+      "Have you completed the following level of education: Master's Degree?",
+      "Master's Degree"
+    ),
+    'Yes'
+  );
+  assert.strictEqual(
+    mapEducationAnswerToYesNo(
+      "Have you completed the following level of education: Bachelor's Degree or above?",
+      "Master's Degree"
+    ),
+    'Yes'
+  );
+  // Below-highest without threshold wording stays unanswered by design.
+  assert.strictEqual(
+    mapEducationAnswerToYesNo(
+      "Have you completed the following level of education: Bachelor's Degree?",
+      "Master's Degree"
+    ),
+    null
+  );
+  // A configured Master's grounds an honest No for a PhD-level question.
+  assert.strictEqual(
+    mapEducationAnswerToYesNo(
+      'Have you completed the following level of education: Doctor of Philosophy?',
+      "Master's Degree"
+    ),
+    'No'
+  );
+  for (const question of [
+    "Is your highest level of education a Bachelor's or Master's degree?",
+    'Is a Juris Doctor your highest degree?',
+    'Is a Medical Doctor your highest degree?',
+    'Is a Doctorate in Nursing Practice your highest degree?',
+    'Is an MBA in Finance your highest degree?',
+    "Does your Master's degree have a concentration in finance?",
+  ]) {
+    assert.strictEqual(mapEducationAnswerToYesNo(question, 'PhD'), null, question);
+  }
+});
+
+test('dialog option matching does not confuse short numeric choices', () => {
+  const options = ['0', '1', '2', '10+'].map((label) => ({ label }));
+  assert.strictEqual(matchDialogRadioOption(options, '10'), null);
+  assert.strictEqual(matchDialogRadioOption(options, '1').label, '1');
+  assert.strictEqual(matchDialogRadioOption(options, '10+').label, '10+');
+});
+
+test('dialog option matching accepts only supported sensitive-status phrases', () => {
+  const options = ['Protected veteran', 'Not a protected veteran'].map((label) => ({ label }));
+  const matched = matchDialogRadioOption(options, 'I am not a protected veteran');
+  assert.strictEqual(matched.label, 'Not a protected veteran');
+  assert.strictEqual(matchDialogRadioOption(options, 'Veteran'), null);
+
+  const genderOptions = ['Cisgender woman', 'Transgender woman'].map((label) => ({ label }));
+  assert.strictEqual(matchDialogRadioOption(genderOptions, 'Woman'), null);
+
+  assert.strictEqual(
+    matchDialogRadioOption([{ label: 'I am not a protected veteran.' }], 'I am not a protected veteran').label,
+    'I am not a protected veteran.'
+  );
+});
+
+test('dialog option matching leaves same-polarity qualified choices ambiguous', () => {
+  const options = [
+    'Authorized to work in the United States',
+    'Authorized to work in Canada',
+  ].map((label) => ({ label }));
+  assert.strictEqual(matchDialogRadioOption(options, 'Authorized to work'), null);
+
+  const genderOptions = [
+    'Male',
+    'Female (including transgender women)',
+  ].map((label) => ({ label }));
+  assert.strictEqual(matchDialogRadioOption(genderOptions, 'Female'), null);
+});
+
+test('dialog option matching bridges only explicit decline-to-answer synonyms', () => {
+  const options = [
+    'Yes, I have a disability',
+    'No, I do not have a disability',
+    'I do not want to answer',
+  ].map((label) => ({ label }));
+  assert.strictEqual(
+    matchDialogRadioOption(options, 'I do not wish to answer').label,
+    'I do not want to answer'
+  );
+  assert.strictEqual(matchDialogRadioOption(options, 'I do not have a disability'), null);
+
+  assert.strictEqual(
+    matchDialogRadioOption([{ label: 'I prefer not to specify' }], 'Prefer not to say').label,
+    'I prefer not to specify'
+  );
+  assert.strictEqual(
+    matchDialogRadioOption([{ label: 'Decline to self-identify' }], "I don't wish to answer").label,
+    'Decline to self-identify'
+  );
+  assert.strictEqual(
+    matchDialogRadioOption([{ label: 'I prefer not to self-identify' }], 'I do not want to self-identify').label,
+    'I prefer not to self-identify'
+  );
 });
 
 // ── Summary ──

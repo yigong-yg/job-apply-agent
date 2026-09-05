@@ -165,8 +165,49 @@ test('answers US citizen Yes from workAuthorization', () => {
   assert.strictEqual(r.answer, 'Yes');
 });
 
-test('answers are-you-a-veteran No from veteranStatus', () => {
+test('blocks compound-jurisdiction authorization not fully covered', () => {
+  // Overlap semantics answered "United States and Canada?" Yes from US-only
+  // config; every asked jurisdiction must now be covered.
+  const r = guardAnswer('Are you legally authorized to work in the United States and Canada?', ctx);
+  assert.strictEqual(r.action, 'block');
+});
+
+test('answers capitalized US authorization from US config', () => {
+  const r = guardAnswer('Are you legally authorized to work in the US?', ctx);
+  assert.strictEqual(r.action, 'answer');
+  assert.strictEqual(r.answer, 'Yes');
+});
+
+test('the pronoun us is not a jurisdiction claim', () => {
+  // "work with us" is generic eligibility — answerable — while a lowercase
+  // "us" must never satisfy a different named jurisdiction.
+  const generic = guardAnswer('Are you legally authorized to work with us?', ctx);
+  assert.strictEqual(generic.action, 'answer');
+  assert.strictEqual(generic.answer, 'Yes');
+
+  const canada = guardAnswer('Are you eligible to work in Canada with us?', ctx);
+  assert.strictEqual(canada.action, 'block');
+});
+
+test('blocks are-you-a-veteran when status only denies protected status', () => {
+  // 'I am not a protected veteran' does not say the user never served, so a
+  // generic veteran question cannot be derived from it.
   const r = guardAnswer('Are you a veteran?', ctx);
+  assert.strictEqual(r.action, 'block');
+});
+
+test('answers protected-veteran question No from not-protected status', () => {
+  const r = guardAnswer('Are you a protected veteran?', ctx);
+  assert.strictEqual(r.action, 'answer');
+  assert.strictEqual(r.answer, 'No');
+});
+
+test('answers are-you-a-veteran No from an unambiguous negative status', () => {
+  const neverServed = {
+    ...ctx,
+    config: { user: { ...config.user, veteranStatus: 'Never served in the military' } },
+  };
+  const r = guardAnswer('Are you a veteran?', neverServed);
   assert.strictEqual(r.action, 'answer');
   assert.strictEqual(r.answer, 'No');
 });

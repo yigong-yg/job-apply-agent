@@ -27,13 +27,19 @@ if (!fs.existsSync(configPath) || !fs.existsSync(answersPath)) {
   console.error(`Error: missing ${missing.join(' and ')}. Copy from .example templates:\n  cp config.json.example config.json\n  cp defaultAnswers.json.example defaultAnswers.json\nThen fill in your personal details.`);
   process.exit(2);
 }
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-const defaultAnswers = JSON.parse(fs.readFileSync(answersPath, 'utf8'));
+// Windows editors and PowerShell 5.1 write UTF-8 with a BOM, which strict
+// JSON.parse rejects — a BOM-carrying config crashed the 2026-08-31 launcher.
+function readJsonFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^﻿/, ''));
+}
+const config = readJsonFile(configPath);
+const defaultAnswers = readJsonFile(answersPath);
 
 // Core libraries
 const logger = require('./lib/logger');
 const state = require('./lib/state');
 const { launchForPlatform, checkLoginStatus } = require('./lib/browser');
+const { getRunExitCode, clampToDailyBudget } = require('./lib/run-health');
 
 // LLM support
 const { createLLMCache, setUserContext } = require('./lib/llm');
@@ -292,8 +298,9 @@ async function main() {
     }
   }
 
-  // Create a new run record in SQLite (sessionId is auto-increment)
-  const { runId, sessionId } = state.createRun();
+  // Create a new run record in SQLite (sessionId is auto-increment). The mode
+  // keeps dry-run rows out of production cooldown and cap queries.
+  const { runId, sessionId } = state.createRun({ mode: runtime.dryRun ? 'dry_run' : 'production' });
 
   // Create per-run LLM cache (shared across platforms for dedup)
   const llmCache = createLLMCache();
@@ -354,6 +361,26 @@ async function main() {
       config.platforms[platform].maxApplicationsPerRun = runtime.maxApplications;
     }
 
+    // Cumulative Denver-day ceiling: each slot run re-applies its own per-run
+    // max, so without this a multi-slot day could authorize several times the
+    // intended daily volume. Dry runs submit nothing and are exempt.
+    if (!runtime.dryRun) {
+      const dailyCap = Number(process.env.DAILY_MAX_APPLICATIONS || config.behavior?.dailyMaxApplications || 30);
+      const submittedToday = state.getTodaySubmittedCount();
+      const allowance = clampToDailyBudget({
+        perRunMax: config.platforms[platform].maxApplicationsPerRun,
+        dailyCap,
+        submittedToday,
+      });
+      if (allowance <= 0) {
+        platformLogger.info({ dailyCap, submittedToday }, 'Daily submission ceiling reached — skipping platform');
+        runStats[platform] = { applied: 0, skipped: 0, errors: 0, alreadyApplied: 0, internalSkipped: 0, dailyCapReached: true };
+        continue;
+      }
+      config.platforms[platform].maxApplicationsPerRun = allowance;
+      platformLogger.info({ dailyCap, submittedToday, allowance }, 'Applying daily submission budget');
+    }
+
     let context = null;
     let page = null;
 
@@ -383,6 +410,16 @@ async function main() {
 
       runStats[platform] = platformStats;
       platformLogger.info(platformStats, 'Platform complete');
+      // A scan that aborted (reload/re-list failure) or found no result cards
+      // at all is an infrastructure failure, not a completed run: mark it
+      // unhealthy so the launcher's later trigger retries the slot.
+      if (platformStats?.aborted || (platformStats?.noResults && (platformStats.applied || 0) === 0)) {
+        platformCrashed = true;
+        platformLogger.warn(
+          { aborted: !!platformStats.aborted, noResults: !!platformStats.noResults },
+          'Platform scan did not complete — run marked unhealthy for retry'
+        );
+      }
       if (platformStats?.stopSession) {
         stopSessionRequested = true;
         platformLogger.warn(
@@ -457,11 +494,20 @@ async function main() {
   }, logger);
 
   // Exit codes the launcher can act on: 3 = session expired (retry + human
-  // re-login needed), 1 = platform crashed mid-run (retry recovers budget;
-  // dedup prevents double submissions), 0 = clean run incl. daily-limit stop.
-  if (sessionExpiredPlatforms.length > 0) process.exit(3);
-  if (platformCrashed) process.exit(1);
-  process.exit(0);
+  // re-login needed), 1 = an unhealthy production run (platform crash or
+  // errors with zero submissions), 0 = healthy run incl. dry runs and
+  // daily-limit stops. Nonzero prevents run_apply.ps1 from marking the day
+  // successful, allowing its later scheduled trigger to retry.
+  const dbRunStats = state.getRunStats(runId);
+  const captchaBlocked = Object.values(dbRunStats).some((s) => (s.captcha_blocked || 0) > 0);
+  process.exit(getRunExitCode({
+    dryRun: runtime.dryRun,
+    totalApplied,
+    totalErrors,
+    sessionExpired: sessionExpiredPlatforms.length > 0,
+    platformCrashed,
+    captchaBlocked,
+  }));
 }
 
 main().catch((err) => {
