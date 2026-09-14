@@ -22,6 +22,51 @@ const { fillForm } = require('../lib/form-filler');
 const { recordUnfilledField } = require('../lib/state');
 
 const SELECTOR_TIMEOUT = 10000;
+const SUBMISSION_CONFIRMATION_TEXT = [
+  'Your application has been submitted',
+  'Application submitted',
+];
+const SUBMISSION_CONFIRMATION_SELECTORS = ['[data-testid="postApplyPage"]'];
+
+function submissionConfirmationLocators(pageOrPages) {
+  const pages = [...new Set(Array.isArray(pageOrPages) ? pageOrPages : [pageOrPages])];
+  return pages.flatMap((page) => {
+    if (!page || typeof page.locator !== 'function' || typeof page.getByText !== 'function') return [];
+    return [
+      ...SUBMISSION_CONFIRMATION_SELECTORS.map((selector) => page.locator(selector)),
+      ...SUBMISSION_CONFIRMATION_TEXT.map((text) => page.getByText(text, { exact: false })),
+    ];
+  });
+}
+
+async function hasVisibleSubmissionConfirmation(page) {
+  for (const evidence of submissionConfirmationLocators(page)) {
+    const matches = await evidence.all().catch(() => []);
+    for (const match of matches) {
+      if (await match.isVisible().catch(() => false)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Wait for explicit post-submit evidence. A confirmation that was already on
+ * the page before the click is deliberately not accepted for the current job.
+ */
+async function waitForSubmissionConfirmation(page, options = {}) {
+  const { timeout = 10000, preexistingEvidence = false } = options;
+  if (preexistingEvidence) return false;
+  const locators = submissionConfirmationLocators(page);
+  if (locators.length === 0) return false;
+  const deadline = Date.now() + timeout;
+  do {
+    if (await hasVisibleSubmissionConfirmation(page)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+  } while (Date.now() <= deadline);
+  return false;
+}
 
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
@@ -81,10 +126,17 @@ function isIndeedDomain(url) {
 
 /**
  * Handle a single step of the Indeed apply form.
- * Returns 'next', 'submitted', or 'error'.
+ * Returns 'next', 'submitted', 'submit_unconfirmed', 'dry_run', or 'error'.
  */
 async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dryRun, options = {}) {
   await sleep(800, 1500);
+
+  const {
+    confirmationPage = page,
+    submissionConfirmationTimeout = 10000,
+    onSubmitAttempt = () => {},
+    ...fillOptions
+  } = options;
 
   const { filledCount, unfilledFields } = await fillForm(
     page,
@@ -93,7 +145,7 @@ async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dry
     logger,
     'indeed',
     jobId,
-    options
+    fillOptions
   );
 
   for (const field of unfilledFields) {
@@ -120,10 +172,16 @@ async function handleIndeedStep(page, defaultAnswers, config, logger, jobId, dry
         if (dryRun) {
           await screenshotError(page, 'indeed', `dryrun-${jobId}`, config);
           logger.info({ jobId }, '[DRY RUN] Would submit Indeed application');
-          return 'submitted';
+          return 'dry_run';
         }
+        const preexistingEvidence = await hasVisibleSubmissionConfirmation(confirmationPage);
+        onSubmitAttempt();
         await btn.click();
-        return 'submitted';
+        const confirmed = await waitForSubmissionConfirmation(confirmationPage, {
+          timeout: submissionConfirmationTimeout,
+          preexistingEvidence,
+        });
+        return confirmed ? 'submitted' : 'submit_unconfirmed';
       } else {
         await btn.click();
         return 'next';
@@ -166,8 +224,14 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
   const retryAttempts = new Map(); // jobId → number of retries made
 
   let applied = 0;
+  let dryRunReady = 0;
+  let submissionAttempts = 0;
+  let budgetUsed = 0;
   let skipped = 0;
   let errors = 0;
+  let aborted = false;
+  let noResults = false;
+  let sawUsableJob = false;
 
   const searchUrl = buildSearchUrl(config);
   logger.info({ platform: 'indeed', searchUrl }, 'Navigating to Indeed search');
@@ -182,12 +246,12 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
       platform: 'indeed', jobId: 'captcha_detected',
       status: 'captcha_blocked', errorMessage: 'Bot/CAPTCHA detection triggered — platform stopped', runId,
     });
-    return { applied, skipped, errors };
+    return { applied, skipped, errors, aborted, noResults, captchaBlocked: true };
   }
   let currentPage = 1;
   let pageHasMoreJobs = true;
 
-  while (applied < maxApplications && pageHasMoreJobs) {
+  while (budgetUsed < maxApplications && pageHasMoreJobs) {
     // Wait for job cards container
     try {
       await page.waitForSelector('#mosaic-provider-jobcards, .jobsearch-ResultsList', {
@@ -195,6 +259,8 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
       });
     } catch (_) {
       logger.warn({ platform: 'indeed' }, 'Job cards container not found');
+      if (currentPage === 1) noResults = true;
+      else aborted = true;
       break;
     }
 
@@ -203,16 +269,19 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
     // Get job cards — Indeed uses li elements with data-jk
     const jobCards = await page.$$('li[data-jk], .job_seen_beacon, .slider_item');
     logger.info({ platform: 'indeed', cardCount: jobCards.length, page: currentPage }, 'Found job cards');
+    if (currentPage === 1 && jobCards.length === 0) noResults = true;
 
     const cardsToProcess = [...jobCards];
 
-    while (cardsToProcess.length > 0 && applied < maxApplications) {
+    while (cardsToProcess.length > 0 && budgetUsed < maxApplications) {
       const card = cardsToProcess.shift();
 
       let jobId = null;
       let jobTitle = null;
       let company = null;
       let jobUrl = null;
+      let submitAttempted = false;
+      let submitOutcomeRecorded = false;
 
       try {
         jobId = await extractIndeedJobId(card);
@@ -220,10 +289,14 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
           skipped++;
           continue;
         }
+        sawUsableJob = true;
 
         if (state.hasApplied('indeed', jobId)) {
           logger.debug({ jobId }, 'Already applied — skipping');
-          state.recordApplication({ platform: 'indeed', jobId, status: 'already_applied', runId });
+          state.recordApplication({
+            platform: 'indeed', jobId, status: 'already_applied',
+            skipReason: 'already_applied_db', runId,
+          });
           skipped++;
           continue;
         }
@@ -306,7 +379,7 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
           if (closeBtn) await closeBtn.click();
           state.recordApplication({
             platform: 'indeed', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', runId,
+            status: 'already_applied', skipReason: 'already_applied_indeed', runId,
           });
           skipped++;
           continue;
@@ -327,7 +400,7 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
             platform: 'indeed', jobId: 'captcha_detected',
             status: 'captcha_blocked', errorMessage: 'Bot/CAPTCHA detection triggered — platform stopped', runId,
           });
-          return { applied, skipped, errors };
+          return { applied, skipped, errors, aborted, noResults, captchaBlocked: true };
         }
 
         // Check if apply form loaded in an iframe
@@ -349,6 +422,14 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
           llmCache: llmCache || undefined,
           llmBudget,
           runId,
+          confirmationPage: [page, applyPage],
+          onSubmitAttempt: () => {
+            if (!submitAttempted) {
+              submitAttempted = true;
+              submissionAttempts++;
+              budgetUsed++;
+            }
+          },
         };
 
         // Multi-step form navigation
@@ -360,22 +441,35 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
           stepCount++;
           const result = await handleIndeedStep(applyPage, defaultAnswers, config, logger, jobId, dryRun, fillOptions);
 
-          if (result === 'submitted') {
+          if (result === 'submitted' || result === 'dry_run') {
             formComplete = true;
-
-            // Wait for confirmation
-            await page.waitForSelector(
-              'text="Your application has been submitted", text="application submitted", [data-testid="postApplyPage"]',
-              { timeout: 10000 }
-            ).catch(() => null);
-
-            logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Indeed application submitted');
+            logger.info(
+              { jobId, jobTitle, company, steps: stepCount },
+              result === 'dry_run' ? '[DRY RUN] Indeed application reached submit' : 'Indeed application submitted'
+            );
             state.recordApplication({
               platform: 'indeed', jobId, jobTitle, company, jobUrl,
-              status: dryRun ? 'dry_run' : 'submitted', runId,
+              status: result === 'dry_run' ? 'dry_run' : 'submitted', runId,
             });
-            applied++;
-
+            submitOutcomeRecorded = result === 'submitted';
+            if (result === 'submitted') applied++;
+            else {
+              dryRunReady++;
+              budgetUsed++;
+            }
+          } else if (result === 'submit_unconfirmed') {
+            formComplete = true;
+            errors++;
+            logger.error(
+              { jobId, jobTitle, company, steps: stepCount },
+              'Indeed submit click was not confirmed; outcome recorded as unverified'
+            );
+            state.recordApplication({
+              platform: 'indeed', jobId, jobTitle, company, jobUrl,
+              status: 'submit_unconfirmed',
+              errorMessage: 'Submit clicked but confirmation evidence timed out', runId,
+            });
+            submitOutcomeRecorded = true;
           } else if (result === 'error') {
             throw new Error(`Could not navigate Indeed form step ${stepCount}`);
           }
@@ -399,6 +493,24 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
 
         await sleep(2000, 4000);
 
+        // A click that threw or a post-submit navigation failure has an
+        // unknown outcome. Never enqueue the same card for a retry.
+        if (submitAttempted) {
+          if (!submitOutcomeRecorded) {
+            errors++;
+            state.recordApplication({
+              platform: 'indeed', jobId, jobTitle, company, jobUrl,
+              status: 'submit_unconfirmed',
+              errorMessage: `Submit click outcome unknown: ${err.message}`, runId,
+            });
+          }
+          logger.error(
+            { platform: 'indeed', jobId, error: err.message },
+            'Error after submit attempt; ending platform run to prevent a duplicate'
+          );
+          return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted: true, noResults, captchaBlocked: false };
+        }
+
         // Check for bot detection before deciding whether to retry (PRD §8.2)
         if (await isBotDetected(page)) {
           logger.error({ platform: 'indeed' }, 'Bot detection after error — stopping Indeed');
@@ -406,7 +518,7 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
             platform: 'indeed', jobId: 'captcha_detected',
             status: 'captcha_blocked', errorMessage: 'Bot/CAPTCHA detection triggered — platform stopped', runId,
           });
-          return { applied, skipped, errors };
+          return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted, noResults, captchaBlocked: true };
         }
 
         // Retry transient errors up to maxRetries times
@@ -428,7 +540,7 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
     }
 
     // Pagination: Indeed uses page links at the bottom
-    if (applied < maxApplications) {
+    if (budgetUsed < maxApplications) {
       try {
         const nextPageLink = await page.$(
           `a[aria-label="Page ${currentPage + 1}"], a[data-testid="pagination-page-next"]`
@@ -441,12 +553,14 @@ async function applyIndeed(page, config, defaultAnswers, state, runId, logger, d
           pageHasMoreJobs = false;
         }
       } catch (_) {
+        aborted = true;
         pageHasMoreJobs = false;
       }
     }
   }
 
-  return { applied, skipped, errors };
+  if (maxApplications > 0 && !sawUsableJob) noResults = true;
+  return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted, noResults, captchaBlocked: false };
 }
 
-module.exports = { applyIndeed };
+module.exports = { applyIndeed, waitForSubmissionConfirmation };
