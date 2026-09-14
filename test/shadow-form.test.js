@@ -1640,6 +1640,48 @@ const SHADOW_HTML = `
     assert.strictEqual(noCountryLabels.size, 2);
   });
 
+  // ── Compound false positives answered end to end (2026-09-13) ──
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/5 pages</div>
+      ${nativeRadioGroup('compound-sponsor', 'Do you now or will you in the future require sponsorship to work in the United States?', ['Yes', 'No'])}
+      ${nativeRadioGroup('compound-citizen', 'Are you a US Citizen or Green Card holder?', ['Yes', 'No'])}
+      ${nativeRadioGroup('compound-age', 'Are you at least 18 years of age and legally eligible to perform the duties of this position?', ['Yes', 'No'])}
+    </dialog>`);
+  const compoundLabels = new Set();
+  const compoundResult = await fillDialogRadioGroups(
+    page, {}, { user: { workAuthorization: 'US Citizen', requiresSponsorship: false, over18: true } }, noopLogger, 'compound-job',
+    { runId: 'fixture-run', guardBlockedLabels: compoundLabels, jobContext: { jobCountry: 'us' } }
+  );
+  const compoundSponsorNo = await nativeRadioChecked('compound-sponsor', 'No');
+  const compoundCitizenYes = await nativeRadioChecked('compound-citizen', 'Yes');
+  const compoundAgeYes = await nativeRadioChecked('compound-age', 'Yes');
+  check('boilerplate compounds answer from config once recognised', () => {
+    assert.strictEqual(compoundSponsorNo, 'true');
+    assert.strictEqual(compoundCitizenYes, 'true');
+    assert.strictEqual(compoundAgeYes, 'true');
+    assert.strictEqual(compoundResult.filled, 3);
+    assert.deepStrictEqual([...compoundLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/5 pages</div>
+      ${nativeRadioGroup('age-unset', 'Are you at least 18 years of age and legally eligible to perform the duties of this position?', ['Yes', 'No'])}
+    </dialog>`);
+  const ageUnsetLabels = new Set();
+  await fillDialogRadioGroups(
+    page, {}, { user: { workAuthorization: 'US Citizen', requiresSponsorship: false } }, noopLogger, 'age-unset-job',
+    { runId: 'fixture-run', guardBlockedLabels: ageUnsetLabels, jobContext: { jobCountry: 'us' } }
+  );
+  const ageUnsetSelected = await page.locator('#age-unset [role="radio"][aria-checked="true"]').count();
+  check('18-and-eligible stays unanswered without an over18 config fact', () => {
+    assert.strictEqual(ageUnsetSelected, 0);
+    assert.strictEqual(ageUnsetLabels.size, 1);
+  });
+
   await browser.close();
 
   console.log(`\n${passed} passed, ${failed} failed`);

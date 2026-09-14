@@ -26,7 +26,7 @@ const { sleep } = require('../lib/humanize');
 const { fillForm, retryInvalidFields, normalizeLabel } = require('../lib/form-filler');
 const { recordUnfilledField, recordFillAudit } = require('../lib/state');
 const { queueAppNotification } = require('../lib/notify');
-const { guardAnswer, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
+const { guardAnswer, namedJurisdictions, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
 const { validateAnswer, VALIDATOR_PATTERN_SOURCES } = require('../lib/output-validator');
 
 const SELECTOR_TIMEOUT = 10000;
@@ -1621,6 +1621,15 @@ function isIncidentalSensitiveDisclosure(question, questionClass) {
   );
 }
 
+// Boilerplate "or"/"and" phrasings that ask ONE grounded fact (2026-09-13):
+// "US citizen or green card holder" is the alternative form the citizenship
+// resolver already answers, and "at least 18 years of age and legally
+// eligible to perform the duties of this position" is answered from
+// config.user.over18 plus a covering work authorization (see
+// groundedDialogPreference). Both were refused as compound_question.
+const CITIZENSHIP_ALTERNATIVE_RE = /\b(?:an? )?(?:us |u s |american )?citizen(?:ship)?(?: status)? or (?:an? )?(?:us |u s )?(?:permanent resident|green card(?: holder)?)\b/g;
+const AGE_AND_ELIGIBILITY_RE = /\b(?:at least|over) 18 years? (?:of age|old)(?: or older)? and legally eligible to perform the (?:essential )?duties of (?:this|the) (?:position|job|role)\b/g;
+
 function dialogQuestionRequiresExactAnswer(question, questionClass = '') {
   const normal = normalizeLabel(String(question || ''));
   if (hasUnsafeDialogNegation(normal)) return 'negated_question';
@@ -1628,10 +1637,14 @@ function dialogQuestionRequiresExactAnswer(question, questionClass = '') {
     /\bvisa sponsorship or (?:a )?visa transfer\b/.test(normal) ||
     /\bh 1b or other employment based immigration (?:case|support)\b/.test(normal);
   const compoundProbe = normal
-    .replace(/\bnow or in the future\b/g, '')
+    // "Do you now or will you in the future require ..." is the same
+    // single sponsorship question as "now or in the future".
+    .replace(/\bnow or (?:will you )?in the future\b/g, '')
     .replace(/\b(?:a )?work visa or employment authori[sz]ation\b/g, 'immigration support')
     .replace(/\bvisa sponsorship or (?:a )?visa transfer\b/g, 'visa sponsorship')
     .replace(/\bh 1b or other employment based immigration (?:case|support)\b/g, 'immigration support')
+    .replace(CITIZENSHIP_ALTERNATIVE_RE, 'citizenship status')
+    .replace(AGE_AND_ELIGIBILITY_RE, 'age eligibility')
     .replace(/\bor (?:higher|above|older)\b/g, '');
   if (/\b(?:and|or)\b/.test(compoundProbe)) return 'compound_question';
   if (!recognizedSponsorshipAlternative &&
@@ -1745,11 +1758,31 @@ function configuredBooleanChoice(value) {
   return null;
 }
 
-function groundedDialogPreference(normalQuestion, config) {
+// "At least 18 and legally eligible to perform the duties of this position"
+// is Yes only when config says over 18 AND the configured authorization
+// covers the posting country; a configured under-18 answers No; anything
+// else stays unanswered.
+function ageAndEligibilityAnswer(user, jobCountry) {
+  const over18 = configuredBooleanChoice(user.over18);
+  if (over18 === 'No') return false;
+  if (over18 !== 'Yes') return undefined;
+  if (!user.workAuthorization) return undefined;
+  if (jobCountry && !namedJurisdictions(String(user.workAuthorization)).has(String(jobCountry))) return undefined;
+  return true;
+}
+
+function groundedDialogPreference(normalQuestion, config, jobCountry = null) {
   const user = config.user || {};
-  const compoundProbe = normalQuestion.replace(/\bor older\b/g, '');
+  const compoundProbe = normalQuestion
+    .replace(/\bor older\b/g, '')
+    .replace(AGE_AND_ELIGIBILITY_RE, 'age eligibility');
   if (hasUnsafeDialogNegation(normalQuestion) || /\b(?:and|or)\b/.test(compoundProbe)) return null;
   const mappings = [
+    {
+      matches: /^are you (?:at least|over) 18 years? (?:of age|old)(?: or older)? and legally eligible to perform the (?:essential )?duties of (?:this|the) (?:position|job|role)$/.test(normalQuestion),
+      value: ageAndEligibilityAnswer(user, jobCountry),
+      source: 'config:user.over18+workAuthorization',
+    },
     {
       matches: /^(?:are|would) you (?:be )?willing to relocate$/.test(normalQuestion),
       value: user.willingToRelocate,
@@ -1998,7 +2031,7 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
       chosen = matchOption(explicitDefault);
       if (chosen) { source = 'defaultAnswers'; confidence = 'exact_question'; }
       if (!chosen) {
-        const preference = groundedDialogPreference(normalLabel, config);
+        const preference = groundedDialogPreference(normalLabel, config, options.jobContext?.jobCountry || null);
         chosen = preference ? matchOption(preference.answer) : null;
         if (chosen) { source = preference.source; confidence = 'config'; }
       }
@@ -3539,6 +3572,8 @@ module.exports = {
   markActiveApplyDialog,
   mapEducationAnswerToYesNo,
   matchDialogRadioOption,
+  dialogQuestionRequiresExactAnswer,
+  groundedDialogPreference,
   waitForSubmissionConfirmation,
   captureSubmissionConfirmationEvidence,
   firstVisibleLocator,

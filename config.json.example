@@ -16,6 +16,7 @@
     "workAuthorization": "[WORK_AUTHORIZATION]",
     "requiresSponsorship": false,
     "willingToRelocate": true,
+    "over18": true,
     "yearsOfExperience": "[YEARS_OF_EXPERIENCE]",
     "graduationYear": "[GRADUATION_YEAR]",
     "highestEducation": "[HIGHEST_EDUCATION]",
