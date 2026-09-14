@@ -68,6 +68,7 @@
   },
 
   "behavior": {
+    "dailyMaxApplications": 30,
     "minDelayBetweenActions": 1500,
     "maxDelayBetweenActions": 4000,
     "minDelayBetweenApplications": 5000,

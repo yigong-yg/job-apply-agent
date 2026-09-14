@@ -51,8 +51,18 @@ test('fails a captcha-blocked production run with zero submissions', () => {
   assert.strictEqual(getRunExitCode({ totalApplied: 0, totalErrors: 0, captchaBlocked: true }), 1);
 });
 
-test('a captcha stop after real submissions is still a completed run', () => {
-  assert.strictEqual(getRunExitCode({ totalApplied: 3, captchaBlocked: true }), 0);
+test('a captcha stop remains unhealthy after partial submissions', () => {
+  assert.strictEqual(getRunExitCode({ totalApplied: 3, captchaBlocked: true }), 1);
+});
+
+test('a captcha stop makes a diagnostic dry run unhealthy', () => {
+  assert.strictEqual(getRunExitCode({ dryRun: true, captchaBlocked: true }), 1);
+});
+
+test('any unconfirmed Submit click fails production health', () => {
+  assert.strictEqual(getRunExitCode({
+    totalApplied: 3, totalErrors: 1, unconfirmedSubmissions: 1,
+  }), 1);
 });
 
 test('daily budget subtracts prior submissions from the ceiling', () => {
@@ -70,6 +80,16 @@ test('a smaller per-run max still binds under the daily budget', () => {
 
 test('an unset per-run max falls back to the remaining daily allowance', () => {
   assert.strictEqual(clampToDailyBudget({ perRunMax: 0, dailyCap: 30, submittedToday: 12 }), 18);
+});
+
+test('an invalid daily ceiling fails closed to zero allowance', () => {
+  assert.strictEqual(clampToDailyBudget({ perRunMax: 100, dailyCap: 'invalid', submittedToday: 0 }), 0);
+});
+
+test('invalid counters and per-run limits fail closed', () => {
+  assert.strictEqual(clampToDailyBudget({ perRunMax: 'invalid', dailyCap: 30, submittedToday: 0 }), 0);
+  assert.strictEqual(clampToDailyBudget({ perRunMax: -1, dailyCap: 30, submittedToday: 0 }), 0);
+  assert.strictEqual(clampToDailyBudget({ perRunMax: 5, dailyCap: 30, submittedToday: 'invalid' }), 0);
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
