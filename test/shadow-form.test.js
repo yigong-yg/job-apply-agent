@@ -1575,6 +1575,29 @@ const SHADOW_HTML = `
     assert.deepStrictEqual([...nativeStepLabels], []);
   });
 
+  // ── Contact-step location typeahead (verified live 2026-09-13) ──
+  // LinkedIn's required "Location (city)" control is an <input> with NO type
+  // attribute (data-testid="typeahead-input", aria-autocomplete="list") and
+  // no label association. A selector that requires type="text" never sees
+  // it, so the step bounced on "This field is required" (11 jobs, 09-06..13).
+  await page.setContent(`
+    <dialog open>
+      <div>1/6 pages</div>
+      <p>Location (city)*</p>
+      <input id="typeahead-city" data-testid="typeahead-input" autocomplete="off"
+             placeholder="Enter city or location" aria-autocomplete="list" value="">
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const typeaheadStepResult = await handleInlineApplyStep(
+    page, defaultAnswers, config, noopLogger, 'typeahead-step-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const typeaheadValue = await page.locator('#typeahead-city').inputValue();
+  check('an input without a type attribute is filled like a text input', () => {
+    assert.strictEqual(typeaheadValue, 'Springfield');
+    assert.strictEqual(typeaheadStepResult, 'next');
+  });
+
   await browser.close();
 
   console.log(`\n${passed} passed, ${failed} failed`);
