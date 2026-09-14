@@ -18,6 +18,7 @@ const { chromium } = require('playwright');
 const {
   fillShadowForm,
   fillDialogRadioGroups,
+  fillDialogCheckboxGroups,
   handleInlineApplyStep,
   collectApplyValidationErrors,
   detectTopChoiceBlocked,
@@ -1419,7 +1420,21 @@ const SHADOW_HTML = `
     <script>
       document.addEventListener('change', (event) => {
         const input = event.target;
-        if (!(input instanceof HTMLInputElement) || input.type !== 'radio') return;
+        if (!(input instanceof HTMLInputElement)) return;
+        if (input.type === 'checkbox') {
+          // Same widget family: the wrapper mirrors the hidden input and is
+          // replaced on change, so agent attributes on the old node are lost.
+          const wrapper = input.closest('[role="checkbox"]');
+          if (!wrapper) return;
+          const clone = wrapper.cloneNode(true);
+          clone.setAttribute('aria-checked', input.checked ? 'true' : 'false');
+          clone.removeAttribute('data-agent-checkbox');
+          const clonedInput = clone.querySelector('input[type="checkbox"]');
+          if (clonedInput) clonedInput.checked = input.checked;
+          wrapper.replaceWith(clone);
+          return;
+        }
+        if (input.type !== 'radio') return;
         const group = input.closest('[role="radiogroup"]');
         if (!group) return;
         for (const wrapper of [...group.querySelectorAll('[role="radio"]')]) {
@@ -1680,6 +1695,107 @@ const SHADOW_HTML = `
   check('18-and-eligible stays unanswered without an over18 config fact', () => {
     assert.strictEqual(ageUnsetSelected, 0);
     assert.strictEqual(ageUnsetLabels.size, 1);
+  });
+
+  // ── Dialog checkbox widget (verified live 2026-09-13) ──
+  // <p>statement*</p><fieldset aria-describedby="error-message-…"><div>
+  //   <div role="checkbox" tabindex="0" aria-checked="false"><div><div>
+  //     <input type="checkbox" tabindex="-1"><label for></label></div>
+  //     <p>I certify and agree</p></div></div></div></fieldset>
+  // The hidden input is invisible to fillForm and the wrapper click is inert,
+  // so a required certification box left every such form on the same page.
+  const nativeCheckboxWidget = (id, statement, label, { checked = false } = {}) => `
+    <p>${statement}*</p>
+    <fieldset id="${id}" aria-describedby="error-message-${id}">
+      <div>
+        <div role="checkbox" tabindex="0" aria-checked="${checked ? 'true' : 'false'}">
+          <div>
+            <div>
+              <input id="${id}-input" type="checkbox" tabindex="-1" style="${HIDDEN_INPUT_STYLE}"${checked ? ' checked' : ''}>
+              <label for="${id}-input"></label>
+            </div>
+            <p>${label}</p>
+          </div>
+        </div>
+      </div>
+    </fieldset>`;
+  const nativeCheckboxChecked = async (id) => {
+    const states = await page.$$eval(`#${id} [role="checkbox"]`, (els) => els.map((el) => el.getAttribute('aria-checked')));
+    return states[0] || `missing widget in #${id}`;
+  };
+  const CERTIFY_STATEMENT = 'I certify that the information provided in this application is true, complete, and accurate to the best of my knowledge. ' +
+    'I understand that providing false or misleading information may result in the rejection of my application or termination of employment if discovered after hire.';
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>5/8 pages</div>
+      ${nativeCheckboxWidget('certify-box', CERTIFY_STATEMENT, 'I certify and agree')}
+      ${nativeCheckboxWidget('contact-consent-box', 'FieldAI has my consent to contact me about future job opportunities.', 'I agree')}
+    </dialog>`);
+  const certifyLabels = new Set();
+  const certifyResult = await fillDialogCheckboxGroups(
+    page, {}, { user: {} }, noopLogger, 'certify-job',
+    { runId: 'fixture-run', guardBlockedLabels: certifyLabels }
+  );
+  const certifyChecked = await nativeCheckboxChecked('certify-box');
+  const contactConsentChecked = await nativeCheckboxChecked('contact-consent-box');
+  check('dialog checkbox widgets with consent wording are checked through the hidden input', () => {
+    assert.strictEqual(certifyChecked, 'true');
+    assert.strictEqual(contactConsentChecked, 'true');
+    assert.strictEqual(certifyResult.filled, 2);
+    assert.strictEqual(certifyResult.selectionFailures, 0);
+    assert.deepStrictEqual([...certifyLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/4 pages</div>
+      ${nativeCheckboxWidget('sms-box', 'I consent to receive automated text messages (SMS/MMS) from the employer at the phone number I provided.', 'I agree')}
+      ${nativeCheckboxWidget('unknown-box', 'I have read the attached policy document.', 'Yes')}
+      ${nativeCheckboxWidget('top-choice-box', 'Mark this job as a top choice', 'Top choice')}
+    </dialog>`);
+  const declinedLabels = new Set();
+  const declinedResult = await fillDialogCheckboxGroups(
+    page, {}, { user: {} }, noopLogger, 'declined-job',
+    { runId: 'fixture-run', guardBlockedLabels: declinedLabels }
+  );
+  const smsChecked = await nativeCheckboxChecked('sms-box');
+  const unknownChecked = await nativeCheckboxChecked('unknown-box');
+  const topChoiceWidgetChecked = await nativeCheckboxChecked('top-choice-box');
+  check('SMS consent, unknown statements and Top Choice widgets stay unchecked', () => {
+    assert.strictEqual(smsChecked, 'false');
+    assert.strictEqual(unknownChecked, 'false');
+    assert.strictEqual(topChoiceWidgetChecked, 'false');
+    assert.strictEqual(declinedResult.filled, 0);
+    assert.strictEqual(declinedResult.selectionFailures, 0);
+    assert([...declinedLabels].some((label) => label.includes('automated text messages')),
+      `expected the SMS statement to be guard-blocked, got: ${JSON.stringify([...declinedLabels])}`);
+    assert([...declinedLabels].some((label) => label.includes('policy document')),
+      `expected the unknown statement to be guard-blocked, got: ${JSON.stringify([...declinedLabels])}`);
+    assert(![...declinedLabels].some((label) => /top choice/i.test(label)), 'Top Choice is a policy decision, not a guard refusal');
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>5/8 pages</div>
+      ${nativeCheckboxWidget('step-certify-box', CERTIFY_STATEMENT, 'I certify and agree')}
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const certifyStepLabels = new Set();
+  const certifyStepResult = await handleInlineApplyStep(
+    page, {}, { user: {} }, noopLogger, 'certify-step-job', false, 5,
+    { guardBlockedLabels: certifyStepLabels, submissionConfirmationTimeout: 50 }
+  );
+  const certifyStepChecked = await nativeCheckboxChecked('step-certify-box');
+  const certifyStepNextClicked = await page.locator('body').getAttribute('data-next-clicked');
+  check('the full apply step checks a required certification widget and advances', () => {
+    assert.strictEqual(certifyStepChecked, 'true');
+    assert.strictEqual(certifyStepResult, 'next');
+    assert.strictEqual(certifyStepNextClicked, 'true');
+    assert.deepStrictEqual([...certifyStepLabels], []);
   });
 
   await browser.close();

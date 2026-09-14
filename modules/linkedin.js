@@ -2195,6 +2195,158 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
   return { groups: groups.length, filled, selectionFailures };
 }
 
+// Dialog checkbox widgets (2026-09 UI, verified live 2026-09-13): the
+// statement sits in a <p> before a <fieldset aria-describedby="error-…">, the
+// control is a div[role=checkbox] wrapper around a hidden native input plus an
+// empty label[for], and the option text ("I certify and agree") is a <p>
+// inside the wrapper. fillForm never sees the hidden input and the wrapper
+// click is inert, so a required certification box left every such form on
+// the same page with no audit row (FieldAI, 2026-09-14).
+const DIALOG_CHECKBOX_CONSENT_RE = /\b(?:agree|certify|confirm|acknowledge|accept|consent)\b/;
+// Never auto-consent to messaging or marketing programmes (parity with the
+// radio path, which refuses the SMS-consent screener).
+const DIALOG_CHECKBOX_NEVER_RE = /\b(?:text messages?|sms|mms|marketing|promotional|newsletter)\b/;
+
+async function fillDialogCheckboxGroups(page, defaultAnswers, config, logger, jobId, options = {}) {
+  const runId = options.runId || null;
+  const topChoicePolicy = config.platformPolicy?.linkedin?.topChoice || 'never';
+
+  await markActiveApplyDialog(page);
+  const boxes = await page.evaluate(() => {
+    const found = [];
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    for (const stale of document.querySelectorAll('dialog [data-agent-checkbox]')) {
+      stale.removeAttribute('data-agent-checkbox');
+    }
+    const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+    if (!dlg || !/pages/i.test(dlg.innerText || '')) return found;
+    let ci = 0;
+    for (const box of dlg.querySelectorAll('[role="checkbox"]')) {
+      if (!isVisible(box)) continue;
+      if (box.getAttribute('aria-checked') === 'true') continue;
+      const label = (box.innerText || '').trim();
+      const container = box.closest('fieldset') || box.parentElement;
+      let statementNode = container ? container.previousElementSibling : null;
+      while (statementNode && !(statementNode.textContent || '').trim()) {
+        statementNode = statementNode.previousElementSibling;
+      }
+      const statement = statementNode && isVisible(statementNode) ? statementNode.textContent.trim() : '';
+      const required = /^error-message/.test((container && container.getAttribute('aria-describedby')) || '') ||
+        /\*\s*$/.test(statement);
+      const tag = `agent-checkbox-${ci++}`;
+      box.setAttribute('data-agent-checkbox', tag);
+      found.push({ tag, label, statement, required });
+    }
+    return found;
+  }).catch(() => []);
+
+  let filled = 0;
+  let selectionFailures = 0;
+  for (const box of boxes) {
+    const fieldLabel = (box.statement || box.label).substring(0, 200);
+    const text = normalizeLabel(`${box.statement} ${box.label}`);
+
+    // LinkedIn Top Choice consumes a boost credit: the platform policy owns
+    // it (default never) and the cycle classifier reports it, not the guard.
+    if (/\btop choice\b/.test(text)) {
+      if (topChoicePolicy !== 'always') {
+        recordFillAudit({
+          platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+          fillSource: 'platform_policy:top_choice', answer: 'left_unchecked', confidence: `top_choice:${topChoicePolicy}`,
+        });
+        logger.debug({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80), topChoicePolicy }, 'Left dialog Top Choice checkbox unchecked by platform policy');
+        continue;
+      }
+    } else if (!DIALOG_CHECKBOX_CONSENT_RE.test(text) || DIALOG_CHECKBOX_NEVER_RE.test(text)) {
+      // Not a plain certification/consent statement: leave it unchecked and
+      // let a later bounce classify as an honest guarded skip.
+      const reason = DIALOG_CHECKBOX_NEVER_RE.test(text) ? 'never_consent_checkbox' : 'no_grounded_checkbox_answer';
+      if (options.guardBlockedLabels) options.guardBlockedLabels.add(fieldLabel);
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+        fillSource: 'cannot_fill', answer: '', confidence: `guard:${reason}`,
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel, fieldType: 'checkbox' });
+      logger.info({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80), reason, required: box.required }, 'Dialog checkbox left unchecked without grounded consent');
+      continue;
+    }
+
+    await markActiveApplyDialog(page);
+    const widget = page.locator(`dialog[data-agent-active-apply="true"] [data-agent-checkbox="${box.tag}"]`).first();
+    const clicked = await widget.evaluate((el) => {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      // The state lives on the hidden native input; the wrapper click is inert.
+      const nativeInput = el.querySelector('input[type="checkbox"]');
+      if (nativeInput && !nativeInput.disabled) nativeInput.click();
+      else el.click();
+      return true;
+    }).catch(() => false);
+    if (clicked) await sleep(100, 200);
+    // Verify with a fresh query: the wrapper is re-rendered after a change.
+    await markActiveApplyDialog(page);
+    const checked = clicked && await page.evaluate(({ statement, label }) => {
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let current = element; current instanceof Element;) {
+          const style = getComputedStyle(current);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+              current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+          current = current.parentElement || current.getRootNode()?.host || null;
+        }
+        return true;
+      };
+      const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+      if (!dlg) return false;
+      for (const candidate of dlg.querySelectorAll('[role="checkbox"]')) {
+        if (!isVisible(candidate)) continue;
+        if ((candidate.innerText || '').trim() !== label) continue;
+        const container = candidate.closest('fieldset') || candidate.parentElement;
+        let node = container ? container.previousElementSibling : null;
+        while (node && !(node.textContent || '').trim()) node = node.previousElementSibling;
+        const currentStatement = node && isVisible(node) ? node.textContent.trim() : '';
+        if (currentStatement !== statement) continue;
+        return candidate.getAttribute('aria-checked') === 'true' ||
+          !!candidate.querySelector('input[type="checkbox"]')?.checked;
+      }
+      return false;
+    }, { statement: box.statement, label: box.label }).catch(() => false);
+    if (checked) {
+      filled++;
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+        fillSource: 'rule:consent_checkbox', answer: 'checked', confidence: 'consent',
+      });
+      logger.debug({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80) }, 'Checked dialog consent checkbox');
+    } else {
+      selectionFailures++;
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+        fillSource: 'cannot_fill', answer: '', confidence: 'automation:checkbox_click_failed',
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel, fieldType: 'checkbox' });
+      logger.warn({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80) }, 'Dialog checkbox click did not check the box');
+    }
+  }
+
+  if (boxes.length > 0) {
+    logger.info({ platform: 'linkedin', jobId, boxes: boxes.length, filled }, 'Dialog checkbox widgets processed');
+  }
+  return { boxes: boxes.length, filled, selectionFailures };
+}
+
 // Fingerprint the active form step. The dialog UI puts radio questions in a
 // preceding <p>, not in label/legend, and retains hidden templates; include
 // visible question/progress text only.
@@ -2228,6 +2380,12 @@ async function captureApplyStepFingerprint(page) {
         while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
         const t = (q?.textContent || group.getAttribute('aria-label') || '').trim().substring(0, 120);
         if (t) labels.push(t);
+      }
+      // Checkbox widgets carry no label/legend text of their own.
+      for (const box of root.querySelectorAll('[role="checkbox"]')) {
+        if (box.getClientRects().length === 0) continue;
+        const t = (box.innerText || '').trim().substring(0, 60);
+        if (t) labels.push(`checkbox:${t}`);
       }
       const progress = (root.innerText || '').match(/\b\d+\s*(?:\/|of)\s*\d+\s*pages?\b/i)?.[0];
       if (progress) labels.push(progress);
@@ -2744,6 +2902,24 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
       platform: 'linkedin', jobId, stepNum,
       selectionFailures: dialogRadioFill.selectionFailures,
     }, 'Dialog radio selection was not verified; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
+
+  // ── Dialog checkbox widgets (2026-09 UI): certification/consent boxes ──
+  let dialogCheckboxFill;
+  try {
+    dialogCheckboxFill = await fillDialogCheckboxGroups(page, defaultAnswers, config, logger, jobId, options);
+  } catch (error) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum, error: error?.message || String(error),
+    }, 'Dialog checkbox processing failed; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
+  if ((dialogCheckboxFill.selectionFailures || 0) > 0) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum,
+      selectionFailures: dialogCheckboxFill.selectionFailures,
+    }, 'Dialog checkbox selection was not verified; refusing to advance or submit');
     return 'radio_selection_failed';
   }
 
@@ -3566,6 +3742,7 @@ module.exports = {
   isRemoteLocation,
   fillShadowForm,
   fillDialogRadioGroups,
+  fillDialogCheckboxGroups,
   handleInlineApplyStep,
   collectApplyValidationErrors,
   detectTopChoiceBlocked,
