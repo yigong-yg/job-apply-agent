@@ -1598,6 +1598,48 @@ const SHADOW_HTML = `
     assert.strictEqual(typeaheadStepResult, 'next');
   });
 
+  // ── Posting-country placeholder (2026-09-13) ──
+  // FieldAI-style screeners defer the jurisdiction to the posting. The card
+  // location supplies it via options.jobContext.jobCountry.
+  const countryPlaceholderDialog = () => `
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>5/8 pages</div>
+      ${nativeRadioGroup('country-auth', 'Are you legally authorized to work in the country where this position is located?', ['Yes', 'No'])}
+      ${nativeRadioGroup(
+        'country-sponsor',
+        'Will you now or in the future require employer sponsorship for a work visa or employment authorization to work in the country where this position is located?',
+        ['Yes', 'No']
+      )}
+    </dialog>`;
+  const countryConfig = { user: { workAuthorization: 'US Citizen', requiresSponsorship: false } };
+  await page.setContent(countryPlaceholderDialog());
+  const countryLabels = new Set();
+  const countryResult = await fillDialogRadioGroups(
+    page, {}, countryConfig, noopLogger, 'country-job',
+    { runId: 'fixture-run', guardBlockedLabels: countryLabels, jobContext: { jobCountry: 'us' } }
+  );
+  const countryAuthYes = await nativeRadioChecked('country-auth', 'Yes');
+  const countrySponsorNo = await nativeRadioChecked('country-sponsor', 'No');
+  check('the posting country grounds "the country where this position is located" screeners', () => {
+    assert.strictEqual(countryAuthYes, 'true');
+    assert.strictEqual(countrySponsorNo, 'true');
+    assert.strictEqual(countryResult.filled, 2);
+    assert.deepStrictEqual([...countryLabels], []);
+  });
+
+  await page.setContent(countryPlaceholderDialog());
+  const noCountryLabels = new Set();
+  await fillDialogRadioGroups(
+    page, {}, countryConfig, noopLogger, 'no-country-job',
+    { runId: 'fixture-run', guardBlockedLabels: noCountryLabels, jobContext: {} }
+  );
+  const noCountrySelected = await page.locator('[role="radiogroup"] [role="radio"][aria-checked="true"]').count();
+  check('without a posting country the placeholder screeners stay unanswered and guarded', () => {
+    assert.strictEqual(noCountrySelected, 0);
+    assert.strictEqual(noCountryLabels.size, 2);
+  });
+
   await browser.close();
 
   console.log(`\n${passed} passed, ${failed} failed`);

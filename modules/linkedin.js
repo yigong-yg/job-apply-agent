@@ -765,6 +765,51 @@ function buildLinkedInSearchUrl(config) {
 //  Result Card Helpers
 // ══════════════════════════════════════════════════════════
 
+// ── Posting country ──
+// Screeners phrased "in the country where this position is located" are
+// grounded by the posting itself. The LinkedIn search is US-scoped, so a card
+// location naming the United States or a US state resolves to 'us'; other
+// named countries resolve to their answer-policy jurisdiction name; area-only
+// locations ("Greater Boston Area") fall back to the configured search
+// country. Unknown stays null, which keeps those questions unanswerable.
+const US_STATE_ABBREVIATIONS = new Set([
+  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA',
+  'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM',
+  'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA',
+  'WV', 'WI', 'WY', 'PR',
+]);
+const US_STATE_NAMES_RE = /\b(?:alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|puerto rico)\b/;
+const US_COUNTRY_RE = /\b(?:united states|u\.s\.a?\.?|usa)\b/i;
+const OTHER_COUNTRY_PATTERNS = [
+  ['canada', /\bcanada\b/i],
+  ['australia', /\baustralia\b/i],
+  ['india', /\bindia\b/i],
+  ['mexico', /\bmexico\b/i],
+  // "Wales" is left out: "New South Wales, Australia" must not read as the UK.
+  ['uk', /\b(?:united kingdom|great britain|england|scotland|northern ireland)\b|\buk\b/i],
+];
+
+function normalizeCountryName(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  if (US_COUNTRY_RE.test(text) || /^us$/i.test(text)) return 'us';
+  for (const [name, pattern] of OTHER_COUNTRY_PATTERNS) if (pattern.test(text)) return name;
+  return text.toLowerCase();
+}
+
+function deriveJobCountry(locationText, config = {}) {
+  const text = String(locationText || '');
+  if (US_COUNTRY_RE.test(text)) return 'us';
+  const abbreviation = text.match(/,\s*([A-Z]{2})\b/);
+  if (abbreviation && US_STATE_ABBREVIATIONS.has(abbreviation[1])) return 'us';
+  if (US_STATE_NAMES_RE.test(text.toLowerCase())) return 'us';
+  for (const [name, pattern] of OTHER_COUNTRY_PATTERNS) if (pattern.test(text)) return name;
+  const configured = config.search?.jobCountry || config.search?.country;
+  if (configured) return normalizeCountryName(configured);
+  if (US_COUNTRY_RE.test(String(config.search?.location || ''))) return 'us';
+  return null;
+}
+
 const RESULT_CARD_CONTAINER_SELECTOR = [
   '[data-job-id]',
   '[data-occludable-job-id]',
@@ -1872,7 +1917,9 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
     let source = sensitiveOptionSetAnswer?.source || null;
     let confidence = sensitiveOptionSetAnswer ? 'config_option_set' : null;
 
-    const guard = guardAnswer(group.question, { config, defaultAnswers: flatAnswers });
+    const guard = guardAnswer(group.question, {
+      config, defaultAnswers: flatAnswers, jobCountry: options.jobContext?.jobCountry || null,
+    });
     const exactOnlyReason = dialogQuestionRequiresExactAnswer(group.question, guard.questionClass);
     if (exactOnlyReason) {
       const exactChoice = matchDialogRadioOption(group.options, explicitDefault);
@@ -3273,7 +3320,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // ── Step 7: Process inline apply steps ──
         const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
         const fillOptions = {
-          jobContext: { jobTitle, company, jobDescription: detail.description || '' },
+          jobContext: {
+            jobTitle,
+            company,
+            jobDescription: detail.description || '',
+            // Grounds "the country where this position is located" screeners.
+            jobCountry: deriveJobCountry(summary.location, config),
+          },
           llmCache: llmCache || undefined,
           llmBudget,
           runId,
@@ -3472,6 +3525,7 @@ module.exports = {
   applyLinkedIn,
   // Exported for testing
   buildLinkedInSearchUrl,
+  deriveJobCountry,
   extractResultCardJobId,
   extractSelectedJobDetail,
   summarizeResultCard,

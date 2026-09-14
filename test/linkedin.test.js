@@ -14,6 +14,7 @@ const {
   buildApplyLinkSelector,
   mapEducationAnswerToYesNo,
   matchDialogRadioOption,
+  deriveJobCountry,
 } = require('../modules/linkedin');
 
 let passed = 0;
@@ -24,6 +25,23 @@ function test(name, fn) {
 }
 
 console.log('\n=== LinkedIn Module Tests ===\n');
+
+// ── deriveJobCountry (2026-09-13) ──
+// Screeners phrased "in the country where this position is located" are
+// grounded by the posting's country, read from the card location and, for
+// area-only locations, the configured (US-scoped) search.
+test('deriveJobCountry reads the posting country from the card location', () => {
+  const cfg = { search: { location: 'California, New York, Massachusetts, United States' } };
+  assert.strictEqual(deriveJobCountry('San Francisco, CA (On-site)', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('United States (Remote)', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('New York, NY', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('Toronto, Ontario, Canada', cfg), 'canada');
+  assert.strictEqual(deriveJobCountry('London, England, United Kingdom', cfg), 'uk');
+  assert.strictEqual(deriveJobCountry('Greater Boston Area', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('Greater Boston Area', { search: {} }), null);
+  assert.strictEqual(deriveJobCountry('', { search: { country: 'US' } }), 'us');
+  assert.strictEqual(deriveJobCountry('Sydney, New South Wales, Australia', cfg), 'australia');
+});
 
 // ── buildLinkedInSearchUrl ──
 
