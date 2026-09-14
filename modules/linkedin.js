@@ -1819,10 +1819,36 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
         let q = grp.previousElementSibling;
         while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
         const question = q && isVisible(q) ? q.textContent.trim() : (grp.getAttribute('aria-label') || '');
+        // 2026-09 widget (verified live 2026-09-05): each option's aria-label
+        // repeats the QUESTION (or the group label, e.g. "Gender"), and the
+        // option text is the wrapper's visible innerText. Prefer visible text,
+        // then aria-labelledby, and use aria-label only when it is not the
+        // question itself. Reading aria-label first turned every option label
+        // into the question, so no configured answer could match (09-02..05).
+        const normalizeText = (text) => String(text || '').toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+        const questionKey = normalizeText(question);
+        const optionLabelOf = (o) => {
+          const visibleText = (o.innerText || '').trim();
+          if (visibleText) return visibleText;
+          const labelledBy = (o.getAttribute('aria-labelledby') || '').split(/\s+/)
+            .map((id) => ((id && document.getElementById(id)?.textContent) || '').trim())
+            .filter(Boolean).join(' ');
+          if (labelledBy) return labelledBy;
+          const ariaLabel = (o.getAttribute('aria-label') || '').trim();
+          return normalizeText(ariaLabel) === questionKey ? '' : ariaLabel;
+        };
         const optionInfos = opts.map((o, oi) => {
           const tag = `agent-radio-${gi}-${oi}`;
           o.setAttribute('data-agent-radio', tag);
-          return { tag, label: (o.getAttribute('aria-label') || o.innerText || '').trim() };
+          return {
+            tag,
+            label: optionLabelOf(o),
+            // Raw text sources, re-checked before the click and used to find
+            // the re-rendered option after it.
+            innerText: (o.innerText || '').trim(),
+            ariaLabel: (o.getAttribute('aria-label') || '').trim(),
+          };
         });
         found.push({ question, options: optionInfos });
         gi++;
@@ -1977,10 +2003,15 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
       const currentQuestion = questionNode && isVisible(questionNode)
         ? questionNode.textContent.trim()
         : (group.getAttribute('aria-label') || '');
-      const currentLabel = (el.getAttribute('aria-label') || el.innerText || '').trim();
-      return currentQuestion === snapshot.question && currentLabel === snapshot.optionLabel &&
+      // Compare the raw text sources captured in Phase A (visible text and
+      // aria-label); the derived option label depends on question-aware
+      // precedence and is not re-derived here.
+      const currentInnerText = (el.innerText || '').trim();
+      const currentAriaLabel = (el.getAttribute('aria-label') || '').trim();
+      return currentQuestion === snapshot.question &&
+        currentInnerText === snapshot.innerText && currentAriaLabel === snapshot.ariaLabel &&
         el.getAttribute('aria-checked') !== 'true';
-    }, { question: group.question, optionLabel: chosen.label }).catch(() => false);
+    }, { question: group.question, innerText: chosen.innerText, ariaLabel: chosen.ariaLabel }).catch(() => false);
     if (!snapshotStillMatches) {
       selectionFailures++;
       recordFillAudit({
@@ -1993,19 +2024,64 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
     }
     const clicked = await radio.evaluate((el) => {
       if (el.getAttribute('aria-disabled') === 'true') return false;
-      el.click();
+      // 2026-09 widget: the selection state lives on the hidden native input
+      // and a synthetic click on the role=radio wrapper is inert (0 verified
+      // selections from 08-23 to 09-05). Click the input when there is one.
+      const nativeInput = el.querySelector('input[type="radio"]');
+      if (nativeInput && !nativeInput.disabled) nativeInput.click();
+      else el.click();
       return true;
     }).catch(() => false);
     if (clicked) await sleep(100, 200);
-    const selected = clicked && await radio.evaluate((el) =>
-      el.getAttribute('aria-checked') === 'true' || !!el.querySelector('input[type="radio"]')?.checked
-    ).catch(() => false);
+    // Verify with a FRESH query keyed on the question and the option's raw
+    // text: the widget re-renders and replaces the wrapper nodes after a
+    // change, so the tagged locator can resolve to a detached node (or to
+    // nothing) even though the selection succeeded.
+    await markActiveApplyDialog(page);
+    const selected = clicked && await page.evaluate(({ question, innerText, ariaLabel }) => {
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let current = element; current instanceof Element;) {
+          const style = getComputedStyle(current);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+              current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+          current = current.parentElement || current.getRootNode()?.host || null;
+        }
+        return true;
+      };
+      const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+      if (!dlg) return false;
+      for (const grp of dlg.querySelectorAll('[role="radiogroup"]')) {
+        if (!isVisible(grp)) continue;
+        let questionNode = grp.previousElementSibling;
+        while (questionNode && !(questionNode.textContent || '').trim()) {
+          questionNode = questionNode.previousElementSibling;
+        }
+        const currentQuestion = questionNode && isVisible(questionNode)
+          ? questionNode.textContent.trim()
+          : (grp.getAttribute('aria-label') || '');
+        if (currentQuestion !== question) continue;
+        const option = [...grp.querySelectorAll('[role="radio"]')].find((candidate) =>
+          isVisible(candidate) &&
+          (candidate.innerText || '').trim() === innerText &&
+          (candidate.getAttribute('aria-label') || '').trim() === ariaLabel
+        );
+        if (!option) continue;
+        return option.getAttribute('aria-checked') === 'true' ||
+          !!option.querySelector('input[type="radio"]')?.checked;
+      }
+      return false;
+    }, { question: group.question, innerText: chosen.innerText, ariaLabel: chosen.ariaLabel }).catch(() => false);
     if (selected) {
       filled++;
       recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: source || 'unknown', answer: chosen.label, confidence });
       // The chosen option stays out of logs (self-ID answers are sensitive);
       // fill_audit in the gitignored DB keeps the full value for forensics.
-      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), source }, 'Filled dialog radio group');
+      // The option set is logged so a future markup change shows up in the
+      // first run rather than as silent refusals.
+      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), source, options: optionLabels }, 'Filled dialog radio group');
       if ((options._dialogRadioDepth || 0) < 8) {
         const nested = await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, {
           ...options,

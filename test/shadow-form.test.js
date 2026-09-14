@@ -1409,6 +1409,172 @@ const SHADOW_HTML = `
     assert.strictEqual(inertRadioSubmitClicked, null);
   });
 
+  // ── 2026-09 LinkedIn radio widget (verified live 2026-09-05) ──
+  // Each option is a div[role=radio] whose aria-label repeats the QUESTION (or
+  // the group label, e.g. "Gender"); the option text is the wrapper's visible
+  // innerText; a hidden native input[type=radio] owns the state; the wrapper
+  // has no click handler; after a change React replaces the wrapper nodes, so
+  // attributes the agent set on the old node are gone.
+  const NATIVE_RADIO_SCRIPT = `
+    <script>
+      document.addEventListener('change', (event) => {
+        const input = event.target;
+        if (!(input instanceof HTMLInputElement) || input.type !== 'radio') return;
+        const group = input.closest('[role="radiogroup"]');
+        if (!group) return;
+        for (const wrapper of [...group.querySelectorAll('[role="radio"]')]) {
+          const own = wrapper.contains(input);
+          const clone = wrapper.cloneNode(true);
+          clone.setAttribute('aria-checked', own ? 'true' : 'false');
+          clone.removeAttribute('data-agent-radio');
+          const clonedInput = clone.querySelector('input[type="radio"]');
+          if (clonedInput) clonedInput.checked = own;
+          wrapper.replaceWith(clone);
+        }
+      });
+    </script>`;
+  const HIDDEN_INPUT_STYLE = 'position:absolute;opacity:0;width:0;height:0';
+  // aria-checked of the option whose visible text equals `text` (fresh query:
+  // the widget replaces wrapper nodes after a change).
+  const nativeRadioChecked = async (groupId, text) => {
+    const states = await page.$$eval(`#${groupId} [role="radio"]`, (els) =>
+      els.map((el) => ({ text: (el.innerText || '').trim(), checked: el.getAttribute('aria-checked') })));
+    const match = states.find((state) => state.text === text);
+    return match ? match.checked : `missing option "${text}" in ${JSON.stringify(states)}`;
+  };
+  const nativeRadioGroup = (id, question, optionLabels, { labelledBy = null, checkedIndex = -1, ariaLabel = null } = {}) => `
+    <p>${question}*</p>
+    <fieldset id="${id}" role="radiogroup" aria-describedby="error-message-${id}">
+      <div>
+        ${optionLabels.map((label, index) => `
+        <div role="radio" tabindex="0" aria-checked="${index === checkedIndex ? 'true' : 'false'}"
+             ${labelledBy ? `aria-labelledby="${id}-group-label"` : `aria-label="${ariaLabel === null ? question : ariaLabel}"`}>
+          <div>
+            <div>
+              <input id="${id}-${index}" type="radio" name="radio-group-${id}" style="${HIDDEN_INPUT_STYLE}"${index === checkedIndex ? ' checked' : ''}>
+              <label for="${id}-${index}"></label>
+            </div>
+            <div><p>${label}</p></div>
+          </div>
+        </div>`).join('')}
+      </div>
+    </fieldset>
+    ${labelledBy ? `<span id="${id}-group-label" style="${HIDDEN_INPUT_STYLE}">${labelledBy}</span>` : ''}`;
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>1/2 pages</div>
+      ${nativeRadioGroup(
+        'native-sponsorship',
+        'Will you now, or in the future, require sponsorship for employment visa status (e.g. H-1B visa status)?',
+        ['Yes', 'No']
+      )}
+    </dialog>`);
+  const nativeSponsorshipLabels = new Set();
+  const nativeSponsorshipResult = await fillDialogRadioGroups(
+    page, {}, { user: { requiresSponsorship: false } }, noopLogger, 'native-sponsorship-job',
+    { runId: 'fixture-run', guardBlockedLabels: nativeSponsorshipLabels }
+  );
+  const nativeSponsorshipNo = await nativeRadioChecked('native-sponsorship', 'No');
+  const nativeSponsorshipYes = await nativeRadioChecked('native-sponsorship', 'Yes');
+  check('2026-09 widget: option text comes from innerText when aria-label carries the question', () => {
+    assert.strictEqual(nativeSponsorshipNo, 'true');
+    assert.strictEqual(nativeSponsorshipYes, 'false');
+    assert.strictEqual(nativeSponsorshipResult.filled, 1);
+    assert.strictEqual(nativeSponsorshipResult.selectionFailures, 0);
+    assert.deepStrictEqual([...nativeSponsorshipLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>1/2 pages</div>
+      ${nativeRadioGroup('native-gender', 'Gender', ['Male', 'Female', 'I prefer not to specify'])}
+    </dialog>`);
+  const nativeGenderLabels = new Set();
+  const nativeGenderResult = await fillDialogRadioGroups(
+    page, {}, { user: { gender: 'Male' } }, noopLogger, 'native-gender-job',
+    { runId: 'fixture-run', guardBlockedLabels: nativeGenderLabels }
+  );
+  const nativeGenderMale = await nativeRadioChecked('native-gender', 'Male');
+  check('2026-09 widget: a configured sensitive answer matches the visible option text under a group-label aria-label', () => {
+    assert.strictEqual(nativeGenderMale, 'true');
+    assert.strictEqual(nativeGenderResult.filled, 1);
+    assert.strictEqual(nativeGenderResult.selectionFailures, 0);
+    assert.deepStrictEqual([...nativeGenderLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>1/2 pages</div>
+      ${nativeRadioGroup(
+        'native-cc305',
+        'Form CC-305 OMB Control Number 1250-0005 Expires 04/30/2026 Why are you being asked to complete this form? ' +
+          'We are a federal contractor or subcontractor. The law requires us to provide equal employment opportunity ' +
+          'to qualified people with disabilities. How do you know if you have a disability?',
+        [
+          'Yes, I have a disability, or have had one in the past',
+          'No, I do not have a disability and have not had one in the past',
+          'I do not want to answer',
+        ],
+        { labelledBy: 'Disability' }
+      )}
+    </dialog>`);
+  const nativeCc305Labels = new Set();
+  const nativeCc305Result = await fillDialogRadioGroups(
+    page, {}, { user: { disabilityStatus: 'I do not wish to answer' } }, noopLogger, 'native-cc305-job',
+    { runId: 'fixture-run', guardBlockedLabels: nativeCc305Labels }
+  );
+  const nativeCc305OptOut = await nativeRadioChecked('native-cc305', 'I do not want to answer');
+  check('2026-09 widget: selection goes through the hidden native input and survives node replacement', () => {
+    assert.strictEqual(nativeCc305OptOut, 'true');
+    assert.strictEqual(nativeCc305Result.filled, 1);
+    assert.strictEqual(nativeCc305Result.selectionFailures, 0);
+    assert.deepStrictEqual([...nativeCc305Labels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>2/4 pages</div>
+      ${nativeRadioGroup('native-resume', 'Resume', ['', '', ''], { checkedIndex: 0, ariaLabel: 'Resume_Sam.pdf' })}
+    </dialog>`);
+  const nativeResumeResult = await fillDialogRadioGroups(
+    page, {}, { user: {} }, noopLogger, 'native-resume-job',
+    { runId: 'fixture-run', guardBlockedLabels: new Set() }
+  );
+  check('2026-09 widget: a pre-selected resume picker is not a radio question', () => {
+    assert.strictEqual(nativeResumeResult.groups, 0);
+    assert.strictEqual(nativeResumeResult.selectionFailures, 0);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/4 pages</div>
+      ${nativeRadioGroup(
+        'native-step-sponsorship',
+        'Will you now, or in the future, require sponsorship for employment visa status (e.g. H-1B visa status)?',
+        ['Yes', 'No']
+      )}
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const nativeStepLabels = new Set();
+  const nativeStepResult = await handleInlineApplyStep(
+    page, {}, { user: { requiresSponsorship: false } }, noopLogger, 'native-step-job', false, 3,
+    { guardBlockedLabels: nativeStepLabels, submissionConfirmationTimeout: 50 }
+  );
+  const nativeStepNo = await nativeRadioChecked('native-step-sponsorship', 'No');
+  const nativeStepNextClicked = await page.locator('body').getAttribute('data-next-clicked');
+  check('2026-09 widget: the full apply step selects the grounded radio and advances', () => {
+    assert.strictEqual(nativeStepNo, 'true');
+    assert.strictEqual(nativeStepResult, 'next');
+    assert.strictEqual(nativeStepNextClicked, 'true');
+    assert.deepStrictEqual([...nativeStepLabels], []);
+  });
+
   await browser.close();
 
   console.log(`\n${passed} passed, ${failed} failed`);
