@@ -22,6 +22,8 @@ const {
   collectApplyValidationErrors,
   detectTopChoiceBlocked,
   waitForSubmissionConfirmation,
+  extractResultCardJobId,
+  extractSelectedJobDetail,
   firstVisibleApplyControl,
   markActiveApplyDialog,
   dismissActiveApplyUi,
@@ -238,6 +240,25 @@ const SHADOW_HTML = `
     .getAttribute('aria-checked');
   check('dialog radio markers do not collide across retained form steps', () => {
     assert.strictEqual(dialogCommuteChecked, 'true');
+  });
+
+  await page.setContent(`
+    <dialog open>
+      <div>1/2 pages</div>
+      ${dialogRadioGroup('multi-relocate', 'Are you willing to relocate?')}
+      ${dialogRadioGroup('multi-commute', 'Are you able to commute?')}
+    </dialog>`);
+  const multiRadioResult = await fillDialogRadioGroups(
+    page, defaultAnswers, config, noopLogger, 'multi-radio-job',
+    { runId: 'fixture-run', guardBlockedLabels: new Set() }
+  );
+  const multiRadioSelections = await page.locator(
+    '#multi-relocate [role="radio"][aria-checked="true"], #multi-commute [role="radio"][aria-checked="true"]'
+  ).count();
+  check('multiple grounded radio groups are selected without stale-marker failures', () => {
+    assert.strictEqual(multiRadioSelections, 2);
+    assert.strictEqual(multiRadioResult.filled, 2);
+    assert.strictEqual(multiRadioResult.selectionFailures, 0);
   });
 
   await page.setContent(`
@@ -1232,10 +1253,10 @@ const SHADOW_HTML = `
 
   await page.goto('about:blank?currentJobId=1234567890');
   await page.setContent(`
-    <main><div>Selected job detail</div></main>
+    <main><section id="selected-detail"><a href="/jobs/view/1234567890">Selected job detail</a></section></main>
     <dialog open>
       <div>1/1 pages</div>
-      <button onclick="this.closest('dialog').remove(); document.querySelector('main').insertAdjacentHTML('beforeend', '<section><h2>Application status</h2><p>Application submitted</p><span>now</span></section>')">
+      <button onclick="this.closest('dialog').remove(); document.querySelector('#selected-detail').insertAdjacentHTML('beforeend', '<div><h2>Application status</h2><p>Application submitted</p><span>now</span></div>')">
         Submit application
       </button>
     </dialog>`);
@@ -1249,7 +1270,7 @@ const SHADOW_HTML = `
 
   await page.goto('about:blank?currentJobId=9999999999');
   await page.setContent(`
-    <main><div>Different selected job</div></main>
+    <main><section><a href="/jobs/view/9999999999">Different selected job</a></section></main>
     <dialog open>
       <div>1/1 pages</div>
       <button onclick="this.closest('dialog').remove(); document.querySelector('main').insertAdjacentHTML('beforeend', '<section><h2>Application status</h2><p>Application submitted</p></section>')">
@@ -1266,7 +1287,7 @@ const SHADOW_HTML = `
 
   await page.goto('about:blank?currentJobId=1234567890');
   await page.setContent(`
-    <main><section><h2>Application status</h2><p>Application submitted</p><span>earlier</span></section></main>
+    <main><section><a href="/jobs/view/1234567890">Selected job</a><h2>Application status</h2><p>Application submitted</p><span>earlier</span></section></main>
     <dialog open>
       <div>1/1 pages</div>
       <button onclick="this.closest('dialog').remove()">Submit application</button>
@@ -1282,7 +1303,7 @@ const SHADOW_HTML = `
   await page.goto('about:blank?currentJobId=1234567890');
   await page.setContent(`
     <main>
-      <div>Selected job detail</div>
+      <section><a href="/jobs/view/1234567890">Selected job detail</a></section>
       <div data-job-id="other-listing"><h2>Application status</h2><p>Application submitted</p></div>
     </main>
     <dialog open>
@@ -1295,6 +1316,56 @@ const SHADOW_HTML = `
   );
   check('detail status inside another result card cannot confirm even with a matching URL', () => {
     assert.strictEqual(unrelatedCardDetailResult, 'submit_unconfirmed');
+  });
+
+  await page.goto('about:blank?currentJobId=1234567890');
+  await page.setContent(`
+    <main>
+      <section id="selected-detail"><a href="/jobs/view/1234567890">Selected job detail</a></section>
+      <aside id="unrelated-sidebar"></aside>
+    </main>
+    <dialog open>
+      <div>1/1 pages</div>
+      <button onclick="this.closest('dialog').remove(); document.querySelector('#unrelated-sidebar').insertAdjacentHTML('beforeend', '<div><h2>Application status</h2><p>Application submitted</p></div>')">
+        Submit application
+      </button>
+    </dialog>`);
+  const unrelatedSidebarDetailResult = await handleInlineApplyStep(
+    page, {}, {}, noopLogger, '1234567890', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  check('a sibling sidebar status cannot confirm the selected job', () => {
+    assert.strictEqual(unrelatedSidebarDetailResult, 'submit_unconfirmed');
+  });
+
+  await page.goto('about:blank?currentJobId=1234567890');
+  await page.setContent(`
+    <main>
+      <section id="selected-detail"><a href="/jobs/view/1234567890">Selected job detail</a></section>
+      <ul><li data-occludable-job-id="9999999999">Application status Application submitted</li></ul>
+    </main>`);
+  const detailWithUnrelatedAppliedCard = await extractSelectedJobDetail(page);
+  check('an Applied badge in another result does not mark the selected job applied', () => {
+    assert.strictEqual(detailWithUnrelatedAppliedCard.alreadyApplied, false);
+  });
+  await page.locator('#selected-detail').evaluate((element) => {
+    element.insertAdjacentHTML('beforeend', '<div><h2>Application status</h2><p>Application submitted</p></div>');
+  });
+  const detailWithOwnedStatus = await extractSelectedJobDetail(page);
+  check('selected-detail status is recognized when owned by the current job', () => {
+    assert.strictEqual(detailWithOwnedStatus.alreadyApplied, true);
+  });
+
+  await page.setContent(`
+    <ul>
+      <li data-occludable-job-id="1234567890"><button id="attributed-card">Easy Apply</button></li>
+      <li><button id="linked-card"><a href="/jobs/view/example-role-9999999999">View job</a></button></li>
+    </ul>`);
+  const attributedCardId = await extractResultCardJobId(page.locator('#attributed-card'));
+  const linkedCardId = await extractResultCardJobId(page.locator('#linked-card'));
+  check('result-card identity prefers stable attributes and job links', () => {
+    assert.strictEqual(attributedCardId, '1234567890');
+    assert.strictEqual(linkedCardId, '9999999999');
   });
 
   await page.goto('about:blank');
@@ -1312,10 +1383,30 @@ const SHADOW_HTML = `
     page, defaultAnswers, config, noopLogger, 'inert-radio-job',
     { guardBlockedLabels: inertRadioGuardLabels }
   );
-  check('a radio click that never selects is recorded as an unfilled guard label', () => {
+  check('a grounded radio click that never selects is an automation failure, not a guard refusal', () => {
     assert.strictEqual(inertRadioResult.filled, 0);
-    assert.strictEqual(inertRadioGuardLabels.size, 1);
-    assert.ok([...inertRadioGuardLabels][0].includes('relocate'));
+    assert.strictEqual(inertRadioResult.selectionFailures, 1);
+    assert.strictEqual(inertRadioGuardLabels.size, 0);
+  });
+
+  await page.setContent(`
+    <dialog open>
+      <div>1/1 pages</div>
+      <p>Are you willing to relocate?*</p>
+      <fieldset role="radiogroup">
+        <div role="radio" aria-label="Yes" aria-checked="false">Yes</div>
+        <div role="radio" aria-label="No" aria-checked="false">No</div>
+      </fieldset>
+      <button onclick="document.body.dataset.submitClicked = 'true'; this.closest('dialog').insertAdjacentHTML('beforeend', '<div>Your application was sent</div>')">Submit application</button>
+    </dialog>`);
+  const inertRadioStepResult = await handleInlineApplyStep(
+    page, defaultAnswers, config, noopLogger, 'inert-radio-step-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const inertRadioSubmitClicked = await page.locator('body').getAttribute('data-submit-clicked');
+  check('the full apply step never clicks Submit after an inert required radio', () => {
+    assert.strictEqual(inertRadioStepResult, 'radio_selection_failed');
+    assert.strictEqual(inertRadioSubmitClicked, null);
   });
 
   await browser.close();

@@ -507,7 +507,7 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
       const match = fuzzyMatch(labelText);
       if (match) {
         if (isRejectedValue(match)) {
-          blocked.push({ label: labelText, type: fieldType, reason: 'output_guard', answer: String(match).substring(0, 60) });
+          blocked.push({ label: labelText, type: fieldType, reason: 'output_guard' });
           continue;
         }
         if (el.tagName === 'SELECT') {
@@ -765,6 +765,20 @@ function buildLinkedInSearchUrl(config) {
 //  Result Card Helpers
 // ══════════════════════════════════════════════════════════
 
+const RESULT_CARD_CONTAINER_SELECTOR = [
+  '[data-job-id]',
+  '[data-occludable-job-id]',
+  '[role="listitem"]',
+  'li',
+  'li.scaffold-layout__list-item',
+  '[class*="job-card-job-posting-card-wrapper"]',
+  '[class*="job-card-container"]',
+  '[class*="job-card-list"]',
+  '[class*="jobs-search-results__list-item"]',
+  'div[data-view-name="job-card"]',
+  'a[data-control-name*="job_card"]',
+].join(', ');
+
 /**
  * Find all result card locators on the current page.
  *
@@ -816,6 +830,35 @@ async function listResultCards(page) {
   if (cardIndices.length === 0) return [];
   const baseLocator = page.getByRole('button');
   return cardIndices.map(i => baseLocator.nth(i));
+}
+
+async function extractResultCardJobId(card) {
+  return card.evaluate((element) => {
+    const normalizeId = (value) => {
+      const match = String(value || '').match(/\d{6,}/);
+      return match ? match[0] : null;
+    };
+    const idFromHref = (href) => {
+      const match = String(href || '').match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)/);
+      return match ? match[1] : null;
+    };
+
+    for (let current = element; current && current !== document.body; current = current.parentElement) {
+      const attributed = normalizeId(
+        current.getAttribute?.('data-job-id') ||
+        current.getAttribute?.('data-occludable-job-id')
+      );
+      if (attributed) return attributed;
+      const ownHref = idFromHref(current.getAttribute?.('href'));
+      if (ownHref) return ownHref;
+    }
+
+    for (const link of element.querySelectorAll?.('a[href*="/jobs/view/"]') || []) {
+      const linked = idFromHref(link.getAttribute('href'));
+      if (linked) return linked;
+    }
+    return null;
+  }).catch(() => null);
 }
 
 async function countResultCards(page) {
@@ -992,7 +1035,7 @@ async function selectCard(cardLocator) {
  * Operates on the top-level page (detail panel is not inside the iframe).
  */
 async function extractSelectedJobDetail(page) {
-  const detail = await page.evaluate(() => {
+  const detail = await page.evaluate(({ resultCardContainerSelector }) => {
     const body = document.body;
     if (!body) return null;
 
@@ -1040,19 +1083,41 @@ async function extractSelectedJobDetail(page) {
       if (m) jobId = m[1];
     }
 
+    const mainEl = document.querySelector('main');
+
     // Promoted detection (detail-derived)
     const bodyText = body.innerText || '';
     const isPromoted = bodyText.includes('Promoted by hirer');
 
-    // Already applied detection
-    const alreadyApplied = bodyText.includes('Application submitted') ||
-      /\bApplied\b/.test(bodyText.substring(0, 500));
+    // Already-applied evidence must be owned by the selected detail pane. The
+    // left result list often contains an Applied card; body-wide text made
+    // that unrelated badge suppress whichever job was currently selected.
+    const hrefJobId = (href) => {
+      const match = String(href || '').match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)/);
+      return match ? match[1] : null;
+    };
+    const selectedDetailAnchors = jobId && mainEl
+      ? [...mainEl.querySelectorAll('a[href*="/jobs/view/"]')].filter((anchor) =>
+        isVisible(anchor) && hrefJobId(anchor.getAttribute('href')) === jobId &&
+        !anchor.closest(resultCardContainerSelector)
+      )
+      : [];
+    const belongsToSelectedDetail = (element) => {
+      for (let owner = element; owner && owner !== mainEl; owner = owner.parentElement) {
+        if (selectedDetailAnchors.some((anchor) => owner.contains(anchor))) return true;
+      }
+      return false;
+    };
+    const detailStatusPattern = /\bApplication status\s+Application submitted\b/i;
+    const alreadyApplied = !!mainEl && [...mainEl.querySelectorAll('*')].some((element) =>
+      isVisible(element) && detailStatusPattern.test((element.innerText || '').replace(/\s+/g, ' ')) &&
+      belongsToSelectedDetail(element)
+    );
 
     // Title and company from detail panel
     // The detail shows: company logo/link, then job title as a link, then location
     let title = null;
     let company = null;
-    const mainEl = document.querySelector('main');
     if (mainEl) {
       // Title is typically the first link inside main that points to /jobs/view/
       const titleLink = mainEl.querySelector('a[href*="/jobs/view/"] p, main p a[href*="/jobs/view/"]');
@@ -1074,7 +1139,7 @@ async function extractSelectedJobDetail(page) {
     const jobUrl = jobId ? `https://www.linkedin.com/jobs/view/${jobId}` : null;
 
     return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, hasEasyApply, description };
-  }).catch(() => null);
+  }, { resultCardContainerSelector: RESULT_CARD_CONTAINER_SELECTOR }).catch(() => null);
 
   // Also try getting jobId from the top-level page URL (more reliable)
   if (detail && !detail.jobId) {
@@ -1766,6 +1831,7 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
   }).catch(() => []);
 
   let filled = 0;
+  let selectionFailures = 0;
   for (const group of groups) {
     if (!group.question || group.options.length === 0) continue;
     const optionLabels = group.options.map(o => o.label);
@@ -1916,8 +1982,13 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
         el.getAttribute('aria-checked') !== 'true';
     }, { question: group.question, optionLabel: chosen.label }).catch(() => false);
     if (!snapshotStillMatches) {
-      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
-      logger.info({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio group changed before selection; recollecting safely');
+      selectionFailures++;
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
+        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'automation:radio_snapshot_changed',
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+      logger.warn({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio group changed before selection; refusing to advance this step');
       continue;
     }
     const clicked = await radio.evaluate((el) => {
@@ -1941,16 +2012,21 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
           _dialogRadioDepth: (options._dialogRadioDepth || 0) + 1,
         });
         filled += nested.filled;
+        selectionFailures += nested.selectionFailures || 0;
+        // The nested pass re-tags every still-unanswered group. Returning here
+        // prevents this pass from treating those intentionally replaced tags
+        // as snapshot changes and manufacturing an automation failure.
+        await sleep(200, 500);
+        return { groups: groups.length, filled, selectionFailures };
       }
       await sleep(200, 500);
     } else {
-      // Fail closed: an unselected group is an unfilled field. Recording it
-      // as guard-blocked routes a later validation bounce into the honest
-      // guarded-abandon classification instead of submitting incomplete.
-      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+      // This is an automation failure, not an honest policy refusal: config
+      // supplied a grounded answer, but the UI did not accept the selection.
+      selectionFailures++;
       recordFillAudit({
         platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
-        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'guard:radio_click_failed',
+        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'automation:radio_click_failed',
       });
       recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
       logger.warn({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio click did not select the option');
@@ -1960,7 +2036,7 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
   if (groups.length > 0) {
     logger.info({ platform: 'linkedin', jobId, groups: groups.length, filled }, 'Dialog radio groups processed');
   }
-  return { groups: groups.length, filled };
+  return { groups: groups.length, filled, selectionFailures };
 }
 
 // Fingerprint the active form step. The dialog UI puts radio questions in a
@@ -2105,7 +2181,7 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
     ? options.baselineSignatures
     : [];
   const expectedJobId = options.expectedJobId ? String(options.expectedJobId) : null;
-  return page.evaluate(({ markBaseline, baselineToken, baselineSignatures, expectedJobId }) => {
+  return page.evaluate(({ markBaseline, baselineToken, baselineSignatures, expectedJobId, resultCardContainerSelector }) => {
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return false;
@@ -2226,6 +2302,20 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
     const main = document.querySelector('main');
     let selectedDetailSubmitted = false;
     if (selectedJobMatches && main) {
+      const hrefJobId = (href) => {
+        const match = String(href || '').match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)/);
+        return match ? match[1] : null;
+      };
+      const selectedDetailAnchors = [...main.querySelectorAll('a[href*="/jobs/view/"]')].filter((anchor) =>
+        isVisible(anchor) && hrefJobId(anchor.getAttribute('href')) === expectedJobId &&
+        !anchor.closest(resultCardContainerSelector)
+      );
+      const belongsToSelectedDetail = (element) => {
+        for (let owner = element; owner && owner !== main; owner = owner.parentElement) {
+          if (selectedDetailAnchors.some((anchor) => owner.contains(anchor))) return true;
+        }
+        return false;
+      };
       const statusLeaves = [...main.querySelectorAll('*')].filter((el) => {
         if (!isVisible(el) || !detailStatusPattern.test(exposedText(el))) return false;
         return ![...el.children].some((child) =>
@@ -2233,7 +2323,8 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
         );
       });
       selectedDetailSubmitted = statusLeaves.some((el) =>
-        !el.closest('dialog') && !el.closest(unrelatedResultSelector));
+        !el.closest('dialog') && !el.closest(unrelatedResultSelector) &&
+        belongsToSelectedDetail(el));
     }
     const baselineOwner = baselineToken
       ? [...document.querySelectorAll(`[${ownerAttribute}]`)]
@@ -2259,7 +2350,13 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
       baselineToken: markBaseline ? baselineToken : null,
       baselineSignatures: markBaseline ? capturedSignatures : baselineSignatures,
     };
-  }, { markBaseline, baselineToken, baselineSignatures, expectedJobId }).catch(() => ({
+  }, {
+    markBaseline,
+    baselineToken,
+    baselineSignatures,
+    expectedJobId,
+    resultCardContainerSelector: RESULT_CARD_CONTAINER_SELECTOR,
+  }).catch(() => ({
     globalCount: 0,
     dialogCounts: {},
     dialogNovelCounts: {},
@@ -2477,9 +2574,22 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
 
   // ── Custom radio-group questions (2026-08 dialog UI) ──
   // Invisible native inputs make these unreachable for fillForm.
+  let dialogRadioFill;
   try {
-    await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options);
-  } catch (_) {}
+    dialogRadioFill = await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options);
+  } catch (error) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum, error: error?.message || String(error),
+    }, 'Dialog radio processing failed; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
+  if ((dialogRadioFill.selectionFailures || 0) > 0) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum,
+      selectionFailures: dialogRadioFill.selectionFailures,
+    }, 'Dialog radio selection was not verified; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
 
   await sleep(500, 1000);
 
@@ -2726,6 +2836,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   const maxPages = config.behavior?.maxPages || 5;
 
   let applied = 0;
+  let dryRunReady = 0;
+  let submissionAttempts = 0;
+  let submissionBudgetUsed = 0;
   let skipped = 0;
   let errors = 0;
   let alreadyApplied = 0;
@@ -2748,8 +2861,18 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
   function recordOutcome(outcome) {
     recordAndNotify(outcome);
-    if (outcome.status === 'submitted' || outcome.status === 'dry_run') applied++;
-    else if (outcome.status === 'skipped') skipped++;
+    if (outcome.status === 'submitted') {
+      applied++;
+      submissionAttempts++;
+      submissionBudgetUsed++;
+    } else if (outcome.status === 'dry_run') {
+      dryRunReady++;
+      submissionBudgetUsed++;
+    } else if (outcome.status === 'submit_unconfirmed') {
+      errors++;
+      submissionAttempts++;
+      submissionBudgetUsed++;
+    } else if (outcome.status === 'skipped') skipped++;
     else if (outcome.status === 'already_applied') alreadyApplied++;
     else if (outcome.status === 'error') errors++;
   }
@@ -2787,7 +2910,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   const seenRunCardKeys = new Set();
   const seenRunJobIds = new Set();
 
-  while (applied < maxApplications && currentPage <= maxPages) {
+  while (submissionBudgetUsed < maxApplications && currentPage <= maxPages) {
     // ── List result cards on current page (top-level page) ──
     let cards;
     try {
@@ -2833,7 +2956,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       break;
     }
 
-    for (let i = 0; i < cards.length && applied < maxApplications; i++) {
+    for (let i = 0; i < cards.length && submissionBudgetUsed < maxApplications; i++) {
       // ── Preemptive renderer reload ──
       // Reset the SPA's accumulated state before it crashes. We reload at
       // the TOP of an iteration (no card in flight) so we never orphan an
@@ -2901,7 +3024,10 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Within-run card dedup: the carousel re-serves the same promoted
         // cards after reloads and across pages. First encounter decides and
         // records the outcome; repeats are free.
-        const cardKey = [jobTitle, company, summary.location || ''].join('|').toLowerCase();
+        const cardJobId = await extractResultCardJobId(card);
+        const cardKey = cardJobId
+          ? `job:${cardJobId}`
+          : [jobTitle, company, summary.location || ''].join('|').toLowerCase();
         if (seenRunCardKeys.has(cardKey)) {
           internalSkipped++;
           continue;
@@ -3053,7 +3179,19 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (hasLinkedInDailySubmissionLimitMessage(pageText) || hasLinkedInDailySubmissionLimitMessage(shadowText)) {
           logger.warn({ platform: 'linkedin', applied, jobId, jobTitle }, 'Daily submission limit — ending session');
           recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'daily_limit_reached', source });
-          return { applied, skipped, errors, alreadyApplied, internalSkipped, stopSession: true, stopSessionReason: 'linkedin_daily_submission_limit' };
+          return {
+            applied,
+            dryRunReady,
+            submissionAttempts,
+            skipped,
+            errors,
+            alreadyApplied,
+            internalSkipped,
+            aborted: abortPlatformRun,
+            noResults: noResultsPageOne,
+            stopSession: true,
+            stopSessionReason: 'linkedin_daily_submission_limit',
+          };
         }
 
         // ── Step 7: Process inline apply steps ──
@@ -3069,6 +3207,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         let stepCount = 0;
         let applyComplete = false;
         const seenFingerprints = new Set();
+        const retriedFingerprints = new Set();
         const MAX_STEPS = 12;
 
         while (!applyComplete && stepCount < MAX_STEPS) {
@@ -3087,7 +3226,15 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             fingerprint = await captureApplyStepFingerprint(page);
           }
 
-          if (fingerprint && seenFingerprints.has(fingerprint)) {
+          if (fingerprint && seenFingerprints.has(fingerprint) && !retriedFingerprints.has(fingerprint)) {
+            // One unchanged settle check is not enough to distinguish a slow
+            // transition from a form that needs a second fill/advance pass.
+            // Retry the handler once; only a second settled repeat is a cycle.
+            retriedFingerprints.add(fingerprint);
+            logger.warn({
+              jobId, jobTitle, company, stepNum: stepCount,
+            }, 'Apply step remained unchanged after settling; retrying once before cycle failure');
+          } else if (fingerprint && seenFingerprints.has(fingerprint)) {
             // Surface the actual unfilled labels — pre-fix the throw gave us
             // no signal about which fields the agent couldn't resolve.
             const labels = fingerprint.split('||').filter(Boolean).slice(0, 12);
@@ -3120,7 +3267,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
           const result = await handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount, fillOptions);
 
-          if (result === 'retry_failed' || result === 'top_choice_required' || result === 'submit_unconfirmed') {
+          if (result === 'retry_failed' || result === 'radio_selection_failed' ||
+              result === 'top_choice_required' || result === 'submit_unconfirmed') {
             // 'submit_unconfirmed' gets its own message: the 2026-08-25..29
             // runs recorded 13 real submissions as "Validation errors" because
             // an unconfirmed submit was indistinguishable from a form bounce.
@@ -3128,11 +3276,15 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
               ? 'top_choice_required_review — form blocked on boost checkbox, policy is never-spend'
               : result === 'submit_unconfirmed'
                 ? `Submit clicked on step ${stepCount} but no confirmation observed — outcome unverified`
+                : result === 'radio_selection_failed'
+                  ? `Required radio selection failed on step ${stepCount} — refusing to submit`
                 : `Validation errors on step ${stepCount} — retry failed`);
             // An unconfirmed submit is an unknown outcome and must surface as
             // an error: guard metadata would downgrade it to a routine skip
             // and hide it from run health and forensics.
-            if (result !== 'submit_unconfirmed' && fillOptions.guardBlockedLabels.size > 0) {
+            if (result === 'submit_unconfirmed') {
+              valErr.submitUnconfirmed = true;
+            } else if (result !== 'radio_selection_failed' && fillOptions.guardBlockedLabels.size > 0) {
               valErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
             } else if (result === 'top_choice_required') {
               valErr.policyAbandonment = 'top_choice_required';
@@ -3141,7 +3293,10 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           } else if (result === 'submitted') {
             applyComplete = true;
 
-            logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Application submitted');
+            logger.info(
+              { jobId, jobTitle, company, steps: stepCount },
+              dryRun ? '[DRY RUN] Application ready to submit' : 'Application submitted'
+            );
             recordOutcome({ status: dryRun ? 'dry_run' : 'submitted', jobId, jobTitle, company, jobUrl, steps: stepCount, source });
 
             // Dismiss post-submit UI
@@ -3184,7 +3339,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Honest abandonment is a skip, not breakage (spec: 'error' must mean
         // the agent broke, not that it refused to fabricate an answer).
         const guardedLabels = Array.isArray(err.guardedAbandonment) ? err.guardedAbandonment : null;
-        if (guardedLabels && guardedLabels.length > 0) {
+        if (err.submitUnconfirmed) {
+          logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Submission outcome is unverified');
+          recordOutcome({
+            status: 'submit_unconfirmed', jobId: jobId || 'unknown', jobTitle,
+            company, jobUrl, errorMessage: err.message, source,
+          });
+        } else if (guardedLabels && guardedLabels.length > 0) {
           const labelSummary = guardedLabels
             .map(l => String(l).replace(/\s+/g, ' ').trim().substring(0, 40))
             .slice(0, 3).join(' | ');
@@ -3205,7 +3366,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     if (abortPlatformRun) break;
 
     // ── Pagination ──
-    if (applied < maxApplications && currentPage < maxPages) {
+    if (submissionBudgetUsed < maxApplications && currentPage < maxPages) {
       const navigated = await goToNextPage(page, currentPage, logger);
       if (!navigated) break;
       currentPage++;
@@ -3218,13 +3379,25 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   // aborted/noResults let the orchestrator distinguish an incomplete scan
   // (reload failure, empty page 1 = challenge/DOM break/login bounce) from a
   // genuinely exhausted healthy run.
-  return { applied, skipped, errors, alreadyApplied, internalSkipped, aborted: abortPlatformRun, noResults: noResultsPageOne };
+  return {
+    applied,
+    dryRunReady,
+    submissionAttempts,
+    skipped,
+    errors,
+    alreadyApplied,
+    internalSkipped,
+    aborted: abortPlatformRun,
+    noResults: noResultsPageOne,
+  };
 }
 
 module.exports = {
   applyLinkedIn,
   // Exported for testing
   buildLinkedInSearchUrl,
+  extractResultCardJobId,
+  extractSelectedJobDetail,
   summarizeResultCard,
   shouldApply,
   isRemoteLocation,
