@@ -1613,6 +1613,87 @@ const SHADOW_HTML = `
     assert.strictEqual(typeaheadStepResult, 'next');
   });
 
+  // LinkedIn's suggestion list renders asynchronously (often more than the
+  // handler's 0.8 s wait: 7Th Sky Tech, 2026-09-17, bounced with the raw
+  // text left in the field). The listbox is a [role=listbox] whose
+  // aria-labelledby is the input id; picking an option replaces the value.
+  await page.setContent(`
+    <dialog open>
+      <div>1/6 pages</div>
+      <p>Location (city)*</p>
+      <input id="slow-typeahead" data-testid="typeahead-input" autocomplete="off"
+             placeholder="Enter city or location" aria-autocomplete="list" value="">
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+      <script>
+        const slowInput = document.getElementById('slow-typeahead');
+        slowInput.addEventListener('input', () => {
+          const existing = document.getElementById('slow-listbox');
+          if (existing) existing.remove();
+          clearTimeout(window.__slowListboxTimer);
+          window.__slowListboxTimer = setTimeout(() => {
+            if (!slowInput.value) return;
+            const listbox = document.createElement('div');
+            listbox.id = 'slow-listbox';
+            listbox.setAttribute('role', 'listbox');
+            listbox.setAttribute('aria-labelledby', 'slow-typeahead');
+            for (const text of [slowInput.value + ', Illinois, United States', slowInput.value + ' Metropolitan Area']) {
+              const option = document.createElement('div');
+              option.setAttribute('role', 'option');
+              option.textContent = text;
+              option.addEventListener('click', () => { slowInput.value = text; listbox.remove(); });
+              listbox.appendChild(option);
+            }
+            slowInput.insertAdjacentElement('afterend', listbox);
+          }, 1500);
+        });
+      </script>
+    </dialog>`);
+  const slowTypeaheadResult = await handleInlineApplyStep(
+    page, defaultAnswers, config, noopLogger, 'slow-typeahead-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const slowTypeaheadValue = await page.locator('#slow-typeahead').inputValue();
+  check('a typeahead whose suggestions render late still gets a suggestion applied', () => {
+    // Either suggestion is a valid LinkedIn location; the raw typed text is not.
+    assert(['Springfield, Illinois, United States', 'Springfield Metropolitan Area'].includes(slowTypeaheadValue),
+      `expected a suggestion to be applied, got ${JSON.stringify(slowTypeaheadValue)}`);
+    assert.strictEqual(slowTypeaheadResult, 'next');
+  });
+
+  // Longer contact forms add Country* and Phone country code* selects; both
+  // were left unselected (3 error cycles in 3 nights, 09-15..17).
+  await page.setContent(`
+    <dialog open>
+      <div>1/6 pages</div>
+      <label for="contact-country">Country*</label>
+      <select id="contact-country">
+        <option value="">Select an option</option>
+        <option value="CA">Canada</option>
+        <option value="US">United States</option>
+        <option value="UM">United States Minor Outlying Islands</option>
+      </select>
+      <label for="contact-phone-code">Phone country code*</label>
+      <select id="contact-phone-code">
+        <option value="">Select an option</option>
+        <option value="AD">Andorra (+376)</option>
+        <option value="AE">United Arab Emirates (+971)</option>
+        <option value="US">United States (+1)</option>
+        <option value="UM">United States Minor Outlying Islands (+1)</option>
+      </select>
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const countrySelectResult = await handleInlineApplyStep(
+    page, {}, { user: { country: 'US' } }, noopLogger, 'country-select-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const countrySelected = await page.locator('#contact-country').inputValue();
+  const phoneCodeSelected = await page.locator('#contact-phone-code').inputValue();
+  check('Country and Phone country code selects follow config.user.country', () => {
+    assert.strictEqual(countrySelected, 'US');
+    assert.strictEqual(phoneCodeSelected, 'US');
+    assert.strictEqual(countrySelectResult, 'next');
+  });
+
   // ── Posting-country placeholder (2026-09-13) ──
   // FieldAI-style screeners defer the jurisdiction to the posting. The card
   // location supplies it via options.jobContext.jobCountry.
