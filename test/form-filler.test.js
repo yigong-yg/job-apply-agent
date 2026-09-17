@@ -136,5 +136,33 @@ test('hear about rule still matches an actual referral question', () => {
   assert.strictEqual(result.answer, 'Job Board');
 });
 
+// ── Country selects (2026-09-16) ──
+// Longer LinkedIn contact forms carry Country* and Phone country code*
+// selects; with no rule they stayed unselected and the step bounced.
+test('country rule answers from config.user.country with the display name', () => {
+  const withCountry = { user: { ...config.user, country: 'US' } };
+  const country = inferByRules(normalizeLabel('Country*'), 'Country*', 'select', withCountry);
+  assert(country, 'expected a country answer');
+  assert.strictEqual(country.rule, 'rule:country');
+  assert.strictEqual(country.answer, 'United States');
+  const residence = inferByRules(normalizeLabel('Country of residence'), 'Country of residence', 'select', withCountry);
+  assert.strictEqual(residence && residence.answer, 'United States');
+  const spelled = inferByRules(normalizeLabel('Country'), 'Country', 'select', { user: { country: 'United Kingdom' } });
+  assert.strictEqual(spelled && spelled.answer, 'United Kingdom');
+});
+
+test('phone country code rule answers the dialing-code display form', () => {
+  const withCountry = { user: { ...config.user, country: 'US' } };
+  const code = inferByRules(normalizeLabel('Phone country code*'), 'Phone country code*', 'select', withCountry);
+  assert(code, 'expected a phone country code answer');
+  assert.strictEqual(code.rule, 'rule:phone_country_code');
+  assert.strictEqual(code.answer, 'United States (+1)');
+});
+
+test('country rules stay silent without config.user.country', () => {
+  const country = inferByRules(normalizeLabel('Country*'), 'Country*', 'select', config);
+  assert(!country || !/country/.test(country.rule), `unexpected country answer: ${JSON.stringify(country)}`);
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

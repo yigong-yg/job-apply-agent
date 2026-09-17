@@ -14,7 +14,11 @@ const {
   buildApplyLinkSelector,
   mapEducationAnswerToYesNo,
   matchDialogRadioOption,
+  deriveJobCountry,
+  dialogQuestionRequiresExactAnswer,
+  groundedDialogPreference,
 } = require('../modules/linkedin');
+const { normalizeLabel } = require('../lib/form-filler');
 
 let passed = 0;
 let failed = 0;
@@ -24,6 +28,65 @@ function test(name, fn) {
 }
 
 console.log('\n=== LinkedIn Module Tests ===\n');
+
+// ── deriveJobCountry (2026-09-13) ──
+// Screeners phrased "in the country where this position is located" are
+// grounded by the posting's country, read from the card location and, for
+// area-only locations, the configured (US-scoped) search.
+test('deriveJobCountry reads the posting country from the card location', () => {
+  const cfg = { search: { location: 'California, New York, Massachusetts, United States' } };
+  assert.strictEqual(deriveJobCountry('San Francisco, CA (On-site)', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('United States (Remote)', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('New York, NY', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('Toronto, Ontario, Canada', cfg), 'canada');
+  assert.strictEqual(deriveJobCountry('London, England, United Kingdom', cfg), 'uk');
+  assert.strictEqual(deriveJobCountry('Greater Boston Area', cfg), 'us');
+  assert.strictEqual(deriveJobCountry('Greater Boston Area', { search: {} }), null);
+  assert.strictEqual(deriveJobCountry('', { search: { country: 'US' } }), 'us');
+  assert.strictEqual(deriveJobCountry('Sydney, New South Wales, Australia', cfg), 'australia');
+});
+
+// ── Compound-question false positives (2026-09-13) ──
+// These boilerplate phrasings contain "or"/"and" but ask one grounded fact.
+test('sponsorship phrased "now or will you in the future" is not a compound question', () => {
+  assert.strictEqual(
+    dialogQuestionRequiresExactAnswer('Do you now or will you in the future require sponsorship to work in the United States?', 'sponsorship'),
+    null
+  );
+});
+
+test('citizen-or-green-card alternatives are one citizenship question', () => {
+  assert.strictEqual(dialogQuestionRequiresExactAnswer('Are you an US Citizen or Permanent Resident?', 'citizenship'), null);
+  assert.strictEqual(dialogQuestionRequiresExactAnswer('Are you a US Citizen or Green Card holder?', 'citizenship'), null);
+  assert.strictEqual(dialogQuestionRequiresExactAnswer('Is your WORK AUTHORIZATION either US CITIZEN OR GREEN CARD HOLDER?', 'citizenship'), null);
+});
+
+test('"18 years of age and legally eligible" boilerplate is one grounded fact', () => {
+  assert.strictEqual(
+    dialogQuestionRequiresExactAnswer('Are you at least 18 years of age and legally eligible to perform the duties of this position?', 'unguarded'),
+    null
+  );
+});
+
+test('genuine compounds are still exact-only', () => {
+  assert.strictEqual(
+    dialogQuestionRequiresExactAnswer("Do you have at least a bachelor's degree and 5 years of Python experience?", 'education_facts'),
+    'compound_question'
+  );
+  assert.strictEqual(dialogQuestionRequiresExactAnswer('Are you willing to work onsite or relocate?', 'unguarded'), 'compound_question');
+  assert.strictEqual(dialogQuestionRequiresExactAnswer('Are you a US citizen or willing to relocate?', 'citizenship'), 'compound_question');
+});
+
+test('18-and-eligible answers only from over18 plus covering authorization', () => {
+  const q = normalizeLabel('Are you at least 18 years of age and legally eligible to perform the duties of this position?*');
+  const grounded = groundedDialogPreference(q, { user: { over18: true, workAuthorization: 'US Citizen' } }, 'us');
+  assert.strictEqual(grounded && grounded.answer, 'Yes');
+  assert.strictEqual(groundedDialogPreference(q, { user: { over18: false, workAuthorization: 'US Citizen' } }, 'us').answer, 'No');
+  assert.strictEqual(groundedDialogPreference(q, { user: { workAuthorization: 'US Citizen' } }, 'us'), null);
+  assert.strictEqual(groundedDialogPreference(q, { user: { over18: true } }, 'us'), null);
+  assert.strictEqual(groundedDialogPreference(q, { user: { over18: true, workAuthorization: 'US Citizen' } }, 'canada'), null);
+  assert.strictEqual(groundedDialogPreference(q, { user: { over18: true, workAuthorization: 'US Citizen' } }, null).answer, 'Yes');
+});
 
 // ── buildLinkedInSearchUrl ──
 

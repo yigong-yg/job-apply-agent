@@ -18,6 +18,40 @@ const { fillForm } = require('../lib/form-filler');
 const { recordUnfilledField } = require('../lib/state');
 
 const SELECTOR_TIMEOUT = 10000;
+const SUBMISSION_CONFIRMATION_TEXT = [
+  'Application submitted',
+  'Successfully applied',
+];
+
+function submissionConfirmationLocators(page) {
+  if (!page || typeof page.getByText !== 'function') return [];
+  return SUBMISSION_CONFIRMATION_TEXT.map((text) => page.getByText(text, { exact: false }));
+}
+
+async function hasVisibleSubmissionConfirmation(page) {
+  for (const evidence of submissionConfirmationLocators(page)) {
+    const matches = await evidence.all().catch(() => []);
+    for (const match of matches) {
+      if (await match.isVisible().catch(() => false)) return true;
+    }
+  }
+  return false;
+}
+
+async function waitForSubmissionConfirmation(page, options = {}) {
+  const { timeout = 10000, preexistingEvidence = false } = options;
+  if (preexistingEvidence) return false;
+  const locators = submissionConfirmationLocators(page);
+  if (locators.length === 0) return false;
+  const deadline = Date.now() + timeout;
+  do {
+    if (await hasVisibleSubmissionConfirmation(page)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+  } while (Date.now() <= deadline);
+  return false;
+}
 
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
@@ -107,8 +141,14 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
   const retryAttempts = new Map(); // jobId → number of retries made
 
   let applied = 0;
+  let dryRunReady = 0;
+  let submissionAttempts = 0;
+  let budgetUsed = 0;
   let skipped = 0;
   let errors = 0;
+  let aborted = false;
+  let noResults = false;
+  let sawUsableJob = false;
 
   const searchUrl = buildSearchUrl(config);
   logger.info({ platform: 'dice', searchUrl }, 'Navigating to Dice search');
@@ -122,12 +162,12 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
       platform: 'dice', jobId: 'captcha_detected',
       status: 'captcha_blocked', errorMessage: 'Cloudflare/bot block detected — platform stopped', runId,
     });
-    return { applied, skipped, errors };
+    return { applied, skipped, errors, aborted, noResults, captchaBlocked: true };
   }
   let currentPage = 1;
   let pageHasMoreJobs = true;
 
-  while (applied < maxApplications && pageHasMoreJobs) {
+  while (budgetUsed < maxApplications && pageHasMoreJobs) {
     // Wait for job cards to load
     // Dice is React SPA — waitForSelector auto-waits for React to render
     try {
@@ -137,6 +177,8 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
       );
     } catch (_) {
       logger.warn({ platform: 'dice' }, 'Job cards not found — may have reached end of results');
+      if (currentPage === 1) noResults = true;
+      else aborted = true;
       break;
     }
 
@@ -146,16 +188,19 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
       '.search-result-job-card, [data-cy="search-card"], dhi-search-card'
     );
     logger.info({ platform: 'dice', cardCount: jobCards.length, page: currentPage }, 'Found job cards');
+    if (currentPage === 1 && jobCards.length === 0) noResults = true;
 
     const cardsToProcess = [...jobCards];
 
-    while (cardsToProcess.length > 0 && applied < maxApplications) {
+    while (cardsToProcess.length > 0 && budgetUsed < maxApplications) {
       const card = cardsToProcess.shift();
 
       let jobId = null;
       let jobTitle = null;
       let company = null;
       let jobUrl = null;
+      let submitAttempted = false;
+      let submitOutcomeRecorded = false;
 
       try {
         jobId = await extractDiceJobId(card);
@@ -163,10 +208,14 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
           skipped++;
           continue;
         }
+        sawUsableJob = true;
 
         if (state.hasApplied('dice', jobId)) {
           logger.debug({ jobId }, 'Already applied — skipping');
-          state.recordApplication({ platform: 'dice', jobId, status: 'already_applied', runId });
+          state.recordApplication({
+            platform: 'dice', jobId, status: 'already_applied',
+            skipReason: 'already_applied_db', runId,
+          });
           skipped++;
           continue;
         }
@@ -194,7 +243,7 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
             platform: 'dice', jobId: 'captcha_detected',
             status: 'captcha_blocked', errorMessage: 'Cloudflare/bot block detected — platform stopped', runId,
           });
-          return { applied, skipped, errors };
+          return { applied, skipped, errors, aborted, noResults, captchaBlocked: true };
         }
 
         // Check for "Complete your profile" interstitial — if shown, user must fix manually
@@ -235,7 +284,7 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
         if (btnText.includes('applied')) {
           state.recordApplication({
             platform: 'dice', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', runId,
+            status: 'already_applied', skipReason: 'already_applied_dice', runId,
           });
           skipped++;
           await page.goBack({ waitUntil: 'domcontentloaded' });
@@ -327,23 +376,41 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
             status: 'dry_run', runId,
           });
         } else {
+          const preexistingEvidence = await hasVisibleSubmissionConfirmation(page);
+          submitAttempted = true;
+          submissionAttempts++;
+          budgetUsed++;
           await submitBtn.click();
           await sleep(1500, 2500);
 
-          // Wait for confirmation
-          await page.waitForSelector(
-            'text="Application Submitted", text="Successfully applied", text="application submitted"',
-            { timeout: 10000 }
-          ).catch(() => null);
-
-          logger.info({ jobId, jobTitle, company }, 'Dice application submitted');
-          state.recordApplication({
-            platform: 'dice', jobId, jobTitle, company, jobUrl,
-            status: 'submitted', runId,
-          });
+          const confirmed = await waitForSubmissionConfirmation(page, { preexistingEvidence });
+          if (confirmed) {
+            logger.info({ jobId, jobTitle, company }, 'Dice application submitted');
+            state.recordApplication({
+              platform: 'dice', jobId, jobTitle, company, jobUrl,
+              status: 'submitted', runId,
+            });
+            submitOutcomeRecorded = true;
+            applied++;
+          } else {
+            errors++;
+            logger.error(
+              { jobId, jobTitle, company },
+              'Dice submit click was not confirmed; outcome recorded as unverified'
+            );
+            state.recordApplication({
+              platform: 'dice', jobId, jobTitle, company, jobUrl,
+              status: 'submit_unconfirmed',
+              errorMessage: 'Submit clicked but confirmation evidence timed out', runId,
+            });
+            submitOutcomeRecorded = true;
+          }
         }
 
-        applied++;
+        if (dryRun) {
+          dryRunReady++;
+          budgetUsed++;
+        }
         await sleep(minDelayBetweenApplications, maxDelayBetweenApplications);
 
         // Navigate back to search results
@@ -361,6 +428,24 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
 
         await sleep(2000, 4000);
 
+        // A submit click can reach Dice even when Playwright reports a later
+        // failure. Do not retry an outcome that may already be committed.
+        if (submitAttempted) {
+          if (!submitOutcomeRecorded) {
+            errors++;
+            state.recordApplication({
+              platform: 'dice', jobId, jobTitle, company, jobUrl,
+              status: 'submit_unconfirmed',
+              errorMessage: `Submit click outcome unknown: ${err.message}`, runId,
+            });
+          }
+          logger.error(
+            { platform: 'dice', jobId, error: err.message },
+            'Error after submit attempt; ending platform run to prevent a duplicate'
+          );
+          return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted: true, noResults, captchaBlocked: false };
+        }
+
         // Check for block page before deciding whether to retry (PRD §8.2)
         if (await isBlockedPage(page)) {
           logger.error({ platform: 'dice' }, 'Block page detected after error — stopping Dice');
@@ -368,7 +453,7 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
             platform: 'dice', jobId: 'captcha_detected',
             status: 'captcha_blocked', errorMessage: 'Cloudflare/bot block detected — platform stopped', runId,
           });
-          return { applied, skipped, errors };
+          return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted, noResults, captchaBlocked: true };
         }
 
         // Retry transient errors up to maxRetries times
@@ -390,7 +475,7 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
     }
 
     // Pagination: Dice uses numbered pages at the bottom
-    if (applied < maxApplications) {
+    if (budgetUsed < maxApplications) {
       try {
         const nextBtn = await page.$('a[aria-label="Go to next page"], button[aria-label="Next page"], .pagination-next');
         if (nextBtn && await nextBtn.isVisible()) {
@@ -401,12 +486,14 @@ async function applyDice(page, config, defaultAnswers, state, runId, logger, dry
           pageHasMoreJobs = false;
         }
       } catch (_) {
+        aborted = true;
         pageHasMoreJobs = false;
       }
     }
   }
 
-  return { applied, skipped, errors };
+  if (maxApplications > 0 && !sawUsableJob) noResults = true;
+  return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted, noResults, captchaBlocked: false };
 }
 
-module.exports = { applyDice };
+module.exports = { applyDice, waitForSubmissionConfirmation };

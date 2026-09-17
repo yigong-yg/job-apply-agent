@@ -30,7 +30,7 @@ if (!fs.existsSync(configPath) || !fs.existsSync(answersPath)) {
 // Windows editors and PowerShell 5.1 write UTF-8 with a BOM, which strict
 // JSON.parse rejects — a BOM-carrying config crashed the 2026-08-31 launcher.
 function readJsonFile(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^﻿/, ''));
+  return JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
 }
 const config = readJsonFile(configPath);
 const defaultAnswers = readJsonFile(answersPath);
@@ -183,6 +183,7 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
   ];
 
   let totalApplied = 0;
+  let totalDryRun = 0;
   let totalAlreadyApplied = 0;
   let totalSkipped = 0;
   let totalErrors = 0;
@@ -196,7 +197,8 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
     }
     const platformStats = dbStats[platform] || { applied: 0, skipped: 0, errors: 0, dry_run: 0, already_applied: 0 };
     const { applied = 0, skipped = 0, errors = 0, dry_run = 0, already_applied = 0 } = platformStats;
-    totalApplied += applied + dry_run;
+    totalApplied += applied;
+    totalDryRun += dry_run;
     totalAlreadyApplied += already_applied;
     totalSkipped += skipped;
     totalErrors += errors;
@@ -222,9 +224,12 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
     else if (source === 'config') sourceCategories.defaultAnswers += count; // file uploads etc.
   }
 
-  const totalScanned = totalApplied + totalAlreadyApplied + totalSkipped + totalErrors;
+  const totalScanned = totalApplied + totalDryRun + totalAlreadyApplied + totalSkipped + totalErrors;
+  const outcomeTotal = dryRun
+    ? `${totalDryRun} ready_to_submit`
+    : `${totalApplied} applied`;
   lines.push('─'.repeat(55));
-  lines.push(`  TOTAL:      ${totalApplied} applied | ${totalAlreadyApplied} already_applied | ${totalSkipped} skipped | ${totalErrors} errors`);
+  lines.push(`  TOTAL:      ${outcomeTotal} | ${totalAlreadyApplied} already_applied | ${totalSkipped} skipped | ${totalErrors} errors`);
   lines.push(`  Sessions:  ${sessionStatus.join(' | ')}`);
   lines.push(`  Fill Sources: ${sourceCategories.defaultAnswers} defaultAnswers | ${sourceCategories.rule} rule | ${sourceCategories.llm} llm | ${sourceCategories.safe_default} safe_default | ${sourceCategories.cannot_fill} cannot_fill`);
   lines.push(`  Unmatched Fields: ${unmatchedCount} new (see unfilled_fields table)`);
@@ -232,9 +237,9 @@ async function printSummaryReport(runId, startTime, sessionStats, dryRun = false
 
   const report = lines.join('\n');
   console.log('\n' + report + '\n');
-  logger.info({ runId, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned }, 'Run complete');
+  logger.info({ runId, totalApplied, totalDryRun, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned }, 'Run complete');
 
-  return { report, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin: duration, sessions: sessionStatus };
+  return { report, totalApplied, totalDryRun, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin: duration, sessions: sessionStatus };
 }
 
 /**
@@ -365,8 +370,15 @@ async function main() {
     // max, so without this a multi-slot day could authorize several times the
     // intended daily volume. Dry runs submit nothing and are exempt.
     if (!runtime.dryRun) {
-      const dailyCap = Number(process.env.DAILY_MAX_APPLICATIONS || config.behavior?.dailyMaxApplications || 30);
-      const submittedToday = state.getTodaySubmittedCount();
+      const envDailyCap = process.env.DAILY_MAX_APPLICATIONS;
+      const dailyCapSource = typeof envDailyCap === 'string' && envDailyCap.trim() !== ''
+        ? envDailyCap
+        : (config.behavior?.dailyMaxApplications ?? 30);
+      const dailyCap = Number(dailyCapSource);
+      if (!Number.isFinite(dailyCap) || dailyCap < 0) {
+        throw new Error('DAILY_MAX_APPLICATIONS must be a non-negative number');
+      }
+      const submittedToday = state.getTodaySubmissionBudgetCount();
       const allowance = clampToDailyBudget({
         perRunMax: config.platforms[platform].maxApplicationsPerRun,
         dailyCap,
@@ -410,6 +422,10 @@ async function main() {
 
       runStats[platform] = platformStats;
       platformLogger.info(platformStats, 'Platform complete');
+      if (platformStats?.sessionExpired) {
+        sessionExpiredPlatforms.push(platform);
+        await alertSessionExpired(platform);
+      }
       // A scan that aborted (reload/re-list failure) or found no result cards
       // at all is an infrastructure failure, not a completed run: mark it
       // unhealthy so the launcher's later trigger retries the slot.
@@ -462,7 +478,7 @@ async function main() {
   }
 
   state.completeRun(runId, aggregatedStats);
-  const { report, totalApplied, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin, sessions } =
+  const { report, totalApplied, totalDryRun, totalAlreadyApplied, totalSkipped, totalErrors, totalScanned, durationMin, sessions } =
     await printSummaryReport(runId, startTime, runStats, runtime.dryRun);
 
   // Flush any remaining per-app notifications
@@ -474,6 +490,7 @@ async function main() {
     durationMin,
     scanned: totalScanned,
     applied: totalApplied,
+    readyToSubmit: totalDryRun,
     alreadyApplied: totalAlreadyApplied,
     skipped: totalSkipped,
     failed: totalErrors,
@@ -490,6 +507,7 @@ async function main() {
     dryRun: runtime.dryRun,
     sessionId,
     applied: totalApplied,
+    readyToSubmit: totalDryRun,
     scanned: totalScanned,
   }, logger);
 
@@ -500,6 +518,8 @@ async function main() {
   // successful, allowing its later scheduled trigger to retry.
   const dbRunStats = state.getRunStats(runId);
   const captchaBlocked = Object.values(dbRunStats).some((s) => (s.captcha_blocked || 0) > 0);
+  const unconfirmedSubmissions = Object.values(dbRunStats)
+    .reduce((sum, stats) => sum + (stats.submit_unconfirmed || 0), 0);
   process.exit(getRunExitCode({
     dryRun: runtime.dryRun,
     totalApplied,
@@ -507,6 +527,7 @@ async function main() {
     sessionExpired: sessionExpiredPlatforms.length > 0,
     platformCrashed,
     captchaBlocked,
+    unconfirmedSubmissions,
   }));
 }
 
