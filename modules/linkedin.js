@@ -26,7 +26,7 @@ const { sleep } = require('../lib/humanize');
 const { fillForm, retryInvalidFields, normalizeLabel } = require('../lib/form-filler');
 const { recordUnfilledField, recordFillAudit } = require('../lib/state');
 const { queueAppNotification } = require('../lib/notify');
-const { guardAnswer, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
+const { guardAnswer, namedJurisdictions, GUARDED_PATTERN_SOURCES } = require('../lib/answer-policy');
 const { validateAnswer, VALIDATOR_PATTERN_SOURCES } = require('../lib/output-validator');
 
 const SELECTOR_TIMEOUT = 10000;
@@ -507,7 +507,7 @@ async function fillShadowForm(page, defaultAnswers, logger, jobId, opts = {}) {
       const match = fuzzyMatch(labelText);
       if (match) {
         if (isRejectedValue(match)) {
-          blocked.push({ label: labelText, type: fieldType, reason: 'output_guard', answer: String(match).substring(0, 60) });
+          blocked.push({ label: labelText, type: fieldType, reason: 'output_guard' });
           continue;
         }
         if (el.tagName === 'SELECT') {
@@ -765,6 +765,65 @@ function buildLinkedInSearchUrl(config) {
 //  Result Card Helpers
 // ══════════════════════════════════════════════════════════
 
+// ── Posting country ──
+// Screeners phrased "in the country where this position is located" are
+// grounded by the posting itself. The LinkedIn search is US-scoped, so a card
+// location naming the United States or a US state resolves to 'us'; other
+// named countries resolve to their answer-policy jurisdiction name; area-only
+// locations ("Greater Boston Area") fall back to the configured search
+// country. Unknown stays null, which keeps those questions unanswerable.
+const US_STATE_ABBREVIATIONS = new Set([
+  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA',
+  'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM',
+  'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA',
+  'WV', 'WI', 'WY', 'PR',
+]);
+const US_STATE_NAMES_RE = /\b(?:alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|puerto rico)\b/;
+const US_COUNTRY_RE = /\b(?:united states|u\.s\.a?\.?|usa)\b/i;
+const OTHER_COUNTRY_PATTERNS = [
+  ['canada', /\bcanada\b/i],
+  ['australia', /\baustralia\b/i],
+  ['india', /\bindia\b/i],
+  ['mexico', /\bmexico\b/i],
+  // "Wales" is left out: "New South Wales, Australia" must not read as the UK.
+  ['uk', /\b(?:united kingdom|great britain|england|scotland|northern ireland)\b|\buk\b/i],
+];
+
+function normalizeCountryName(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  if (US_COUNTRY_RE.test(text) || /^us$/i.test(text)) return 'us';
+  for (const [name, pattern] of OTHER_COUNTRY_PATTERNS) if (pattern.test(text)) return name;
+  return text.toLowerCase();
+}
+
+function deriveJobCountry(locationText, config = {}) {
+  const text = String(locationText || '');
+  if (US_COUNTRY_RE.test(text)) return 'us';
+  const abbreviation = text.match(/,\s*([A-Z]{2})\b/);
+  if (abbreviation && US_STATE_ABBREVIATIONS.has(abbreviation[1])) return 'us';
+  if (US_STATE_NAMES_RE.test(text.toLowerCase())) return 'us';
+  for (const [name, pattern] of OTHER_COUNTRY_PATTERNS) if (pattern.test(text)) return name;
+  const configured = config.search?.jobCountry || config.search?.country;
+  if (configured) return normalizeCountryName(configured);
+  if (US_COUNTRY_RE.test(String(config.search?.location || ''))) return 'us';
+  return null;
+}
+
+const RESULT_CARD_CONTAINER_SELECTOR = [
+  '[data-job-id]',
+  '[data-occludable-job-id]',
+  '[role="listitem"]',
+  'li',
+  'li.scaffold-layout__list-item',
+  '[class*="job-card-job-posting-card-wrapper"]',
+  '[class*="job-card-container"]',
+  '[class*="job-card-list"]',
+  '[class*="jobs-search-results__list-item"]',
+  'div[data-view-name="job-card"]',
+  'a[data-control-name*="job_card"]',
+].join(', ');
+
 /**
  * Find all result card locators on the current page.
  *
@@ -816,6 +875,35 @@ async function listResultCards(page) {
   if (cardIndices.length === 0) return [];
   const baseLocator = page.getByRole('button');
   return cardIndices.map(i => baseLocator.nth(i));
+}
+
+async function extractResultCardJobId(card) {
+  return card.evaluate((element) => {
+    const normalizeId = (value) => {
+      const match = String(value || '').match(/\d{6,}/);
+      return match ? match[0] : null;
+    };
+    const idFromHref = (href) => {
+      const match = String(href || '').match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)/);
+      return match ? match[1] : null;
+    };
+
+    for (let current = element; current && current !== document.body; current = current.parentElement) {
+      const attributed = normalizeId(
+        current.getAttribute?.('data-job-id') ||
+        current.getAttribute?.('data-occludable-job-id')
+      );
+      if (attributed) return attributed;
+      const ownHref = idFromHref(current.getAttribute?.('href'));
+      if (ownHref) return ownHref;
+    }
+
+    for (const link of element.querySelectorAll?.('a[href*="/jobs/view/"]') || []) {
+      const linked = idFromHref(link.getAttribute('href'));
+      if (linked) return linked;
+    }
+    return null;
+  }).catch(() => null);
 }
 
 async function countResultCards(page) {
@@ -992,7 +1080,7 @@ async function selectCard(cardLocator) {
  * Operates on the top-level page (detail panel is not inside the iframe).
  */
 async function extractSelectedJobDetail(page) {
-  const detail = await page.evaluate(() => {
+  const detail = await page.evaluate(({ resultCardContainerSelector }) => {
     const body = document.body;
     if (!body) return null;
 
@@ -1040,19 +1128,41 @@ async function extractSelectedJobDetail(page) {
       if (m) jobId = m[1];
     }
 
+    const mainEl = document.querySelector('main');
+
     // Promoted detection (detail-derived)
     const bodyText = body.innerText || '';
     const isPromoted = bodyText.includes('Promoted by hirer');
 
-    // Already applied detection
-    const alreadyApplied = bodyText.includes('Application submitted') ||
-      /\bApplied\b/.test(bodyText.substring(0, 500));
+    // Already-applied evidence must be owned by the selected detail pane. The
+    // left result list often contains an Applied card; body-wide text made
+    // that unrelated badge suppress whichever job was currently selected.
+    const hrefJobId = (href) => {
+      const match = String(href || '').match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)/);
+      return match ? match[1] : null;
+    };
+    const selectedDetailAnchors = jobId && mainEl
+      ? [...mainEl.querySelectorAll('a[href*="/jobs/view/"]')].filter((anchor) =>
+        isVisible(anchor) && hrefJobId(anchor.getAttribute('href')) === jobId &&
+        !anchor.closest(resultCardContainerSelector)
+      )
+      : [];
+    const belongsToSelectedDetail = (element) => {
+      for (let owner = element; owner && owner !== mainEl; owner = owner.parentElement) {
+        if (selectedDetailAnchors.some((anchor) => owner.contains(anchor))) return true;
+      }
+      return false;
+    };
+    const detailStatusPattern = /\bApplication status\s+Application submitted\b/i;
+    const alreadyApplied = !!mainEl && [...mainEl.querySelectorAll('*')].some((element) =>
+      isVisible(element) && detailStatusPattern.test((element.innerText || '').replace(/\s+/g, ' ')) &&
+      belongsToSelectedDetail(element)
+    );
 
     // Title and company from detail panel
     // The detail shows: company logo/link, then job title as a link, then location
     let title = null;
     let company = null;
-    const mainEl = document.querySelector('main');
     if (mainEl) {
       // Title is typically the first link inside main that points to /jobs/view/
       const titleLink = mainEl.querySelector('a[href*="/jobs/view/"] p, main p a[href*="/jobs/view/"]');
@@ -1074,7 +1184,7 @@ async function extractSelectedJobDetail(page) {
     const jobUrl = jobId ? `https://www.linkedin.com/jobs/view/${jobId}` : null;
 
     return { jobId, jobUrl, title, company, isPromoted, alreadyApplied, easyApplyHref, hasEasyApply, description };
-  }).catch(() => null);
+  }, { resultCardContainerSelector: RESULT_CARD_CONTAINER_SELECTOR }).catch(() => null);
 
   // Also try getting jobId from the top-level page URL (more reliable)
   if (detail && !detail.jobId) {
@@ -1511,6 +1621,15 @@ function isIncidentalSensitiveDisclosure(question, questionClass) {
   );
 }
 
+// Boilerplate "or"/"and" phrasings that ask ONE grounded fact (2026-09-13):
+// "US citizen or green card holder" is the alternative form the citizenship
+// resolver already answers, and "at least 18 years of age and legally
+// eligible to perform the duties of this position" is answered from
+// config.user.over18 plus a covering work authorization (see
+// groundedDialogPreference). Both were refused as compound_question.
+const CITIZENSHIP_ALTERNATIVE_RE = /\b(?:an? )?(?:us |u s |american )?citizen(?:ship)?(?: status)? or (?:an? )?(?:us |u s )?(?:permanent resident|green card(?: holder)?)\b/g;
+const AGE_AND_ELIGIBILITY_RE = /\b(?:at least|over) 18 years? (?:of age|old)(?: or older)? and legally eligible to perform the (?:essential )?duties of (?:this|the) (?:position|job|role)\b/g;
+
 function dialogQuestionRequiresExactAnswer(question, questionClass = '') {
   const normal = normalizeLabel(String(question || ''));
   if (hasUnsafeDialogNegation(normal)) return 'negated_question';
@@ -1518,10 +1637,14 @@ function dialogQuestionRequiresExactAnswer(question, questionClass = '') {
     /\bvisa sponsorship or (?:a )?visa transfer\b/.test(normal) ||
     /\bh 1b or other employment based immigration (?:case|support)\b/.test(normal);
   const compoundProbe = normal
-    .replace(/\bnow or in the future\b/g, '')
+    // "Do you now or will you in the future require ..." is the same
+    // single sponsorship question as "now or in the future".
+    .replace(/\bnow or (?:will you )?in the future\b/g, '')
     .replace(/\b(?:a )?work visa or employment authori[sz]ation\b/g, 'immigration support')
     .replace(/\bvisa sponsorship or (?:a )?visa transfer\b/g, 'visa sponsorship')
     .replace(/\bh 1b or other employment based immigration (?:case|support)\b/g, 'immigration support')
+    .replace(CITIZENSHIP_ALTERNATIVE_RE, 'citizenship status')
+    .replace(AGE_AND_ELIGIBILITY_RE, 'age eligibility')
     .replace(/\bor (?:higher|above|older)\b/g, '');
   if (/\b(?:and|or)\b/.test(compoundProbe)) return 'compound_question';
   if (!recognizedSponsorshipAlternative &&
@@ -1635,11 +1758,31 @@ function configuredBooleanChoice(value) {
   return null;
 }
 
-function groundedDialogPreference(normalQuestion, config) {
+// "At least 18 and legally eligible to perform the duties of this position"
+// is Yes only when config says over 18 AND the configured authorization
+// covers the posting country; a configured under-18 answers No; anything
+// else stays unanswered.
+function ageAndEligibilityAnswer(user, jobCountry) {
+  const over18 = configuredBooleanChoice(user.over18);
+  if (over18 === 'No') return false;
+  if (over18 !== 'Yes') return undefined;
+  if (!user.workAuthorization) return undefined;
+  if (jobCountry && !namedJurisdictions(String(user.workAuthorization)).has(String(jobCountry))) return undefined;
+  return true;
+}
+
+function groundedDialogPreference(normalQuestion, config, jobCountry = null) {
   const user = config.user || {};
-  const compoundProbe = normalQuestion.replace(/\bor older\b/g, '');
+  const compoundProbe = normalQuestion
+    .replace(/\bor older\b/g, '')
+    .replace(AGE_AND_ELIGIBILITY_RE, 'age eligibility');
   if (hasUnsafeDialogNegation(normalQuestion) || /\b(?:and|or)\b/.test(compoundProbe)) return null;
   const mappings = [
+    {
+      matches: /^are you (?:at least|over) 18 years? (?:of age|old)(?: or older)? and legally eligible to perform the (?:essential )?duties of (?:this|the) (?:position|job|role)$/.test(normalQuestion),
+      value: ageAndEligibilityAnswer(user, jobCountry),
+      source: 'config:user.over18+workAuthorization',
+    },
     {
       matches: /^(?:are|would) you (?:be )?willing to relocate$/.test(normalQuestion),
       value: user.willingToRelocate,
@@ -1754,10 +1897,36 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
         let q = grp.previousElementSibling;
         while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
         const question = q && isVisible(q) ? q.textContent.trim() : (grp.getAttribute('aria-label') || '');
+        // 2026-09 widget (verified live 2026-09-05): each option's aria-label
+        // repeats the QUESTION (or the group label, e.g. "Gender"), and the
+        // option text is the wrapper's visible innerText. Prefer visible text,
+        // then aria-labelledby, and use aria-label only when it is not the
+        // question itself. Reading aria-label first turned every option label
+        // into the question, so no configured answer could match (09-02..05).
+        const normalizeText = (text) => String(text || '').toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+        const questionKey = normalizeText(question);
+        const optionLabelOf = (o) => {
+          const visibleText = (o.innerText || '').trim();
+          if (visibleText) return visibleText;
+          const labelledBy = (o.getAttribute('aria-labelledby') || '').split(/\s+/)
+            .map((id) => ((id && document.getElementById(id)?.textContent) || '').trim())
+            .filter(Boolean).join(' ');
+          if (labelledBy) return labelledBy;
+          const ariaLabel = (o.getAttribute('aria-label') || '').trim();
+          return normalizeText(ariaLabel) === questionKey ? '' : ariaLabel;
+        };
         const optionInfos = opts.map((o, oi) => {
           const tag = `agent-radio-${gi}-${oi}`;
           o.setAttribute('data-agent-radio', tag);
-          return { tag, label: (o.getAttribute('aria-label') || o.innerText || '').trim() };
+          return {
+            tag,
+            label: optionLabelOf(o),
+            // Raw text sources, re-checked before the click and used to find
+            // the re-rendered option after it.
+            innerText: (o.innerText || '').trim(),
+            ariaLabel: (o.getAttribute('aria-label') || '').trim(),
+          };
         });
         found.push({ question, options: optionInfos });
         gi++;
@@ -1766,6 +1935,7 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
   }).catch(() => []);
 
   let filled = 0;
+  let selectionFailures = 0;
   for (const group of groups) {
     if (!group.question || group.options.length === 0) continue;
     const optionLabels = group.options.map(o => o.label);
@@ -1780,7 +1950,9 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
     let source = sensitiveOptionSetAnswer?.source || null;
     let confidence = sensitiveOptionSetAnswer ? 'config_option_set' : null;
 
-    const guard = guardAnswer(group.question, { config, defaultAnswers: flatAnswers });
+    const guard = guardAnswer(group.question, {
+      config, defaultAnswers: flatAnswers, jobCountry: options.jobContext?.jobCountry || null,
+    });
     const exactOnlyReason = dialogQuestionRequiresExactAnswer(group.question, guard.questionClass);
     if (exactOnlyReason) {
       const exactChoice = matchDialogRadioOption(group.options, explicitDefault);
@@ -1859,7 +2031,7 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
       chosen = matchOption(explicitDefault);
       if (chosen) { source = 'defaultAnswers'; confidence = 'exact_question'; }
       if (!chosen) {
-        const preference = groundedDialogPreference(normalLabel, config);
+        const preference = groundedDialogPreference(normalLabel, config, options.jobContext?.jobCountry || null);
         chosen = preference ? matchOption(preference.answer) : null;
         if (chosen) { source = preference.source; confidence = 'config'; }
       }
@@ -1911,46 +2083,106 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
       const currentQuestion = questionNode && isVisible(questionNode)
         ? questionNode.textContent.trim()
         : (group.getAttribute('aria-label') || '');
-      const currentLabel = (el.getAttribute('aria-label') || el.innerText || '').trim();
-      return currentQuestion === snapshot.question && currentLabel === snapshot.optionLabel &&
+      // Compare the raw text sources captured in Phase A (visible text and
+      // aria-label); the derived option label depends on question-aware
+      // precedence and is not re-derived here.
+      const currentInnerText = (el.innerText || '').trim();
+      const currentAriaLabel = (el.getAttribute('aria-label') || '').trim();
+      return currentQuestion === snapshot.question &&
+        currentInnerText === snapshot.innerText && currentAriaLabel === snapshot.ariaLabel &&
         el.getAttribute('aria-checked') !== 'true';
-    }, { question: group.question, optionLabel: chosen.label }).catch(() => false);
+    }, { question: group.question, innerText: chosen.innerText, ariaLabel: chosen.ariaLabel }).catch(() => false);
     if (!snapshotStillMatches) {
-      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
-      logger.info({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio group changed before selection; recollecting safely');
+      selectionFailures++;
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
+        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'automation:radio_snapshot_changed',
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
+      logger.warn({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio group changed before selection; refusing to advance this step');
       continue;
     }
     const clicked = await radio.evaluate((el) => {
       if (el.getAttribute('aria-disabled') === 'true') return false;
-      el.click();
+      // 2026-09 widget: the selection state lives on the hidden native input
+      // and a synthetic click on the role=radio wrapper is inert (0 verified
+      // selections from 08-23 to 09-05). Click the input when there is one.
+      const nativeInput = el.querySelector('input[type="radio"]');
+      if (nativeInput && !nativeInput.disabled) nativeInput.click();
+      else el.click();
       return true;
     }).catch(() => false);
     if (clicked) await sleep(100, 200);
-    const selected = clicked && await radio.evaluate((el) =>
-      el.getAttribute('aria-checked') === 'true' || !!el.querySelector('input[type="radio"]')?.checked
-    ).catch(() => false);
+    // Verify with a FRESH query keyed on the question and the option's raw
+    // text: the widget re-renders and replaces the wrapper nodes after a
+    // change, so the tagged locator can resolve to a detached node (or to
+    // nothing) even though the selection succeeded.
+    await markActiveApplyDialog(page);
+    const selected = clicked && await page.evaluate(({ question, innerText, ariaLabel }) => {
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let current = element; current instanceof Element;) {
+          const style = getComputedStyle(current);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+              current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+          current = current.parentElement || current.getRootNode()?.host || null;
+        }
+        return true;
+      };
+      const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+      if (!dlg) return false;
+      for (const grp of dlg.querySelectorAll('[role="radiogroup"]')) {
+        if (!isVisible(grp)) continue;
+        let questionNode = grp.previousElementSibling;
+        while (questionNode && !(questionNode.textContent || '').trim()) {
+          questionNode = questionNode.previousElementSibling;
+        }
+        const currentQuestion = questionNode && isVisible(questionNode)
+          ? questionNode.textContent.trim()
+          : (grp.getAttribute('aria-label') || '');
+        if (currentQuestion !== question) continue;
+        const option = [...grp.querySelectorAll('[role="radio"]')].find((candidate) =>
+          isVisible(candidate) &&
+          (candidate.innerText || '').trim() === innerText &&
+          (candidate.getAttribute('aria-label') || '').trim() === ariaLabel
+        );
+        if (!option) continue;
+        return option.getAttribute('aria-checked') === 'true' ||
+          !!option.querySelector('input[type="radio"]')?.checked;
+      }
+      return false;
+    }, { question: group.question, innerText: chosen.innerText, ariaLabel: chosen.ariaLabel }).catch(() => false);
     if (selected) {
       filled++;
       recordFillAudit({ platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio', inputType: null, fillSource: source || 'unknown', answer: chosen.label, confidence });
       // The chosen option stays out of logs (self-ID answers are sensitive);
       // fill_audit in the gitignored DB keeps the full value for forensics.
-      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), source }, 'Filled dialog radio group');
+      // The option set is logged so a future markup change shows up in the
+      // first run rather than as silent refusals.
+      logger.debug({ platform: 'linkedin', jobId, question: label.substring(0, 80), source, options: optionLabels }, 'Filled dialog radio group');
       if ((options._dialogRadioDepth || 0) < 8) {
         const nested = await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, {
           ...options,
           _dialogRadioDepth: (options._dialogRadioDepth || 0) + 1,
         });
         filled += nested.filled;
+        selectionFailures += nested.selectionFailures || 0;
+        // The nested pass re-tags every still-unanswered group. Returning here
+        // prevents this pass from treating those intentionally replaced tags
+        // as snapshot changes and manufacturing an automation failure.
+        await sleep(200, 500);
+        return { groups: groups.length, filled, selectionFailures };
       }
       await sleep(200, 500);
     } else {
-      // Fail closed: an unselected group is an unfilled field. Recording it
-      // as guard-blocked routes a later validation bounce into the honest
-      // guarded-abandon classification instead of submitting incomplete.
-      if (options.guardBlockedLabels) options.guardBlockedLabels.add(label);
+      // This is an automation failure, not an honest policy refusal: config
+      // supplied a grounded answer, but the UI did not accept the selection.
+      selectionFailures++;
       recordFillAudit({
         platform: 'linkedin', jobId, runId, fieldLabel: label, fieldType: 'radio',
-        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'guard:radio_click_failed',
+        inputType: null, fillSource: 'cannot_fill', answer: '', confidence: 'automation:radio_click_failed',
       });
       recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel: label, fieldType: 'radio' });
       logger.warn({ platform: 'linkedin', jobId, question: label.substring(0, 80) }, 'Dialog radio click did not select the option');
@@ -1960,7 +2192,159 @@ async function fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId
   if (groups.length > 0) {
     logger.info({ platform: 'linkedin', jobId, groups: groups.length, filled }, 'Dialog radio groups processed');
   }
-  return { groups: groups.length, filled };
+  return { groups: groups.length, filled, selectionFailures };
+}
+
+// Dialog checkbox widgets (2026-09 UI, verified live 2026-09-13): the
+// statement sits in a <p> before a <fieldset aria-describedby="error-…">, the
+// control is a div[role=checkbox] wrapper around a hidden native input plus an
+// empty label[for], and the option text ("I certify and agree") is a <p>
+// inside the wrapper. fillForm never sees the hidden input and the wrapper
+// click is inert, so a required certification box left every such form on
+// the same page with no audit row (FieldAI, 2026-09-14).
+const DIALOG_CHECKBOX_CONSENT_RE = /\b(?:agree|certify|confirm|acknowledge|accept|consent)\b/;
+// Never auto-consent to messaging or marketing programmes (parity with the
+// radio path, which refuses the SMS-consent screener).
+const DIALOG_CHECKBOX_NEVER_RE = /\b(?:text messages?|sms|mms|marketing|promotional|newsletter)\b/;
+
+async function fillDialogCheckboxGroups(page, defaultAnswers, config, logger, jobId, options = {}) {
+  const runId = options.runId || null;
+  const topChoicePolicy = config.platformPolicy?.linkedin?.topChoice || 'never';
+
+  await markActiveApplyDialog(page);
+  const boxes = await page.evaluate(() => {
+    const found = [];
+    const isVisible = (el) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      for (let current = el; current instanceof Element;) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+            current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+        current = current.parentElement || current.getRootNode()?.host || null;
+      }
+      return true;
+    };
+    for (const stale of document.querySelectorAll('dialog [data-agent-checkbox]')) {
+      stale.removeAttribute('data-agent-checkbox');
+    }
+    const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+    if (!dlg || !/pages/i.test(dlg.innerText || '')) return found;
+    let ci = 0;
+    for (const box of dlg.querySelectorAll('[role="checkbox"]')) {
+      if (!isVisible(box)) continue;
+      if (box.getAttribute('aria-checked') === 'true') continue;
+      const label = (box.innerText || '').trim();
+      const container = box.closest('fieldset') || box.parentElement;
+      let statementNode = container ? container.previousElementSibling : null;
+      while (statementNode && !(statementNode.textContent || '').trim()) {
+        statementNode = statementNode.previousElementSibling;
+      }
+      const statement = statementNode && isVisible(statementNode) ? statementNode.textContent.trim() : '';
+      const required = /^error-message/.test((container && container.getAttribute('aria-describedby')) || '') ||
+        /\*\s*$/.test(statement);
+      const tag = `agent-checkbox-${ci++}`;
+      box.setAttribute('data-agent-checkbox', tag);
+      found.push({ tag, label, statement, required });
+    }
+    return found;
+  }).catch(() => []);
+
+  let filled = 0;
+  let selectionFailures = 0;
+  for (const box of boxes) {
+    const fieldLabel = (box.statement || box.label).substring(0, 200);
+    const text = normalizeLabel(`${box.statement} ${box.label}`);
+
+    // LinkedIn Top Choice consumes a boost credit: the platform policy owns
+    // it (default never) and the cycle classifier reports it, not the guard.
+    if (/\btop choice\b/.test(text)) {
+      if (topChoicePolicy !== 'always') {
+        recordFillAudit({
+          platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+          fillSource: 'platform_policy:top_choice', answer: 'left_unchecked', confidence: `top_choice:${topChoicePolicy}`,
+        });
+        logger.debug({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80), topChoicePolicy }, 'Left dialog Top Choice checkbox unchecked by platform policy');
+        continue;
+      }
+    } else if (!DIALOG_CHECKBOX_CONSENT_RE.test(text) || DIALOG_CHECKBOX_NEVER_RE.test(text)) {
+      // Not a plain certification/consent statement: leave it unchecked and
+      // let a later bounce classify as an honest guarded skip.
+      const reason = DIALOG_CHECKBOX_NEVER_RE.test(text) ? 'never_consent_checkbox' : 'no_grounded_checkbox_answer';
+      if (options.guardBlockedLabels) options.guardBlockedLabels.add(fieldLabel);
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+        fillSource: 'cannot_fill', answer: '', confidence: `guard:${reason}`,
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel, fieldType: 'checkbox' });
+      logger.info({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80), reason, required: box.required }, 'Dialog checkbox left unchecked without grounded consent');
+      continue;
+    }
+
+    await markActiveApplyDialog(page);
+    const widget = page.locator(`dialog[data-agent-active-apply="true"] [data-agent-checkbox="${box.tag}"]`).first();
+    const clicked = await widget.evaluate((el) => {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      // The state lives on the hidden native input; the wrapper click is inert.
+      const nativeInput = el.querySelector('input[type="checkbox"]');
+      if (nativeInput && !nativeInput.disabled) nativeInput.click();
+      else el.click();
+      return true;
+    }).catch(() => false);
+    if (clicked) await sleep(100, 200);
+    // Verify with a fresh query: the wrapper is re-rendered after a change.
+    await markActiveApplyDialog(page);
+    const checked = clicked && await page.evaluate(({ statement, label }) => {
+      const isVisible = (element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        for (let current = element; current instanceof Element;) {
+          const style = getComputedStyle(current);
+          if (style.display === 'none' || style.visibility === 'hidden' ||
+              style.visibility === 'collapse' || Number(style.opacity) === 0 ||
+              current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') return false;
+          current = current.parentElement || current.getRootNode()?.host || null;
+        }
+        return true;
+      };
+      const dlg = document.querySelector('dialog[data-agent-active-apply="true"]');
+      if (!dlg) return false;
+      for (const candidate of dlg.querySelectorAll('[role="checkbox"]')) {
+        if (!isVisible(candidate)) continue;
+        if ((candidate.innerText || '').trim() !== label) continue;
+        const container = candidate.closest('fieldset') || candidate.parentElement;
+        let node = container ? container.previousElementSibling : null;
+        while (node && !(node.textContent || '').trim()) node = node.previousElementSibling;
+        const currentStatement = node && isVisible(node) ? node.textContent.trim() : '';
+        if (currentStatement !== statement) continue;
+        return candidate.getAttribute('aria-checked') === 'true' ||
+          !!candidate.querySelector('input[type="checkbox"]')?.checked;
+      }
+      return false;
+    }, { statement: box.statement, label: box.label }).catch(() => false);
+    if (checked) {
+      filled++;
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+        fillSource: 'rule:consent_checkbox', answer: 'checked', confidence: 'consent',
+      });
+      logger.debug({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80) }, 'Checked dialog consent checkbox');
+    } else {
+      selectionFailures++;
+      recordFillAudit({
+        platform: 'linkedin', jobId, runId, fieldLabel, fieldType: 'checkbox', inputType: null,
+        fillSource: 'cannot_fill', answer: '', confidence: 'automation:checkbox_click_failed',
+      });
+      recordUnfilledField({ platform: 'linkedin', jobId, fieldLabel, fieldType: 'checkbox' });
+      logger.warn({ platform: 'linkedin', jobId, statement: fieldLabel.substring(0, 80) }, 'Dialog checkbox click did not check the box');
+    }
+  }
+
+  if (boxes.length > 0) {
+    logger.info({ platform: 'linkedin', jobId, boxes: boxes.length, filled }, 'Dialog checkbox widgets processed');
+  }
+  return { boxes: boxes.length, filled, selectionFailures };
 }
 
 // Fingerprint the active form step. The dialog UI puts radio questions in a
@@ -1996,6 +2380,12 @@ async function captureApplyStepFingerprint(page) {
         while (q && !(q.textContent || '').trim()) q = q.previousElementSibling;
         const t = (q?.textContent || group.getAttribute('aria-label') || '').trim().substring(0, 120);
         if (t) labels.push(t);
+      }
+      // Checkbox widgets carry no label/legend text of their own.
+      for (const box of root.querySelectorAll('[role="checkbox"]')) {
+        if (box.getClientRects().length === 0) continue;
+        const t = (box.innerText || '').trim().substring(0, 60);
+        if (t) labels.push(`checkbox:${t}`);
       }
       const progress = (root.innerText || '').match(/\b\d+\s*(?:\/|of)\s*\d+\s*pages?\b/i)?.[0];
       if (progress) labels.push(progress);
@@ -2105,7 +2495,7 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
     ? options.baselineSignatures
     : [];
   const expectedJobId = options.expectedJobId ? String(options.expectedJobId) : null;
-  return page.evaluate(({ markBaseline, baselineToken, baselineSignatures, expectedJobId }) => {
+  return page.evaluate(({ markBaseline, baselineToken, baselineSignatures, expectedJobId, resultCardContainerSelector }) => {
     const isVisible = (el) => {
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return false;
@@ -2226,6 +2616,20 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
     const main = document.querySelector('main');
     let selectedDetailSubmitted = false;
     if (selectedJobMatches && main) {
+      const hrefJobId = (href) => {
+        const match = String(href || '').match(/\/jobs\/view\/(?:[^/?]*-)?(\d+)/);
+        return match ? match[1] : null;
+      };
+      const selectedDetailAnchors = [...main.querySelectorAll('a[href*="/jobs/view/"]')].filter((anchor) =>
+        isVisible(anchor) && hrefJobId(anchor.getAttribute('href')) === expectedJobId &&
+        !anchor.closest(resultCardContainerSelector)
+      );
+      const belongsToSelectedDetail = (element) => {
+        for (let owner = element; owner && owner !== main; owner = owner.parentElement) {
+          if (selectedDetailAnchors.some((anchor) => owner.contains(anchor))) return true;
+        }
+        return false;
+      };
       const statusLeaves = [...main.querySelectorAll('*')].filter((el) => {
         if (!isVisible(el) || !detailStatusPattern.test(exposedText(el))) return false;
         return ![...el.children].some((child) =>
@@ -2233,7 +2637,8 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
         );
       });
       selectedDetailSubmitted = statusLeaves.some((el) =>
-        !el.closest('dialog') && !el.closest(unrelatedResultSelector));
+        !el.closest('dialog') && !el.closest(unrelatedResultSelector) &&
+        belongsToSelectedDetail(el));
     }
     const baselineOwner = baselineToken
       ? [...document.querySelectorAll(`[${ownerAttribute}]`)]
@@ -2259,7 +2664,13 @@ async function captureSubmissionConfirmationEvidence(page, options = {}) {
       baselineToken: markBaseline ? baselineToken : null,
       baselineSignatures: markBaseline ? capturedSignatures : baselineSignatures,
     };
-  }, { markBaseline, baselineToken, baselineSignatures, expectedJobId }).catch(() => ({
+  }, {
+    markBaseline,
+    baselineToken,
+    baselineSignatures,
+    expectedJobId,
+    resultCardContainerSelector: RESULT_CARD_CONTAINER_SELECTOR,
+  }).catch(() => ({
     globalCount: 0,
     dialogCounts: {},
     dialogNovelCounts: {},
@@ -2477,9 +2888,40 @@ async function handleInlineApplyStep(page, defaultAnswers, config, logger, jobId
 
   // ── Custom radio-group questions (2026-08 dialog UI) ──
   // Invisible native inputs make these unreachable for fillForm.
+  let dialogRadioFill;
   try {
-    await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options);
-  } catch (_) {}
+    dialogRadioFill = await fillDialogRadioGroups(page, defaultAnswers, config, logger, jobId, options);
+  } catch (error) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum, error: error?.message || String(error),
+    }, 'Dialog radio processing failed; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
+  if ((dialogRadioFill.selectionFailures || 0) > 0) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum,
+      selectionFailures: dialogRadioFill.selectionFailures,
+    }, 'Dialog radio selection was not verified; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
+
+  // ── Dialog checkbox widgets (2026-09 UI): certification/consent boxes ──
+  let dialogCheckboxFill;
+  try {
+    dialogCheckboxFill = await fillDialogCheckboxGroups(page, defaultAnswers, config, logger, jobId, options);
+  } catch (error) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum, error: error?.message || String(error),
+    }, 'Dialog checkbox processing failed; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
+  if ((dialogCheckboxFill.selectionFailures || 0) > 0) {
+    logger.warn({
+      platform: 'linkedin', jobId, stepNum,
+      selectionFailures: dialogCheckboxFill.selectionFailures,
+    }, 'Dialog checkbox selection was not verified; refusing to advance or submit');
+    return 'radio_selection_failed';
+  }
 
   await sleep(500, 1000);
 
@@ -2726,6 +3168,9 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   const maxPages = config.behavior?.maxPages || 5;
 
   let applied = 0;
+  let dryRunReady = 0;
+  let submissionAttempts = 0;
+  let submissionBudgetUsed = 0;
   let skipped = 0;
   let errors = 0;
   let alreadyApplied = 0;
@@ -2748,8 +3193,18 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
   function recordOutcome(outcome) {
     recordAndNotify(outcome);
-    if (outcome.status === 'submitted' || outcome.status === 'dry_run') applied++;
-    else if (outcome.status === 'skipped') skipped++;
+    if (outcome.status === 'submitted') {
+      applied++;
+      submissionAttempts++;
+      submissionBudgetUsed++;
+    } else if (outcome.status === 'dry_run') {
+      dryRunReady++;
+      submissionBudgetUsed++;
+    } else if (outcome.status === 'submit_unconfirmed') {
+      errors++;
+      submissionAttempts++;
+      submissionBudgetUsed++;
+    } else if (outcome.status === 'skipped') skipped++;
     else if (outcome.status === 'already_applied') alreadyApplied++;
     else if (outcome.status === 'error') errors++;
   }
@@ -2787,7 +3242,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   const seenRunCardKeys = new Set();
   const seenRunJobIds = new Set();
 
-  while (applied < maxApplications && currentPage <= maxPages) {
+  while (submissionBudgetUsed < maxApplications && currentPage <= maxPages) {
     // ── List result cards on current page (top-level page) ──
     let cards;
     try {
@@ -2833,7 +3288,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
       break;
     }
 
-    for (let i = 0; i < cards.length && applied < maxApplications; i++) {
+    for (let i = 0; i < cards.length && submissionBudgetUsed < maxApplications; i++) {
       // ── Preemptive renderer reload ──
       // Reset the SPA's accumulated state before it crashes. We reload at
       // the TOP of an iteration (no card in flight) so we never orphan an
@@ -2901,7 +3356,10 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Within-run card dedup: the carousel re-serves the same promoted
         // cards after reloads and across pages. First encounter decides and
         // records the outcome; repeats are free.
-        const cardKey = [jobTitle, company, summary.location || ''].join('|').toLowerCase();
+        const cardJobId = await extractResultCardJobId(card);
+        const cardKey = cardJobId
+          ? `job:${cardJobId}`
+          : [jobTitle, company, summary.location || ''].join('|').toLowerCase();
         if (seenRunCardKeys.has(cardKey)) {
           internalSkipped++;
           continue;
@@ -3053,13 +3511,31 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         if (hasLinkedInDailySubmissionLimitMessage(pageText) || hasLinkedInDailySubmissionLimitMessage(shadowText)) {
           logger.warn({ platform: 'linkedin', applied, jobId, jobTitle }, 'Daily submission limit — ending session');
           recordOutcome({ status: 'skipped', jobId, jobTitle, company, jobUrl, skipReason: 'daily_limit_reached', source });
-          return { applied, skipped, errors, alreadyApplied, internalSkipped, stopSession: true, stopSessionReason: 'linkedin_daily_submission_limit' };
+          return {
+            applied,
+            dryRunReady,
+            submissionAttempts,
+            skipped,
+            errors,
+            alreadyApplied,
+            internalSkipped,
+            aborted: abortPlatformRun,
+            noResults: noResultsPageOne,
+            stopSession: true,
+            stopSessionReason: 'linkedin_daily_submission_limit',
+          };
         }
 
         // ── Step 7: Process inline apply steps ──
         const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
         const fillOptions = {
-          jobContext: { jobTitle, company, jobDescription: detail.description || '' },
+          jobContext: {
+            jobTitle,
+            company,
+            jobDescription: detail.description || '',
+            // Grounds "the country where this position is located" screeners.
+            jobCountry: deriveJobCountry(summary.location, config),
+          },
           llmCache: llmCache || undefined,
           llmBudget,
           runId,
@@ -3069,6 +3545,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         let stepCount = 0;
         let applyComplete = false;
         const seenFingerprints = new Set();
+        const retriedFingerprints = new Set();
         const MAX_STEPS = 12;
 
         while (!applyComplete && stepCount < MAX_STEPS) {
@@ -3087,7 +3564,15 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
             fingerprint = await captureApplyStepFingerprint(page);
           }
 
-          if (fingerprint && seenFingerprints.has(fingerprint)) {
+          if (fingerprint && seenFingerprints.has(fingerprint) && !retriedFingerprints.has(fingerprint)) {
+            // One unchanged settle check is not enough to distinguish a slow
+            // transition from a form that needs a second fill/advance pass.
+            // Retry the handler once; only a second settled repeat is a cycle.
+            retriedFingerprints.add(fingerprint);
+            logger.warn({
+              jobId, jobTitle, company, stepNum: stepCount,
+            }, 'Apply step remained unchanged after settling; retrying once before cycle failure');
+          } else if (fingerprint && seenFingerprints.has(fingerprint)) {
             // Surface the actual unfilled labels — pre-fix the throw gave us
             // no signal about which fields the agent couldn't resolve.
             const labels = fingerprint.split('||').filter(Boolean).slice(0, 12);
@@ -3120,7 +3605,8 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
 
           const result = await handleInlineApplyStep(page, defaultAnswers, config, logger, jobId, dryRun, stepCount, fillOptions);
 
-          if (result === 'retry_failed' || result === 'top_choice_required' || result === 'submit_unconfirmed') {
+          if (result === 'retry_failed' || result === 'radio_selection_failed' ||
+              result === 'top_choice_required' || result === 'submit_unconfirmed') {
             // 'submit_unconfirmed' gets its own message: the 2026-08-25..29
             // runs recorded 13 real submissions as "Validation errors" because
             // an unconfirmed submit was indistinguishable from a form bounce.
@@ -3128,11 +3614,15 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
               ? 'top_choice_required_review — form blocked on boost checkbox, policy is never-spend'
               : result === 'submit_unconfirmed'
                 ? `Submit clicked on step ${stepCount} but no confirmation observed — outcome unverified`
+                : result === 'radio_selection_failed'
+                  ? `Required radio selection failed on step ${stepCount} — refusing to submit`
                 : `Validation errors on step ${stepCount} — retry failed`);
             // An unconfirmed submit is an unknown outcome and must surface as
             // an error: guard metadata would downgrade it to a routine skip
             // and hide it from run health and forensics.
-            if (result !== 'submit_unconfirmed' && fillOptions.guardBlockedLabels.size > 0) {
+            if (result === 'submit_unconfirmed') {
+              valErr.submitUnconfirmed = true;
+            } else if (result !== 'radio_selection_failed' && fillOptions.guardBlockedLabels.size > 0) {
               valErr.guardedAbandonment = [...fillOptions.guardBlockedLabels];
             } else if (result === 'top_choice_required') {
               valErr.policyAbandonment = 'top_choice_required';
@@ -3141,7 +3631,10 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
           } else if (result === 'submitted') {
             applyComplete = true;
 
-            logger.info({ jobId, jobTitle, company, steps: stepCount }, 'Application submitted');
+            logger.info(
+              { jobId, jobTitle, company, steps: stepCount },
+              dryRun ? '[DRY RUN] Application ready to submit' : 'Application submitted'
+            );
             recordOutcome({ status: dryRun ? 'dry_run' : 'submitted', jobId, jobTitle, company, jobUrl, steps: stepCount, source });
 
             // Dismiss post-submit UI
@@ -3184,7 +3677,13 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
         // Honest abandonment is a skip, not breakage (spec: 'error' must mean
         // the agent broke, not that it refused to fabricate an answer).
         const guardedLabels = Array.isArray(err.guardedAbandonment) ? err.guardedAbandonment : null;
-        if (guardedLabels && guardedLabels.length > 0) {
+        if (err.submitUnconfirmed) {
+          logger.error({ platform: 'linkedin', jobId, jobTitle, error: err.message }, 'Submission outcome is unverified');
+          recordOutcome({
+            status: 'submit_unconfirmed', jobId: jobId || 'unknown', jobTitle,
+            company, jobUrl, errorMessage: err.message, source,
+          });
+        } else if (guardedLabels && guardedLabels.length > 0) {
           const labelSummary = guardedLabels
             .map(l => String(l).replace(/\s+/g, ' ').trim().substring(0, 40))
             .slice(0, 3).join(' | ');
@@ -3205,7 +3704,7 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
     if (abortPlatformRun) break;
 
     // ── Pagination ──
-    if (applied < maxApplications && currentPage < maxPages) {
+    if (submissionBudgetUsed < maxApplications && currentPage < maxPages) {
       const navigated = await goToNextPage(page, currentPage, logger);
       if (!navigated) break;
       currentPage++;
@@ -3218,24 +3717,40 @@ async function applyLinkedIn(page, config, defaultAnswers, state, runId, logger,
   // aborted/noResults let the orchestrator distinguish an incomplete scan
   // (reload failure, empty page 1 = challenge/DOM break/login bounce) from a
   // genuinely exhausted healthy run.
-  return { applied, skipped, errors, alreadyApplied, internalSkipped, aborted: abortPlatformRun, noResults: noResultsPageOne };
+  return {
+    applied,
+    dryRunReady,
+    submissionAttempts,
+    skipped,
+    errors,
+    alreadyApplied,
+    internalSkipped,
+    aborted: abortPlatformRun,
+    noResults: noResultsPageOne,
+  };
 }
 
 module.exports = {
   applyLinkedIn,
   // Exported for testing
   buildLinkedInSearchUrl,
+  deriveJobCountry,
+  extractResultCardJobId,
+  extractSelectedJobDetail,
   summarizeResultCard,
   shouldApply,
   isRemoteLocation,
   fillShadowForm,
   fillDialogRadioGroups,
+  fillDialogCheckboxGroups,
   handleInlineApplyStep,
   collectApplyValidationErrors,
   detectTopChoiceBlocked,
   markActiveApplyDialog,
   mapEducationAnswerToYesNo,
   matchDialogRadioOption,
+  dialogQuestionRequiresExactAnswer,
+  groundedDialogPreference,
   waitForSubmissionConfirmation,
   captureSubmissionConfirmationEvidence,
   firstVisibleLocator,

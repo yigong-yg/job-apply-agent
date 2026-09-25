@@ -18,10 +18,13 @@ const { chromium } = require('playwright');
 const {
   fillShadowForm,
   fillDialogRadioGroups,
+  fillDialogCheckboxGroups,
   handleInlineApplyStep,
   collectApplyValidationErrors,
   detectTopChoiceBlocked,
   waitForSubmissionConfirmation,
+  extractResultCardJobId,
+  extractSelectedJobDetail,
   firstVisibleApplyControl,
   markActiveApplyDialog,
   dismissActiveApplyUi,
@@ -238,6 +241,25 @@ const SHADOW_HTML = `
     .getAttribute('aria-checked');
   check('dialog radio markers do not collide across retained form steps', () => {
     assert.strictEqual(dialogCommuteChecked, 'true');
+  });
+
+  await page.setContent(`
+    <dialog open>
+      <div>1/2 pages</div>
+      ${dialogRadioGroup('multi-relocate', 'Are you willing to relocate?')}
+      ${dialogRadioGroup('multi-commute', 'Are you able to commute?')}
+    </dialog>`);
+  const multiRadioResult = await fillDialogRadioGroups(
+    page, defaultAnswers, config, noopLogger, 'multi-radio-job',
+    { runId: 'fixture-run', guardBlockedLabels: new Set() }
+  );
+  const multiRadioSelections = await page.locator(
+    '#multi-relocate [role="radio"][aria-checked="true"], #multi-commute [role="radio"][aria-checked="true"]'
+  ).count();
+  check('multiple grounded radio groups are selected without stale-marker failures', () => {
+    assert.strictEqual(multiRadioSelections, 2);
+    assert.strictEqual(multiRadioResult.filled, 2);
+    assert.strictEqual(multiRadioResult.selectionFailures, 0);
   });
 
   await page.setContent(`
@@ -1232,10 +1254,10 @@ const SHADOW_HTML = `
 
   await page.goto('about:blank?currentJobId=1234567890');
   await page.setContent(`
-    <main><div>Selected job detail</div></main>
+    <main><section id="selected-detail"><a href="/jobs/view/1234567890">Selected job detail</a></section></main>
     <dialog open>
       <div>1/1 pages</div>
-      <button onclick="this.closest('dialog').remove(); document.querySelector('main').insertAdjacentHTML('beforeend', '<section><h2>Application status</h2><p>Application submitted</p><span>now</span></section>')">
+      <button onclick="this.closest('dialog').remove(); document.querySelector('#selected-detail').insertAdjacentHTML('beforeend', '<div><h2>Application status</h2><p>Application submitted</p><span>now</span></div>')">
         Submit application
       </button>
     </dialog>`);
@@ -1249,7 +1271,7 @@ const SHADOW_HTML = `
 
   await page.goto('about:blank?currentJobId=9999999999');
   await page.setContent(`
-    <main><div>Different selected job</div></main>
+    <main><section><a href="/jobs/view/9999999999">Different selected job</a></section></main>
     <dialog open>
       <div>1/1 pages</div>
       <button onclick="this.closest('dialog').remove(); document.querySelector('main').insertAdjacentHTML('beforeend', '<section><h2>Application status</h2><p>Application submitted</p></section>')">
@@ -1266,7 +1288,7 @@ const SHADOW_HTML = `
 
   await page.goto('about:blank?currentJobId=1234567890');
   await page.setContent(`
-    <main><section><h2>Application status</h2><p>Application submitted</p><span>earlier</span></section></main>
+    <main><section><a href="/jobs/view/1234567890">Selected job</a><h2>Application status</h2><p>Application submitted</p><span>earlier</span></section></main>
     <dialog open>
       <div>1/1 pages</div>
       <button onclick="this.closest('dialog').remove()">Submit application</button>
@@ -1282,7 +1304,7 @@ const SHADOW_HTML = `
   await page.goto('about:blank?currentJobId=1234567890');
   await page.setContent(`
     <main>
-      <div>Selected job detail</div>
+      <section><a href="/jobs/view/1234567890">Selected job detail</a></section>
       <div data-job-id="other-listing"><h2>Application status</h2><p>Application submitted</p></div>
     </main>
     <dialog open>
@@ -1295,6 +1317,56 @@ const SHADOW_HTML = `
   );
   check('detail status inside another result card cannot confirm even with a matching URL', () => {
     assert.strictEqual(unrelatedCardDetailResult, 'submit_unconfirmed');
+  });
+
+  await page.goto('about:blank?currentJobId=1234567890');
+  await page.setContent(`
+    <main>
+      <section id="selected-detail"><a href="/jobs/view/1234567890">Selected job detail</a></section>
+      <aside id="unrelated-sidebar"></aside>
+    </main>
+    <dialog open>
+      <div>1/1 pages</div>
+      <button onclick="this.closest('dialog').remove(); document.querySelector('#unrelated-sidebar').insertAdjacentHTML('beforeend', '<div><h2>Application status</h2><p>Application submitted</p></div>')">
+        Submit application
+      </button>
+    </dialog>`);
+  const unrelatedSidebarDetailResult = await handleInlineApplyStep(
+    page, {}, {}, noopLogger, '1234567890', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  check('a sibling sidebar status cannot confirm the selected job', () => {
+    assert.strictEqual(unrelatedSidebarDetailResult, 'submit_unconfirmed');
+  });
+
+  await page.goto('about:blank?currentJobId=1234567890');
+  await page.setContent(`
+    <main>
+      <section id="selected-detail"><a href="/jobs/view/1234567890">Selected job detail</a></section>
+      <ul><li data-occludable-job-id="9999999999">Application status Application submitted</li></ul>
+    </main>`);
+  const detailWithUnrelatedAppliedCard = await extractSelectedJobDetail(page);
+  check('an Applied badge in another result does not mark the selected job applied', () => {
+    assert.strictEqual(detailWithUnrelatedAppliedCard.alreadyApplied, false);
+  });
+  await page.locator('#selected-detail').evaluate((element) => {
+    element.insertAdjacentHTML('beforeend', '<div><h2>Application status</h2><p>Application submitted</p></div>');
+  });
+  const detailWithOwnedStatus = await extractSelectedJobDetail(page);
+  check('selected-detail status is recognized when owned by the current job', () => {
+    assert.strictEqual(detailWithOwnedStatus.alreadyApplied, true);
+  });
+
+  await page.setContent(`
+    <ul>
+      <li data-occludable-job-id="1234567890"><button id="attributed-card">Easy Apply</button></li>
+      <li><button id="linked-card"><a href="/jobs/view/example-role-9999999999">View job</a></button></li>
+    </ul>`);
+  const attributedCardId = await extractResultCardJobId(page.locator('#attributed-card'));
+  const linkedCardId = await extractResultCardJobId(page.locator('#linked-card'));
+  check('result-card identity prefers stable attributes and job links', () => {
+    assert.strictEqual(attributedCardId, '1234567890');
+    assert.strictEqual(linkedCardId, '9999999999');
   });
 
   await page.goto('about:blank');
@@ -1312,10 +1384,499 @@ const SHADOW_HTML = `
     page, defaultAnswers, config, noopLogger, 'inert-radio-job',
     { guardBlockedLabels: inertRadioGuardLabels }
   );
-  check('a radio click that never selects is recorded as an unfilled guard label', () => {
+  check('a grounded radio click that never selects is an automation failure, not a guard refusal', () => {
     assert.strictEqual(inertRadioResult.filled, 0);
-    assert.strictEqual(inertRadioGuardLabels.size, 1);
-    assert.ok([...inertRadioGuardLabels][0].includes('relocate'));
+    assert.strictEqual(inertRadioResult.selectionFailures, 1);
+    assert.strictEqual(inertRadioGuardLabels.size, 0);
+  });
+
+  await page.setContent(`
+    <dialog open>
+      <div>1/1 pages</div>
+      <p>Are you willing to relocate?*</p>
+      <fieldset role="radiogroup">
+        <div role="radio" aria-label="Yes" aria-checked="false">Yes</div>
+        <div role="radio" aria-label="No" aria-checked="false">No</div>
+      </fieldset>
+      <button onclick="document.body.dataset.submitClicked = 'true'; this.closest('dialog').insertAdjacentHTML('beforeend', '<div>Your application was sent</div>')">Submit application</button>
+    </dialog>`);
+  const inertRadioStepResult = await handleInlineApplyStep(
+    page, defaultAnswers, config, noopLogger, 'inert-radio-step-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const inertRadioSubmitClicked = await page.locator('body').getAttribute('data-submit-clicked');
+  check('the full apply step never clicks Submit after an inert required radio', () => {
+    assert.strictEqual(inertRadioStepResult, 'radio_selection_failed');
+    assert.strictEqual(inertRadioSubmitClicked, null);
+  });
+
+  // ── 2026-09 LinkedIn radio widget (verified live 2026-09-05) ──
+  // Each option is a div[role=radio] whose aria-label repeats the QUESTION (or
+  // the group label, e.g. "Gender"); the option text is the wrapper's visible
+  // innerText; a hidden native input[type=radio] owns the state; the wrapper
+  // has no click handler; after a change React replaces the wrapper nodes, so
+  // attributes the agent set on the old node are gone.
+  const NATIVE_RADIO_SCRIPT = `
+    <script>
+      document.addEventListener('change', (event) => {
+        const input = event.target;
+        if (!(input instanceof HTMLInputElement)) return;
+        if (input.type === 'checkbox') {
+          // Same widget family: the wrapper mirrors the hidden input and is
+          // replaced on change, so agent attributes on the old node are lost.
+          const wrapper = input.closest('[role="checkbox"]');
+          if (!wrapper) return;
+          const clone = wrapper.cloneNode(true);
+          clone.setAttribute('aria-checked', input.checked ? 'true' : 'false');
+          clone.removeAttribute('data-agent-checkbox');
+          const clonedInput = clone.querySelector('input[type="checkbox"]');
+          if (clonedInput) clonedInput.checked = input.checked;
+          wrapper.replaceWith(clone);
+          return;
+        }
+        if (input.type !== 'radio') return;
+        const group = input.closest('[role="radiogroup"]');
+        if (!group) return;
+        for (const wrapper of [...group.querySelectorAll('[role="radio"]')]) {
+          const own = wrapper.contains(input);
+          const clone = wrapper.cloneNode(true);
+          clone.setAttribute('aria-checked', own ? 'true' : 'false');
+          clone.removeAttribute('data-agent-radio');
+          const clonedInput = clone.querySelector('input[type="radio"]');
+          if (clonedInput) clonedInput.checked = own;
+          wrapper.replaceWith(clone);
+        }
+      });
+    </script>`;
+  const HIDDEN_INPUT_STYLE = 'position:absolute;opacity:0;width:0;height:0';
+  // aria-checked of the option whose visible text equals `text` (fresh query:
+  // the widget replaces wrapper nodes after a change).
+  const nativeRadioChecked = async (groupId, text) => {
+    const states = await page.$$eval(`#${groupId} [role="radio"]`, (els) =>
+      els.map((el) => ({ text: (el.innerText || '').trim(), checked: el.getAttribute('aria-checked') })));
+    const match = states.find((state) => state.text === text);
+    return match ? match.checked : `missing option "${text}" in ${JSON.stringify(states)}`;
+  };
+  const nativeRadioGroup = (id, question, optionLabels, { labelledBy = null, checkedIndex = -1, ariaLabel = null } = {}) => `
+    <p>${question}*</p>
+    <fieldset id="${id}" role="radiogroup" aria-describedby="error-message-${id}">
+      <div>
+        ${optionLabels.map((label, index) => `
+        <div role="radio" tabindex="0" aria-checked="${index === checkedIndex ? 'true' : 'false'}"
+             ${labelledBy ? `aria-labelledby="${id}-group-label"` : `aria-label="${ariaLabel === null ? question : ariaLabel}"`}>
+          <div>
+            <div>
+              <input id="${id}-${index}" type="radio" name="radio-group-${id}" style="${HIDDEN_INPUT_STYLE}"${index === checkedIndex ? ' checked' : ''}>
+              <label for="${id}-${index}"></label>
+            </div>
+            <div><p>${label}</p></div>
+          </div>
+        </div>`).join('')}
+      </div>
+    </fieldset>
+    ${labelledBy ? `<span id="${id}-group-label" style="${HIDDEN_INPUT_STYLE}">${labelledBy}</span>` : ''}`;
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>1/2 pages</div>
+      ${nativeRadioGroup(
+        'native-sponsorship',
+        'Will you now, or in the future, require sponsorship for employment visa status (e.g. H-1B visa status)?',
+        ['Yes', 'No']
+      )}
+    </dialog>`);
+  const nativeSponsorshipLabels = new Set();
+  const nativeSponsorshipResult = await fillDialogRadioGroups(
+    page, {}, { user: { requiresSponsorship: false } }, noopLogger, 'native-sponsorship-job',
+    { runId: 'fixture-run', guardBlockedLabels: nativeSponsorshipLabels }
+  );
+  const nativeSponsorshipNo = await nativeRadioChecked('native-sponsorship', 'No');
+  const nativeSponsorshipYes = await nativeRadioChecked('native-sponsorship', 'Yes');
+  check('2026-09 widget: option text comes from innerText when aria-label carries the question', () => {
+    assert.strictEqual(nativeSponsorshipNo, 'true');
+    assert.strictEqual(nativeSponsorshipYes, 'false');
+    assert.strictEqual(nativeSponsorshipResult.filled, 1);
+    assert.strictEqual(nativeSponsorshipResult.selectionFailures, 0);
+    assert.deepStrictEqual([...nativeSponsorshipLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>1/2 pages</div>
+      ${nativeRadioGroup('native-gender', 'Gender', ['Male', 'Female', 'I prefer not to specify'])}
+    </dialog>`);
+  const nativeGenderLabels = new Set();
+  const nativeGenderResult = await fillDialogRadioGroups(
+    page, {}, { user: { gender: 'Male' } }, noopLogger, 'native-gender-job',
+    { runId: 'fixture-run', guardBlockedLabels: nativeGenderLabels }
+  );
+  const nativeGenderMale = await nativeRadioChecked('native-gender', 'Male');
+  check('2026-09 widget: a configured sensitive answer matches the visible option text under a group-label aria-label', () => {
+    assert.strictEqual(nativeGenderMale, 'true');
+    assert.strictEqual(nativeGenderResult.filled, 1);
+    assert.strictEqual(nativeGenderResult.selectionFailures, 0);
+    assert.deepStrictEqual([...nativeGenderLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>1/2 pages</div>
+      ${nativeRadioGroup(
+        'native-cc305',
+        'Form CC-305 OMB Control Number 1250-0005 Expires 04/30/2026 Why are you being asked to complete this form? ' +
+          'We are a federal contractor or subcontractor. The law requires us to provide equal employment opportunity ' +
+          'to qualified people with disabilities. How do you know if you have a disability?',
+        [
+          'Yes, I have a disability, or have had one in the past',
+          'No, I do not have a disability and have not had one in the past',
+          'I do not want to answer',
+        ],
+        { labelledBy: 'Disability' }
+      )}
+    </dialog>`);
+  const nativeCc305Labels = new Set();
+  const nativeCc305Result = await fillDialogRadioGroups(
+    page, {}, { user: { disabilityStatus: 'I do not wish to answer' } }, noopLogger, 'native-cc305-job',
+    { runId: 'fixture-run', guardBlockedLabels: nativeCc305Labels }
+  );
+  const nativeCc305OptOut = await nativeRadioChecked('native-cc305', 'I do not want to answer');
+  check('2026-09 widget: selection goes through the hidden native input and survives node replacement', () => {
+    assert.strictEqual(nativeCc305OptOut, 'true');
+    assert.strictEqual(nativeCc305Result.filled, 1);
+    assert.strictEqual(nativeCc305Result.selectionFailures, 0);
+    assert.deepStrictEqual([...nativeCc305Labels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>2/4 pages</div>
+      ${nativeRadioGroup('native-resume', 'Resume', ['', '', ''], { checkedIndex: 0, ariaLabel: 'Resume_Sam.pdf' })}
+    </dialog>`);
+  const nativeResumeResult = await fillDialogRadioGroups(
+    page, {}, { user: {} }, noopLogger, 'native-resume-job',
+    { runId: 'fixture-run', guardBlockedLabels: new Set() }
+  );
+  check('2026-09 widget: a pre-selected resume picker is not a radio question', () => {
+    assert.strictEqual(nativeResumeResult.groups, 0);
+    assert.strictEqual(nativeResumeResult.selectionFailures, 0);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/4 pages</div>
+      ${nativeRadioGroup(
+        'native-step-sponsorship',
+        'Will you now, or in the future, require sponsorship for employment visa status (e.g. H-1B visa status)?',
+        ['Yes', 'No']
+      )}
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const nativeStepLabels = new Set();
+  const nativeStepResult = await handleInlineApplyStep(
+    page, {}, { user: { requiresSponsorship: false } }, noopLogger, 'native-step-job', false, 3,
+    { guardBlockedLabels: nativeStepLabels, submissionConfirmationTimeout: 50 }
+  );
+  const nativeStepNo = await nativeRadioChecked('native-step-sponsorship', 'No');
+  const nativeStepNextClicked = await page.locator('body').getAttribute('data-next-clicked');
+  check('2026-09 widget: the full apply step selects the grounded radio and advances', () => {
+    assert.strictEqual(nativeStepNo, 'true');
+    assert.strictEqual(nativeStepResult, 'next');
+    assert.strictEqual(nativeStepNextClicked, 'true');
+    assert.deepStrictEqual([...nativeStepLabels], []);
+  });
+
+  // ── Contact-step location typeahead (verified live 2026-09-13) ──
+  // LinkedIn's required "Location (city)" control is an <input> with NO type
+  // attribute (data-testid="typeahead-input", aria-autocomplete="list") and
+  // no label association. A selector that requires type="text" never sees
+  // it, so the step bounced on "This field is required" (11 jobs, 09-06..13).
+  await page.setContent(`
+    <dialog open>
+      <div>1/6 pages</div>
+      <p>Location (city)*</p>
+      <input id="typeahead-city" data-testid="typeahead-input" autocomplete="off"
+             placeholder="Enter city or location" aria-autocomplete="list" value="">
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const typeaheadStepResult = await handleInlineApplyStep(
+    page, defaultAnswers, config, noopLogger, 'typeahead-step-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const typeaheadValue = await page.locator('#typeahead-city').inputValue();
+  check('an input without a type attribute is filled like a text input', () => {
+    assert.strictEqual(typeaheadValue, 'Springfield');
+    assert.strictEqual(typeaheadStepResult, 'next');
+  });
+
+  // LinkedIn's suggestion list renders asynchronously (often more than the
+  // handler's 0.8 s wait: 7Th Sky Tech, 2026-09-17, bounced with the raw
+  // text left in the field). The listbox is a [role=listbox] whose
+  // aria-labelledby is the input id; picking an option replaces the value.
+  await page.setContent(`
+    <dialog open>
+      <div>1/6 pages</div>
+      <p>Location (city)*</p>
+      <input id="slow-typeahead" data-testid="typeahead-input" autocomplete="off"
+             placeholder="Enter city or location" aria-autocomplete="list" value="">
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+      <script>
+        const slowInput = document.getElementById('slow-typeahead');
+        slowInput.addEventListener('input', () => {
+          const existing = document.getElementById('slow-listbox');
+          if (existing) existing.remove();
+          clearTimeout(window.__slowListboxTimer);
+          window.__slowListboxTimer = setTimeout(() => {
+            if (!slowInput.value) return;
+            const listbox = document.createElement('div');
+            listbox.id = 'slow-listbox';
+            listbox.setAttribute('role', 'listbox');
+            listbox.setAttribute('aria-labelledby', 'slow-typeahead');
+            for (const text of [slowInput.value + ', Illinois, United States', slowInput.value + ' Metropolitan Area']) {
+              const option = document.createElement('div');
+              option.setAttribute('role', 'option');
+              option.textContent = text;
+              option.addEventListener('click', () => { slowInput.value = text; listbox.remove(); });
+              listbox.appendChild(option);
+            }
+            slowInput.insertAdjacentElement('afterend', listbox);
+          }, 1500);
+        });
+      </script>
+    </dialog>`);
+  const slowTypeaheadResult = await handleInlineApplyStep(
+    page, defaultAnswers, config, noopLogger, 'slow-typeahead-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const slowTypeaheadValue = await page.locator('#slow-typeahead').inputValue();
+  check('a typeahead whose suggestions render late still gets a suggestion applied', () => {
+    // Either suggestion is a valid LinkedIn location; the raw typed text is not.
+    assert(['Springfield, Illinois, United States', 'Springfield Metropolitan Area'].includes(slowTypeaheadValue),
+      `expected a suggestion to be applied, got ${JSON.stringify(slowTypeaheadValue)}`);
+    assert.strictEqual(slowTypeaheadResult, 'next');
+  });
+
+  // Longer contact forms add Country* and Phone country code* selects; both
+  // were left unselected (3 error cycles in 3 nights, 09-15..17).
+  await page.setContent(`
+    <dialog open>
+      <div>1/6 pages</div>
+      <label for="contact-country">Country*</label>
+      <select id="contact-country">
+        <option value="">Select an option</option>
+        <option value="CA">Canada</option>
+        <option value="US">United States</option>
+        <option value="UM">United States Minor Outlying Islands</option>
+      </select>
+      <label for="contact-phone-code">Phone country code*</label>
+      <select id="contact-phone-code">
+        <option value="">Select an option</option>
+        <option value="AD">Andorra (+376)</option>
+        <option value="AE">United Arab Emirates (+971)</option>
+        <option value="US">United States (+1)</option>
+        <option value="UM">United States Minor Outlying Islands (+1)</option>
+      </select>
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const countrySelectResult = await handleInlineApplyStep(
+    page, {}, { user: { country: 'US' } }, noopLogger, 'country-select-job', false, 1,
+    { guardBlockedLabels: new Set(), submissionConfirmationTimeout: 50 }
+  );
+  const countrySelected = await page.locator('#contact-country').inputValue();
+  const phoneCodeSelected = await page.locator('#contact-phone-code').inputValue();
+  check('Country and Phone country code selects follow config.user.country', () => {
+    assert.strictEqual(countrySelected, 'US');
+    assert.strictEqual(phoneCodeSelected, 'US');
+    assert.strictEqual(countrySelectResult, 'next');
+  });
+
+  // ── Posting-country placeholder (2026-09-13) ──
+  // FieldAI-style screeners defer the jurisdiction to the posting. The card
+  // location supplies it via options.jobContext.jobCountry.
+  const countryPlaceholderDialog = () => `
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>5/8 pages</div>
+      ${nativeRadioGroup('country-auth', 'Are you legally authorized to work in the country where this position is located?', ['Yes', 'No'])}
+      ${nativeRadioGroup(
+        'country-sponsor',
+        'Will you now or in the future require employer sponsorship for a work visa or employment authorization to work in the country where this position is located?',
+        ['Yes', 'No']
+      )}
+    </dialog>`;
+  const countryConfig = { user: { workAuthorization: 'US Citizen', requiresSponsorship: false } };
+  await page.setContent(countryPlaceholderDialog());
+  const countryLabels = new Set();
+  const countryResult = await fillDialogRadioGroups(
+    page, {}, countryConfig, noopLogger, 'country-job',
+    { runId: 'fixture-run', guardBlockedLabels: countryLabels, jobContext: { jobCountry: 'us' } }
+  );
+  const countryAuthYes = await nativeRadioChecked('country-auth', 'Yes');
+  const countrySponsorNo = await nativeRadioChecked('country-sponsor', 'No');
+  check('the posting country grounds "the country where this position is located" screeners', () => {
+    assert.strictEqual(countryAuthYes, 'true');
+    assert.strictEqual(countrySponsorNo, 'true');
+    assert.strictEqual(countryResult.filled, 2);
+    assert.deepStrictEqual([...countryLabels], []);
+  });
+
+  await page.setContent(countryPlaceholderDialog());
+  const noCountryLabels = new Set();
+  await fillDialogRadioGroups(
+    page, {}, countryConfig, noopLogger, 'no-country-job',
+    { runId: 'fixture-run', guardBlockedLabels: noCountryLabels, jobContext: {} }
+  );
+  const noCountrySelected = await page.locator('[role="radiogroup"] [role="radio"][aria-checked="true"]').count();
+  check('without a posting country the placeholder screeners stay unanswered and guarded', () => {
+    assert.strictEqual(noCountrySelected, 0);
+    assert.strictEqual(noCountryLabels.size, 2);
+  });
+
+  // ── Compound false positives answered end to end (2026-09-13) ──
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/5 pages</div>
+      ${nativeRadioGroup('compound-sponsor', 'Do you now or will you in the future require sponsorship to work in the United States?', ['Yes', 'No'])}
+      ${nativeRadioGroup('compound-citizen', 'Are you a US Citizen or Green Card holder?', ['Yes', 'No'])}
+      ${nativeRadioGroup('compound-age', 'Are you at least 18 years of age and legally eligible to perform the duties of this position?', ['Yes', 'No'])}
+    </dialog>`);
+  const compoundLabels = new Set();
+  const compoundResult = await fillDialogRadioGroups(
+    page, {}, { user: { workAuthorization: 'US Citizen', requiresSponsorship: false, over18: true } }, noopLogger, 'compound-job',
+    { runId: 'fixture-run', guardBlockedLabels: compoundLabels, jobContext: { jobCountry: 'us' } }
+  );
+  const compoundSponsorNo = await nativeRadioChecked('compound-sponsor', 'No');
+  const compoundCitizenYes = await nativeRadioChecked('compound-citizen', 'Yes');
+  const compoundAgeYes = await nativeRadioChecked('compound-age', 'Yes');
+  check('boilerplate compounds answer from config once recognised', () => {
+    assert.strictEqual(compoundSponsorNo, 'true');
+    assert.strictEqual(compoundCitizenYes, 'true');
+    assert.strictEqual(compoundAgeYes, 'true');
+    assert.strictEqual(compoundResult.filled, 3);
+    assert.deepStrictEqual([...compoundLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/5 pages</div>
+      ${nativeRadioGroup('age-unset', 'Are you at least 18 years of age and legally eligible to perform the duties of this position?', ['Yes', 'No'])}
+    </dialog>`);
+  const ageUnsetLabels = new Set();
+  await fillDialogRadioGroups(
+    page, {}, { user: { workAuthorization: 'US Citizen', requiresSponsorship: false } }, noopLogger, 'age-unset-job',
+    { runId: 'fixture-run', guardBlockedLabels: ageUnsetLabels, jobContext: { jobCountry: 'us' } }
+  );
+  const ageUnsetSelected = await page.locator('#age-unset [role="radio"][aria-checked="true"]').count();
+  check('18-and-eligible stays unanswered without an over18 config fact', () => {
+    assert.strictEqual(ageUnsetSelected, 0);
+    assert.strictEqual(ageUnsetLabels.size, 1);
+  });
+
+  // ── Dialog checkbox widget (verified live 2026-09-13) ──
+  // <p>statement*</p><fieldset aria-describedby="error-message-…"><div>
+  //   <div role="checkbox" tabindex="0" aria-checked="false"><div><div>
+  //     <input type="checkbox" tabindex="-1"><label for></label></div>
+  //     <p>I certify and agree</p></div></div></div></fieldset>
+  // The hidden input is invisible to fillForm and the wrapper click is inert,
+  // so a required certification box left every such form on the same page.
+  const nativeCheckboxWidget = (id, statement, label, { checked = false } = {}) => `
+    <p>${statement}*</p>
+    <fieldset id="${id}" aria-describedby="error-message-${id}">
+      <div>
+        <div role="checkbox" tabindex="0" aria-checked="${checked ? 'true' : 'false'}">
+          <div>
+            <div>
+              <input id="${id}-input" type="checkbox" tabindex="-1" style="${HIDDEN_INPUT_STYLE}"${checked ? ' checked' : ''}>
+              <label for="${id}-input"></label>
+            </div>
+            <p>${label}</p>
+          </div>
+        </div>
+      </div>
+    </fieldset>`;
+  const nativeCheckboxChecked = async (id) => {
+    const states = await page.$$eval(`#${id} [role="checkbox"]`, (els) => els.map((el) => el.getAttribute('aria-checked')));
+    return states[0] || `missing widget in #${id}`;
+  };
+  const CERTIFY_STATEMENT = 'I certify that the information provided in this application is true, complete, and accurate to the best of my knowledge. ' +
+    'I understand that providing false or misleading information may result in the rejection of my application or termination of employment if discovered after hire.';
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>5/8 pages</div>
+      ${nativeCheckboxWidget('certify-box', CERTIFY_STATEMENT, 'I certify and agree')}
+      ${nativeCheckboxWidget('contact-consent-box', 'FieldAI has my consent to contact me about future job opportunities.', 'I agree')}
+    </dialog>`);
+  const certifyLabels = new Set();
+  const certifyResult = await fillDialogCheckboxGroups(
+    page, {}, { user: {} }, noopLogger, 'certify-job',
+    { runId: 'fixture-run', guardBlockedLabels: certifyLabels }
+  );
+  const certifyChecked = await nativeCheckboxChecked('certify-box');
+  const contactConsentChecked = await nativeCheckboxChecked('contact-consent-box');
+  check('dialog checkbox widgets with consent wording are checked through the hidden input', () => {
+    assert.strictEqual(certifyChecked, 'true');
+    assert.strictEqual(contactConsentChecked, 'true');
+    assert.strictEqual(certifyResult.filled, 2);
+    assert.strictEqual(certifyResult.selectionFailures, 0);
+    assert.deepStrictEqual([...certifyLabels], []);
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>3/4 pages</div>
+      ${nativeCheckboxWidget('sms-box', 'I consent to receive automated text messages (SMS/MMS) from the employer at the phone number I provided.', 'I agree')}
+      ${nativeCheckboxWidget('unknown-box', 'I have read the attached policy document.', 'Yes')}
+      ${nativeCheckboxWidget('top-choice-box', 'Mark this job as a top choice', 'Top choice')}
+    </dialog>`);
+  const declinedLabels = new Set();
+  const declinedResult = await fillDialogCheckboxGroups(
+    page, {}, { user: {} }, noopLogger, 'declined-job',
+    { runId: 'fixture-run', guardBlockedLabels: declinedLabels }
+  );
+  const smsChecked = await nativeCheckboxChecked('sms-box');
+  const unknownChecked = await nativeCheckboxChecked('unknown-box');
+  const topChoiceWidgetChecked = await nativeCheckboxChecked('top-choice-box');
+  check('SMS consent, unknown statements and Top Choice widgets stay unchecked', () => {
+    assert.strictEqual(smsChecked, 'false');
+    assert.strictEqual(unknownChecked, 'false');
+    assert.strictEqual(topChoiceWidgetChecked, 'false');
+    assert.strictEqual(declinedResult.filled, 0);
+    assert.strictEqual(declinedResult.selectionFailures, 0);
+    assert([...declinedLabels].some((label) => label.includes('automated text messages')),
+      `expected the SMS statement to be guard-blocked, got: ${JSON.stringify([...declinedLabels])}`);
+    assert([...declinedLabels].some((label) => label.includes('policy document')),
+      `expected the unknown statement to be guard-blocked, got: ${JSON.stringify([...declinedLabels])}`);
+    assert(![...declinedLabels].some((label) => /top choice/i.test(label)), 'Top Choice is a policy decision, not a guard refusal');
+  });
+
+  await page.setContent(`
+    ${NATIVE_RADIO_SCRIPT}
+    <dialog open>
+      <div>5/8 pages</div>
+      ${nativeCheckboxWidget('step-certify-box', CERTIFY_STATEMENT, 'I certify and agree')}
+      <button onclick="document.body.dataset.nextClicked = 'true'">Next</button>
+    </dialog>`);
+  const certifyStepLabels = new Set();
+  const certifyStepResult = await handleInlineApplyStep(
+    page, {}, { user: {} }, noopLogger, 'certify-step-job', false, 5,
+    { guardBlockedLabels: certifyStepLabels, submissionConfirmationTimeout: 50 }
+  );
+  const certifyStepChecked = await nativeCheckboxChecked('step-certify-box');
+  const certifyStepNextClicked = await page.locator('body').getAttribute('data-next-clicked');
+  check('the full apply step checks a required certification widget and advances', () => {
+    assert.strictEqual(certifyStepChecked, 'true');
+    assert.strictEqual(certifyStepResult, 'next');
+    assert.strictEqual(certifyStepNextClicked, 'true');
+    assert.deepStrictEqual([...certifyStepLabels], []);
   });
 
   await browser.close();

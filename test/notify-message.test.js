@@ -49,5 +49,18 @@ test('includes a Discord mention when a user id is configured', () => {
   assert(message.startsWith('<@12345> '));
 });
 
+test('labels dry-run candidates as ready to submit instead of applied', () => {
+  const { buildMeowfisMessage } = loadNotifyWithEnv(undefined);
+  const message = buildMeowfisMessage({
+    dryRun: true,
+    sessionId: 8,
+    applied: 9,
+    readyToSubmit: 2,
+    scanned: 5,
+  });
+  assert(message.includes('ready_to_submit=2'));
+  assert(!message.includes('applied='));
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

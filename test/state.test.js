@@ -4,9 +4,46 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const Database = require('better-sqlite3');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'job-agent-state-test-'));
 process.env.STATE_DB_PATH = path.join(tmpDir, 'test.db');
+
+// Seed a pre-mode schema before loading lib/state. Its dry_run outcome is
+// authoritative migration evidence; the accompanying error must not poison
+// production cooldowns after initSchema upgrades the database.
+const legacyRunId = 'legacy-dry-run';
+const legacyDb = new Database(process.env.STATE_DB_PATH);
+legacyDb.exec(`
+  CREATE TABLE applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    jobId TEXT NOT NULL,
+    jobTitle TEXT,
+    company TEXT,
+    jobUrl TEXT,
+    status TEXT NOT NULL,
+    errorMessage TEXT,
+    appliedAt TEXT NOT NULL,
+    runId TEXT NOT NULL
+  );
+  CREATE TABLE runs (
+    id TEXT PRIMARY KEY,
+    startedAt TEXT NOT NULL,
+    completedAt TEXT,
+    platformStats TEXT
+  );
+  INSERT INTO runs (id, startedAt) VALUES ('legacy-dry-run', datetime('now'));
+  INSERT INTO applications
+    (platform, jobId, jobTitle, company, status, appliedAt, runId)
+  VALUES
+    ('linkedin', 'legacy-ready', 'Legacy Dry Analyst', 'Legacy Dry Co', 'dry_run', datetime('now'), 'legacy-dry-run');
+  INSERT INTO applications
+    (platform, jobId, jobTitle, company, status, errorMessage, appliedAt, runId)
+  VALUES
+    ('linkedin', 'legacy-error', 'Legacy Dry Analyst', 'Legacy Dry Co', 'error', 'diagnostic failure', datetime('now'), 'legacy-dry-run');
+`);
+legacyDb.close();
 
 const state = require('../lib/state');
 const { denverDayStartUTC } = state;
@@ -45,6 +82,20 @@ test('uses the pre-fall-back offset on DST end day', () => {
 
 const { runId } = state.createRun();
 
+test('migration backfills legacy dry-run mode before cooldown queries', () => {
+  assert.strictEqual(
+    state.hasRecentFailure({
+      platform: 'linkedin', jobId: 'legacy-error',
+      company: 'Legacy Dry Co', jobTitle: 'Legacy Dry Analyst',
+    }),
+    false
+  );
+  assert.strictEqual(
+    state.getCompanyRecentAttemptCount({ platform: 'linkedin', company: 'Legacy Dry Co' }),
+    0
+  );
+});
+
 test('submitted rows are proof of a prior application', () => {
   state.recordApplication({
     platform: 'linkedin', jobId: 'submitted-job', status: 'submitted', runId,
@@ -80,10 +131,9 @@ test('database-dedup rows cannot become self-sustaining proof', () => {
 });
 
 test('unattributed already-applied rows are not authoritative proof', () => {
-  state.recordApplication({
+  assert.throws(() => state.recordApplication({
     platform: 'linkedin', jobId: 'unattributed-applied-job', status: 'already_applied', runId,
-  });
-
+  }), /requires skipReason/);
   assert.strictEqual(state.hasApplied('linkedin', 'unattributed-applied-job'), false);
 });
 
@@ -137,6 +187,30 @@ test('run stats surface captcha-blocked rows', () => {
   });
 
   assert.strictEqual(state.getRunStats(captchaRunId).indeed.captcha_blocked, 1);
+});
+
+test('unconfirmed submit is an error, terminal failure, and daily budget use', () => {
+  const beforeBudget = state.getTodaySubmissionBudgetCount();
+  const beforeSubmitted = state.getTodaySubmittedCount();
+  const { runId: unconfirmedRunId } = state.createRun();
+  state.recordApplication({
+    platform: 'linkedin', jobId: 'unconfirmed-job', jobTitle: 'Unconfirmed Analyst',
+    company: 'Unconfirmed Co', status: 'submit_unconfirmed',
+    errorMessage: 'Submit clicked but evidence timed out', runId: unconfirmedRunId,
+  });
+
+  const stats = state.getRunStats(unconfirmedRunId).linkedin;
+  assert.strictEqual(stats.submit_unconfirmed, 1);
+  assert.strictEqual(stats.errors, 1);
+  assert.strictEqual(state.getTodaySubmissionBudgetCount(), beforeBudget + 1);
+  assert.strictEqual(state.getTodaySubmittedCount(), beforeSubmitted);
+  assert.strictEqual(
+    state.hasRecentFailure({
+      platform: 'linkedin', jobId: 'unconfirmed-job',
+      company: 'Unconfirmed Co', jobTitle: 'Unconfirmed Analyst',
+    }),
+    true
+  );
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

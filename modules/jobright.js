@@ -25,6 +25,47 @@ const { fillForm } = require('../lib/form-filler');
 const { recordUnfilledField } = require('../lib/state');
 
 const SELECTOR_TIMEOUT = 10000;
+const SUBMISSION_CONFIRMATION_TEXT = [
+  'Application submitted',
+  'Successfully applied',
+];
+const SUBMISSION_CONFIRMATION_SELECTORS = [
+  '[data-testid="success"]',
+  '[data-testid*="application"][data-testid*="success"]',
+];
+
+function submissionConfirmationLocators(page) {
+  if (!page || typeof page.locator !== 'function' || typeof page.getByText !== 'function') return [];
+  return [
+    ...SUBMISSION_CONFIRMATION_SELECTORS.map((selector) => page.locator(selector)),
+    ...SUBMISSION_CONFIRMATION_TEXT.map((text) => page.getByText(text, { exact: false })),
+  ];
+}
+
+async function hasVisibleSubmissionConfirmation(page) {
+  for (const evidence of submissionConfirmationLocators(page)) {
+    const matches = await evidence.all().catch(() => []);
+    for (const match of matches) {
+      if (await match.isVisible().catch(() => false)) return true;
+    }
+  }
+  return false;
+}
+
+async function waitForSubmissionConfirmation(page, options = {}) {
+  const { timeout = 10000, preexistingEvidence = false } = options;
+  if (preexistingEvidence) return false;
+  const locators = submissionConfirmationLocators(page);
+  if (locators.length === 0) return false;
+  const deadline = Date.now() + timeout;
+  do {
+    if (await hasVisibleSubmissionConfirmation(page)) return true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+  } while (Date.now() <= deadline);
+  return false;
+}
 
 async function screenshotError(page, platform, jobId, config) {
   if (!config.behavior?.screenshotOnError) return;
@@ -130,9 +171,14 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
   const { minDelayBetweenApplications, maxDelayBetweenApplications } = config.behavior;
 
   let applied = 0;
+  let dryRunReady = 0;
+  let submissionAttempts = 0;
+  let budgetUsed = 0;
   let skipped = 0;
   let errors = 0;
-  let processedJobIds = new Set(); // Track processed jobs in this run to avoid re-processing
+  const processedJobIds = new Set(); // Track processed jobs in this run to avoid re-processing
+  let sawUsableJob = false;
+  let noResults = false;
 
   const searchUrl = buildSearchUrl(config);
   logger.info({ platform: 'jobright', searchUrl }, 'Navigating to Jobright jobs');
@@ -145,7 +191,7 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
   const currentUrl = page.url();
   if (loginModal || !isJobrightDomain(currentUrl) || currentUrl.includes('/login')) {
     logger.error({ platform: 'jobright' }, 'Jobright session expired or login required. Stopping.');
-    return { applied, skipped, errors };
+    return { applied, skipped, errors, aborted: true, noResults, sessionExpired: true, captchaBlocked: false };
   }
 
   // Check for Cloudflare/security challenge page (PRD §8.2)
@@ -155,7 +201,7 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
       platform: 'jobright', jobId: 'captcha_detected',
       status: 'captcha_blocked', errorMessage: 'Challenge page detected — platform stopped', runId,
     });
-    return { applied, skipped, errors };
+    return { applied, skipped, errors, aborted: false, noResults, captchaBlocked: true };
   }
 
   // Wait for the job feed to load
@@ -166,7 +212,8 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
     );
   } catch (_) {
     logger.warn({ platform: 'jobright' }, 'Job feed not found — possible page structure change');
-    return { applied, skipped, errors };
+    noResults = true;
+    return { applied, skipped, errors, aborted: false, noResults, captchaBlocked: false };
   }
 
   await sleep(1000, 2000);
@@ -174,17 +221,17 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
   let noNewJobsCount = 0;
   const MAX_NO_NEW_JOBS = 3; // Stop if we can't load new jobs after 3 tries
 
-  while (applied < maxApplications) {
+  while (budgetUsed < maxApplications) {
     // Get all currently loaded job cards
     const allCards = await page.$$(
       '[data-testid="job-card"], .job-card, [class*="JobCard"], .job-list-item'
     );
-
     // Find unprocessed cards
     const unprocessedCards = [];
     for (const card of allCards) {
       const jobId = await extractJobrightJobId(card);
       if (jobId && !processedJobIds.has(jobId)) {
+        sawUsableJob = true;
         unprocessedCards.push({ card, jobId });
       }
     }
@@ -209,19 +256,24 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
     noNewJobsCount = 0;
 
     for (const { card, jobId } of unprocessedCards) {
-      if (applied >= maxApplications) break;
+      if (budgetUsed >= maxApplications) break;
 
       processedJobIds.add(jobId);
 
       let jobTitle = null;
       let company = null;
       let jobUrl = null;
+      let submitAttempted = false;
+      let submitOutcomeRecorded = false;
 
       try {
         // Mark as processed first to avoid re-processing on errors
         if (state.hasApplied('jobright', jobId)) {
           logger.debug({ jobId }, 'Already applied — skipping');
-          state.recordApplication({ platform: 'jobright', jobId, status: 'already_applied', runId });
+          state.recordApplication({
+            platform: 'jobright', jobId, status: 'already_applied',
+            skipReason: 'already_applied_db', runId,
+          });
           skipped++;
           continue;
         }
@@ -275,7 +327,7 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
         if (btnText.includes('applied') && !btnText.includes('quick')) {
           state.recordApplication({
             platform: 'jobright', jobId, jobTitle, company, jobUrl,
-            status: 'already_applied', runId,
+            status: 'already_applied', skipReason: 'already_applied_jobright', runId,
           });
           skipped++;
           await page.goBack({ waitUntil: 'domcontentloaded' });
@@ -283,13 +335,38 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
           continue;
         }
 
+        // Jobright can auto-submit from this first Apply click. A dry run must
+        // therefore stop before clicking it; entering the form is not safe.
+        if (dryRun) {
+          await screenshotError(page, 'jobright', `dryrun-${jobId}`, config);
+          logger.info({ jobId }, '[DRY RUN] Would click Jobright apply button');
+          state.recordApplication({
+            platform: 'jobright', jobId, jobTitle, company, jobUrl,
+            status: 'dry_run', runId,
+          });
+          dryRunReady++;
+          budgetUsed++;
+          await page.goBack({ waitUntil: 'domcontentloaded' }).catch(async () => {
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+          });
+          await sleep(1000, 2000);
+          continue;
+        }
+
+        const preApplyConfirmation = await hasVisibleSubmissionConfirmation(page);
         logger.info({ jobId, jobTitle, company }, 'Clicking Jobright apply button');
+        submitAttempted = true;
+        submissionAttempts++;
+        budgetUsed++;
         await applyBtn.click();
         await sleep(1500, 2500);
 
         // Check if we got redirected to an external site after clicking
         const urlAfterClick = page.url();
         if (!isJobrightDomain(urlAfterClick)) {
+          submitAttempted = false;
+          submissionAttempts--;
+          budgetUsed--;
           logger.debug({ jobId, jobTitle, url: urlAfterClick }, 'Apply redirected to external — skipping');
           state.recordApplication({
             platform: 'jobright', jobId, jobTitle, company, jobUrl,
@@ -306,6 +383,11 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
           '[data-testid="apply-form"], .apply-form, [class*="applyForm"], [role="dialog"]',
           { timeout: SELECTOR_TIMEOUT }
         ).catch(() => null);
+        if (applyForm) {
+          submitAttempted = false;
+          submissionAttempts--;
+          budgetUsed--;
+        }
 
         // Build fill options with LLM support
         const llmBudget = { callsRemaining: 5, msRemaining: 20000 };
@@ -342,50 +424,91 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
         const submitBtn = await page.$(
           'button:has-text("Submit"), button:has-text("Submit Application"), button:has-text("Apply Now"), [data-testid="submit-button"]'
         );
+        const confirmationAfterApply = await hasVisibleSubmissionConfirmation(page);
 
-        if (!submitBtn || !(await submitBtn.isVisible())) {
+        if (!preApplyConfirmation && confirmationAfterApply) {
+          if (!submitAttempted) {
+            // A broad form-shell selector can also match the confirmation
+            // dialog. Restore the first Apply click as the consumed attempt.
+            submitAttempted = true;
+            submissionAttempts++;
+            budgetUsed++;
+          }
+          logger.info({ jobId, jobTitle, company }, 'Jobright application auto-submitted');
+          state.recordApplication({
+            platform: 'jobright', jobId, jobTitle, company, jobUrl,
+            status: 'submitted', runId,
+          });
+          submitOutcomeRecorded = true;
+          applied++;
+        } else if (!submitBtn || !(await submitBtn.isVisible())) {
           // Jobright Quick Apply might auto-submit with just the Apply button click
-          // Check if confirmation is already showing
-          const confirmed = await page.$(
-            'text="Application submitted", text="Successfully applied", [class*="success"], [data-testid="success"]'
-          );
+          const confirmed = await waitForSubmissionConfirmation(page, {
+            preexistingEvidence: preApplyConfirmation,
+          });
           if (confirmed) {
             logger.info({ jobId, jobTitle, company }, 'Jobright application auto-submitted');
             state.recordApplication({
               platform: 'jobright', jobId, jobTitle, company, jobUrl,
-              status: dryRun ? 'dry_run' : 'submitted', runId,
+              status: 'submitted', runId,
             });
+            submitOutcomeRecorded = true;
             applied++;
+          } else if (!submitAttempted) {
+            throw new Error('Submit button not found in Jobright apply form');
           } else {
-            throw new Error('Submit button not found and no auto-submission detected');
-          }
-        } else {
-          if (dryRun) {
-            await screenshotError(page, 'jobright', `dryrun-${jobId}`, config);
-            logger.info({ jobId }, '[DRY RUN] Would submit Jobright application');
-            const closeBtn = await page.$('button[aria-label="Close"], button:has-text("Cancel")');
-            if (closeBtn) await closeBtn.click();
+            // The first Apply click can itself submit. Retrying this job when
+            // evidence is missing could create a duplicate application.
+            errors++;
+            logger.error(
+              { jobId, jobTitle, company },
+              'Jobright Apply click had no form or confirmation; outcome recorded as unverified'
+            );
             state.recordApplication({
               platform: 'jobright', jobId, jobTitle, company, jobUrl,
-              status: 'dry_run', runId,
+              status: 'submit_unconfirmed',
+              errorMessage: 'Apply clicked but no form or confirmation evidence appeared', runId,
             });
-          } else {
-            await submitBtn.click();
-            await sleep(1500, 2500);
+            submitOutcomeRecorded = true;
+          }
+        } else {
+          // A visible Submit control establishes that the first Apply click
+          // opened a form rather than auto-submitting. Refund that conservative
+          // attempt before accounting for the actual Submit click.
+          if (submitAttempted) {
+            submitAttempted = false;
+            submissionAttempts--;
+            budgetUsed--;
+          }
+          const preexistingEvidence = confirmationAfterApply;
+          submitAttempted = true;
+          submissionAttempts++;
+          budgetUsed++;
+          await submitBtn.click();
+          await sleep(1500, 2500);
 
-            // Wait for success indicator
-            await page.waitForSelector(
-              'text="Application submitted", text="Successfully applied", [class*="success"]',
-              { timeout: 10000 }
-            ).catch(() => null);
-
+          const confirmed = await waitForSubmissionConfirmation(page, { preexistingEvidence });
+          if (confirmed) {
             logger.info({ jobId, jobTitle, company }, 'Jobright application submitted');
             state.recordApplication({
               platform: 'jobright', jobId, jobTitle, company, jobUrl,
               status: 'submitted', runId,
             });
+            submitOutcomeRecorded = true;
+            applied++;
+          } else {
+            errors++;
+            logger.error(
+              { jobId, jobTitle, company },
+              'Jobright submit click was not confirmed; outcome recorded as unverified'
+            );
+            state.recordApplication({
+              platform: 'jobright', jobId, jobTitle, company, jobUrl,
+              status: 'submit_unconfirmed',
+              errorMessage: 'Submit clicked but confirmation evidence timed out', runId,
+            });
+            submitOutcomeRecorded = true;
           }
-          applied++;
         }
 
         await sleep(minDelayBetweenApplications, maxDelayBetweenApplications);
@@ -397,14 +520,30 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
         await sleep(1500, 2500);
 
       } catch (err) {
-        logger.error({ platform: 'jobright', jobId, jobTitle, error: err.message }, 'Application error');
-        errors++;
-        await screenshotError(page, 'jobright', jobId, config);
+        const abortAfterSubmitError = submitAttempted;
+        if (submitAttempted) {
+          if (!submitOutcomeRecorded) {
+            errors++;
+            state.recordApplication({
+              platform: 'jobright', jobId, jobTitle, company, jobUrl,
+              status: 'submit_unconfirmed',
+              errorMessage: `Submit click outcome unknown: ${err.message}`, runId,
+            });
+          }
+          logger.error(
+            { platform: 'jobright', jobId, jobTitle, error: err.message },
+            'Error after submit attempt; job will not be retried'
+          );
+        } else {
+          logger.error({ platform: 'jobright', jobId, jobTitle, error: err.message }, 'Application error');
+          errors++;
+          await screenshotError(page, 'jobright', jobId, config);
 
-        state.recordApplication({
-          platform: 'jobright', jobId, jobTitle, company, jobUrl,
-          status: 'error', errorMessage: err.message, runId,
-        });
+          state.recordApplication({
+            platform: 'jobright', jobId, jobTitle, company, jobUrl,
+            status: 'error', errorMessage: err.message, runId,
+          });
+        }
 
         // Return to job feed
         try {
@@ -422,13 +561,17 @@ async function applyJobright(page, config, defaultAnswers, state, runId, logger,
             platform: 'jobright', jobId: 'captcha_detected',
             status: 'captcha_blocked', errorMessage: 'Challenge page detected — platform stopped', runId,
           });
-          return { applied, skipped, errors };
+          return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted: false, noResults, captchaBlocked: true };
+        }
+        if (abortAfterSubmitError) {
+          return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted: true, noResults, captchaBlocked: false };
         }
       }
     }
   }
 
-  return { applied, skipped, errors };
+  if (maxApplications > 0 && !sawUsableJob) noResults = true;
+  return { applied, dryRunReady, submissionAttempts, skipped, errors, aborted: false, noResults, captchaBlocked: false };
 }
 
-module.exports = { applyJobright };
+module.exports = { applyJobright, waitForSubmissionConfirmation };

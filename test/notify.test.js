@@ -51,7 +51,8 @@ test('sendSessionSummary marks dry-run mode in content and embed fields', async 
     sessionId: 42,
     durationMin: 3,
     scanned: 10,
-    applied: 2,
+    applied: 0,
+    readyToSubmit: 2,
     skipped: 7,
     failed: 1,
     dsCalls: 4,
@@ -68,6 +69,10 @@ test('sendSessionSummary marks dry-run mode in content and embed fields', async 
   assert.deepEqual(
     sent[0].payload.embeds[0].fields.find(field => field.name === 'mode'),
     { name: 'mode', value: 'dry_run', inline: true }
+  );
+  assert.deepEqual(
+    sent[0].payload.embeds[0].fields.find(field => field.name === 'ready_to_submit'),
+    { name: 'ready_to_submit', value: '2', inline: true }
   );
 });
 
@@ -106,7 +111,8 @@ test('notifyMeowfis skips dashboard trigger for dry runs', async () => {
   await notifyMeowfis({
     dryRun: true,
     sessionId: 9,
-    applied: 1,
+    applied: 0,
+    readyToSubmit: 1,
     scanned: 5,
   }, createLogger());
 
@@ -114,7 +120,7 @@ test('notifyMeowfis skips dashboard trigger for dry runs', async () => {
   assert.equal(sent[0].url, 'https://discord.invalid/agent-internal');
   assert.equal(
     sent[0].payload.content,
-    'Dry run #9 complete. No dashboard needed. scanned=5 applied=1'
+    'Dry run #9 complete. No dashboard needed. scanned=5 ready_to_submit=1'
   );
   assert.doesNotMatch(sent[0].payload.content, /please write dashboard/);
 });

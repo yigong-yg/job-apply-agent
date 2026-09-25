@@ -16,6 +16,7 @@
     "workAuthorization": "[WORK_AUTHORIZATION]",
     "requiresSponsorship": false,
     "willingToRelocate": true,
+    "over18": true,
     "yearsOfExperience": "[YEARS_OF_EXPERIENCE]",
     "graduationYear": "[GRADUATION_YEAR]",
     "highestEducation": "[HIGHEST_EDUCATION]",
@@ -68,6 +69,7 @@
   },
 
   "behavior": {
+    "dailyMaxApplications": 30,
     "minDelayBetweenActions": 1500,
     "maxDelayBetweenActions": 4000,
     "minDelayBetweenApplications": 5000,

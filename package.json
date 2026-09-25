@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node index.js",
     "setup": "node setup.js",
-    "dry-run": "node index.js --dry-run"
+    "dry-run": "node index.js --dry-run",
+    "test": "node test/run-all.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.9.1",

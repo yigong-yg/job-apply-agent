@@ -320,5 +320,48 @@ test('jurisdiction "able to work" phrasings remain work-authorization', () => {
   assert.strictEqual(classifyQuestion('Are you legally authorized to work in the US?').questionClass, 'work_authorization');
 });
 
+// ── Job-country placeholder (2026-09-13) ──
+// "the country where this position is located" names no jurisdiction, so the
+// 08-31 coverage rule blocked it even though the posting's country is known.
+test('job-country placeholder answers authorization from the posting country', () => {
+  const q = 'Are you legally authorized to work in the country where this position is located?';
+  const withJob = guardAnswer(q, { config, defaultAnswers: {}, jobCountry: 'us' });
+  assert.strictEqual(withJob.action, 'answer');
+  assert.strictEqual(withJob.answer, 'Yes');
+  assert.strictEqual(withJob.questionClass, 'work_authorization');
+});
+
+test('job-country placeholder answers sponsorship from the posting country', () => {
+  const q = 'Will you now or in the future require employer sponsorship for a work visa or employment authorization to work in the country where this position is located?';
+  const withJob = guardAnswer(q, { config, defaultAnswers: {}, jobCountry: 'us' });
+  assert.strictEqual(withJob.action, 'answer');
+  assert.strictEqual(withJob.answer, 'No');
+});
+
+test('job-country placeholder stays blocked without a known posting country', () => {
+  const q = 'Are you legally authorized to work in the country where this position is located?';
+  assert.strictEqual(guardAnswer(q, { config, defaultAnswers: {} }).action, 'block');
+  assert.strictEqual(guardAnswer(q, { config, defaultAnswers: {}, jobCountry: null }).action, 'block');
+});
+
+test('job-country placeholder never projects US authorization onto another country', () => {
+  const q = 'Are you legally authorized to work in the country where this position is located?';
+  assert.strictEqual(guardAnswer(q, { config, defaultAnswers: {}, jobCountry: 'canada' }).action, 'block');
+  const s = 'Will you now or in the future require sponsorship to work in the country you are applying to?';
+  assert.strictEqual(guardAnswer(s, { config, defaultAnswers: {}, jobCountry: 'uk' }).action, 'block');
+});
+
+test('"right to work in the country you are applying to" is a work-authorization question', () => {
+  const q = 'Do you have the right to work in the country you are applying to?';
+  assert.strictEqual(classifyQuestion(q).questionClass, 'work_authorization');
+  assert.strictEqual(guardAnswer(q, { config, defaultAnswers: {}, jobCountry: 'us' }).answer, 'Yes');
+  assert.strictEqual(guardAnswer(q, { config, defaultAnswers: {} }).action, 'block');
+});
+
+test('a named jurisdiction still has to be covered alongside the placeholder', () => {
+  const q = 'Are you authorized to work in Canada, the country where this position is located?';
+  assert.strictEqual(guardAnswer(q, { config, defaultAnswers: {}, jobCountry: 'us' }).action, 'block');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
